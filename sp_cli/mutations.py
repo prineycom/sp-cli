@@ -86,9 +86,11 @@ def _today_prepend(state: dict, task_ids: list[str]) -> None:
 
 def _planner_purge(state: dict, task_ids: list[str]) -> None:
     days = state.get("planner", {}).get("days", {})
-    for day_list in days.values():
+    for day, day_list in list(days.items()):
         for tid in task_ids:
             _list_remove(day_list, tid)
+        if not day_list:
+            del days[day]
 
 
 def _clear_due_with_time(task: dict, changes: dict | None = None) -> None:

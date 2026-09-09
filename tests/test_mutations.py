@@ -168,7 +168,7 @@ class TestDelete:
         assert "S" * 21 not in state["task"]["entities"]
         assert parent["id"] not in state["project"]["entities"]["INBOX_PROJECT"]["taskIds"]
         assert parent["id"] not in _today_order(sample)
-        assert parent["id"] not in state["planner"]["days"]["2030-05-05"]
+        assert "2030-05-05" not in state["planner"]["days"]
         assert_doctor_clean(sample)
 
     def test_bulk_delete(self, sample, b, add_task_entity):
@@ -284,7 +284,7 @@ class TestPlanning:
             assert task["dueWithTime"] is None
             assert task["remindAt"] is None
         assert _today_order(sample)[:2] == [t1["id"], t2["id"]]
-        assert t2["id"] not in sample["state"]["planner"]["days"]["2030-05-05"]
+        assert "2030-05-05" not in sample["state"]["planner"]["days"]
         assert_doctor_clean(sample)
 
     def test_plan_today_keeps_due_with_time_when_already_today(
