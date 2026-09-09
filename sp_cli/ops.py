@@ -7,6 +7,7 @@ from sp_cli.model import now_ms
 
 OP_SCHEMA_VERSION = 4
 MAX_RECENT_OPS = 2000
+MAX_CLOCK_ENTRIES = 20
 
 
 class OpBuilder:
@@ -68,10 +69,14 @@ def merge_clocks(a: dict, b: dict) -> dict:
 
 
 def finalize(d: dict, ops: list[dict], client_id: str, now: int | None = None) -> None:
-    """Stamp the batch into the file: syncVersion+1, sv, trim, clocks, metadata."""
+    """Stamp the batch into the file: syncVersion+1, sv, trim, clocks, metadata.
+
+    Missing syncVersion/vectorClock/recentOps keys default to 0/{}/[]
+    (tolerated only when absent — present values are never regressed).
+    """
     if not ops:
         raise ValueError("finalize: empty batch")
-    new_sync_version = int(d["syncVersion"]) + 1
+    new_sync_version = int(d.get("syncVersion") or 0) + 1
     for op in ops:
         op["sv"] = new_sync_version
     recent = (list(d.get("recentOps") or []) + ops)[-MAX_RECENT_OPS:]
@@ -79,7 +84,19 @@ def finalize(d: dict, ops: list[dict], client_id: str, now: int | None = None) -
         raise ValueError("finalize: recentOps would be empty")
     d["recentOps"] = recent
     d["oldestOpSyncVersion"] = recent[0]["sv"]
-    d["vectorClock"] = merge_clocks(dict(d.get("vectorClock") or {}), ops[-1]["v"])
+    merged = merge_clocks(dict(d.get("vectorClock") or {}), ops[-1]["v"])
+    if len(merged) > MAX_CLOCK_ENTRIES:
+        # Cap: keep our own client id + the highest-counter other entries.
+        others = sorted(
+            ((k, int(v)) for k, v in merged.items() if k != client_id),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        keep = MAX_CLOCK_ENTRIES - (1 if client_id in merged else 0)
+        capped = {k: v for k, v in others[:keep]}
+        if client_id in merged:
+            capped[client_id] = merged[client_id]
+        merged = capped
+    d["vectorClock"] = merged
     d["syncVersion"] = new_sync_version
     d["lastModified"] = now if now is not None else now_ms()
     d["clientId"] = client_id

@@ -84,7 +84,14 @@ class SyncFileClient:
             )
         return data
 
-    def put(self, data: dict) -> None:
+    def put(self, data: dict, allow_unconditional: bool = False) -> None:
+        if not self.etag and not allow_unconditional:
+            raise WebDavError(
+                f"PUT {self.file_url}: refusing to write without an ETag from "
+                "the previous GET (no If-Match means a concurrent write could "
+                "be silently overwritten); pass allow_unconditional=True to "
+                "override"
+            )
         self._write_backup()
         body = add_prefix(serialize(data)).encode("utf-8")
         headers = {"Content-Type": "application/octet-stream"}

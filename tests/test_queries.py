@@ -90,6 +90,28 @@ class TestOverdue:
         t = add_task_entity(title="today", due_day=today_str())
         assert not q.is_overdue(t)
 
+    def test_scheduled_earlier_today_not_overdue(self, sample, add_task_entity):
+        # dueWithTime earlier today: today-member, NOT overdue.
+        earlier = int(
+            datetime.datetime.now()
+            .replace(hour=0, minute=1, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+        t = add_task_entity(title="earlier today", due_with_time=earlier)
+        assert q.is_today_member(t)
+        assert not q.is_overdue(t)
+
+    def test_scheduled_yesterday_overdue(self, sample, add_task_entity):
+        yesterday = int(
+            (datetime.datetime.now() - datetime.timedelta(days=1))
+            .replace(hour=12, minute=0, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+        t = add_task_entity(title="yesterday", due_with_time=yesterday)
+        assert q.is_overdue(t)
+
 
 class TestListFilters:
     def test_default_excludes_done(self, sample, add_task_entity):

@@ -69,7 +69,12 @@ def _list_remove(lst: list, value) -> None:
 
 
 def _today_order(state: dict) -> list:
-    return _tag(state, TODAY_TAG_ID)["taskIds"]
+    """The TODAY tag's ordering list; degrades to a detached no-op list
+    when the TODAY tag is missing (matching queries.py's tolerance)."""
+    tag = state["tag"]["entities"].get(TODAY_TAG_ID)
+    if tag is None:
+        return []
+    return tag.setdefault("taskIds", [])
 
 
 def _today_prepend(state: dict, task_ids: list[str]) -> None:
@@ -127,7 +132,11 @@ def add_task(d: dict, b: OpBuilder, task: dict) -> str:
         tag = _tag(state, tag_id)
         if task["id"] not in tag["taskIds"]:
             tag["taskIds"].append(task["id"])
-    if task.get("dueDay") == today_str():
+    today = today_str()
+    if task.get("dueDay") == today or (
+        task.get("dueWithTime") is not None
+        and day_of_ms(task["dueWithTime"]) == today
+    ):
         _today_prepend(state, [task["id"]])
     return task["id"]
 
@@ -220,9 +229,16 @@ def delete_task(d: dict, b: OpBuilder, task_id: str) -> None:
 
 def delete_tasks(d: dict, b: OpBuilder, task_ids: list[str]) -> None:
     state = _state(d)
+    # Native SP passes the flattened list of ALL deleted ids — every task
+    # plus each task's subTaskIds (the state cascade removes them anyway).
+    all_ids: dict[str, None] = {}
     for tid in task_ids:
-        _task(state, tid)
-    b.op("HDM", "DEL", "TASK", task_ids[0], {"taskIds": list(task_ids)}, ds=list(task_ids))
+        task = _task(state, tid)
+        all_ids[tid] = None
+        for sid in task.get("subTaskIds", []):
+            all_ids[sid] = None
+    flat = list(all_ids)
+    b.op("HDM", "DEL", "TASK", task_ids[0], {"taskIds": flat}, ds=flat)
     for tid in task_ids:
         _cascade_remove_task(state, tid)
 
@@ -314,8 +330,16 @@ def plan_today(d: dict, b: OpBuilder, task_ids: list[str]) -> None:
 
     for tid in task_ids:
         task = _task(state, tid)
-        task["dueDay"] = today
-        _clear_due_with_time(task)
+        if (
+            task.get("dueWithTime") is not None
+            and day_of_ms(task["dueWithTime"]) == today
+        ):
+            # Already scheduled today: SP keeps dueWithTime/remindAt and does
+            # NOT set dueDay (XOR) — membership already holds; ordering only.
+            pass
+        else:
+            task["dueDay"] = today
+            _clear_due_with_time(task)
     _today_prepend(state, task_ids)
     _planner_purge(state, task_ids)
 
@@ -336,6 +360,11 @@ unschedule = remove_from_today
 def plan_for_day(d: dict, b: OpBuilder, task_id: str, day: str) -> None:
     state = _state(d)
     task = _task(state, task_id)
+    if day < today_str():
+        raise MutationError(
+            f"cannot plan for a past day ({day}); "
+            "for today use 'sp today add'"
+        )
     snapshot = copy.deepcopy(task)
 
     b.op(
@@ -610,8 +639,9 @@ def archive_done(d: dict, b: OpBuilder) -> list[str]:
 
     for snapshot in snapshots:
         subtasks = snapshot.pop("subTasks")
+        # Archived entities are plain Tasks: no 'subTasks' key at all
+        # (subtasks are stored flattened alongside their parent).
         parent_entity = dict(snapshot)
-        parent_entity["subTasks"] = []  # flattened: subtasks stored separately
         for entity in [parent_entity] + [dict(s) for s in subtasks]:
             eid = entity["id"]
             if eid not in arch_reg["entities"]:

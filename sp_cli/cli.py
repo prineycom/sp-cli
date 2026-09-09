@@ -80,22 +80,29 @@ def _resolve_tag_refs(
     """Returns (tag_ids, extra_mutations creating missing tags)."""
     tag_ids: list[str] = []
     extra = []
+    missing: dict[str, str] = {}  # lowercased ref -> new id (dedupe creation)
     for ref in refs:
         try:
-            tag_ids.append(q.resolve_tag(d, ref))
+            tag_id = q.resolve_tag(d, ref)
         except q.NotFoundError:
             if not create_missing:
                 raise CliError(
                     f"tag '{ref}' not found (use --create-tags to create it)"
                 ) from None
-            new_id = nanoid()
-            title = ref
+            key = ref.lower()
+            if key in missing:
+                tag_id = missing[key]
+            else:
+                tag_id = nanoid()
+                missing[key] = tag_id
+                title = ref
 
-            def _create(dd, b, _id=new_id, _title=title):
-                mut.tag_add(dd, b, make_tag(_id, _title))
+                def _create(dd, b, _id=tag_id, _title=title):
+                    mut.tag_add(dd, b, make_tag(_id, _title))
 
-            extra.append(_create)
-            tag_ids.append(new_id)
+                extra.append(_create)
+        if tag_id not in tag_ids:
+            tag_ids.append(tag_id)
     return tag_ids, extra
 
 
@@ -149,6 +156,24 @@ def cmd_show(args) -> int:
 
 
 def cmd_add(args) -> int:
+    if args.parent:
+        incompatible = [
+            flag
+            for flag, value in (
+                ("--project", args.project),
+                ("--due", args.due),
+                ("--at", args.at),
+                ("--remind", args.remind),
+                ("--tag", args.tag),
+            )
+            if value
+        ]
+        if incompatible:
+            raise CliError(
+                f"--parent is incompatible with {', '.join(incompatible)}: "
+                "subtasks inherit the parent's project and carry no own "
+                "scheduling or tags"
+            )
     client, store = _ctx()
     d = client.get()
     est = render.parse_duration(args.est) if args.est else 0

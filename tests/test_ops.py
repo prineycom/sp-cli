@@ -1,7 +1,13 @@
 import re
 
 from sp_cli.ids import nanoid, new_client_id, uuid7
-from sp_cli.ops import MAX_RECENT_OPS, OpBuilder, finalize, merge_clocks
+from sp_cli.ops import (
+    MAX_CLOCK_ENTRIES,
+    MAX_RECENT_OPS,
+    OpBuilder,
+    finalize,
+    merge_clocks,
+)
 
 CLI = "B_test01"
 
@@ -149,3 +155,46 @@ class TestFinalize:
 
         with pytest.raises(ValueError):
             finalize(sample, [], CLI)
+
+    def test_missing_keys_default_gracefully(self, sample):
+        # A minimal file without syncVersion / vectorClock / recentOps.
+        del sample["syncVersion"]
+        del sample["vectorClock"]
+        del sample["recentOps"]
+        b = OpBuilder(sample, CLI)
+        ops = _op(b, 1)
+        finalize(sample, ops, CLI)
+        assert sample["syncVersion"] == 1  # defaulted 0 + 1
+        assert sample["recentOps"] == ops
+        assert sample["vectorClock"][CLI] == 1
+
+    def test_present_values_never_regressed(self, sample):
+        # Guard: existing syncVersion is incremented, not reset.
+        sample["syncVersion"] = 41
+        b = OpBuilder(sample, CLI)
+        ops = _op(b, 1)
+        finalize(sample, ops, CLI)
+        assert sample["syncVersion"] == 42
+
+    def test_vector_clock_capped_at_20_entries(self, sample):
+        sample["vectorClock"] = {f"C_{i:04d}": i + 1 for i in range(30)}
+        b = OpBuilder(sample, CLI)
+        ops = _op(b, 1)
+        finalize(sample, ops, CLI)
+        clock = sample["vectorClock"]
+        assert len(clock) == MAX_CLOCK_ENTRIES
+        assert clock[CLI] == 1  # own id always kept, even with low counter
+        # the 19 highest-counter foreign entries survive (counters 12..30)
+        kept_foreign = sorted(v for k, v in clock.items() if k != CLI)
+        assert kept_foreign == list(range(12, 31))
+        assert "C_0000" not in clock  # lowest counters dropped
+
+    def test_vector_clock_not_touched_when_under_cap(self, sample):
+        sample["vectorClock"]["OTHER"] = 9
+        b = OpBuilder(sample, CLI)
+        ops = _op(b, 1)
+        finalize(sample, ops, CLI)
+        clock = sample["vectorClock"]
+        assert clock["OTHER"] == 9
+        assert clock["I_jHradR"] == 5
+        assert clock[CLI] == 1

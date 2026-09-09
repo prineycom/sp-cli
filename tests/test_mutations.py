@@ -52,6 +52,26 @@ class TestAddTask:
         assert _today_order(sample)[0] == "A" * 21
         assert_doctor_clean(sample)
 
+    def test_add_due_with_time_today_enters_today_order(self, sample, b):
+        ts = int(
+            datetime.datetime.now()
+            .replace(hour=23, minute=0, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+        task = make_task("D" * 21, "timed today", "INBOX_PROJECT", due_with_time=ts)
+        mut.add_task(sample, b, task)
+        assert _today_order(sample)[0] == "D" * 21
+        assert_doctor_clean(sample)
+
+    def test_add_due_with_time_other_day_not_in_today_order(self, sample, b):
+        task = make_task(
+            "E" * 21, "timed later", "INBOX_PROJECT", due_with_time=1800000000000
+        )
+        mut.add_task(sample, b, task)
+        assert "E" * 21 not in _today_order(sample)
+        assert_doctor_clean(sample)
+
     def test_add_with_tags_syncs_membership(self, sample, b):
         tag = make_tag("G" * 21, "mytag")
         mut.tag_add(sample, b, tag)
@@ -163,6 +183,23 @@ class TestDelete:
         assert t2["id"] not in sample["state"]["task"]["entities"]
         assert_doctor_clean(sample)
 
+    def test_bulk_delete_flattens_subtask_ids(self, sample, b, add_task_entity):
+        t1 = add_task_entity(title="parent one")
+        sub1 = make_task("S" * 21, "sub1", "INBOX_PROJECT")
+        sub2 = make_task("Z" * 21, "sub2", "INBOX_PROJECT")
+        mut.add_subtask(sample, b, t1["id"], sub1)
+        mut.add_subtask(sample, b, t1["id"], sub2)
+        t2 = add_task_entity(title="two")
+
+        mut.delete_tasks(sample, b, [t1["id"], t2["id"]])
+        op = _last_op(b)
+        flat = [t1["id"], "S" * 21, "Z" * 21, t2["id"]]
+        assert op["ds"] == flat
+        assert op["p"]["actionPayload"] == {"taskIds": flat}
+        for tid in flat:
+            assert tid not in sample["state"]["task"]["entities"]
+        assert_doctor_clean(sample)
+
 
 class TestSubtask:
     def test_add_subtask(self, sample, b, add_task_entity):
@@ -250,6 +287,33 @@ class TestPlanning:
         assert t2["id"] not in sample["state"]["planner"]["days"]["2030-05-05"]
         assert_doctor_clean(sample)
 
+    def test_plan_today_keeps_due_with_time_when_already_today(
+        self, sample, b, add_task_entity
+    ):
+        ts = int(
+            datetime.datetime.now()
+            .replace(hour=23, minute=30, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+        t = add_task_entity(title="timed today", due_with_time=ts, remind_at=ts)
+        mut.plan_today(sample, b, [t["id"]])
+        task = _task(sample, t["id"])
+        assert task["dueWithTime"] == ts  # kept: already points to today
+        assert task["remindAt"] == ts
+        assert task.get("dueDay") is None  # XOR preserved: no dueDay set
+        assert _today_order(sample)[0] == t["id"]
+        assert_doctor_clean(sample)
+
+    def test_plan_today_without_today_tag_is_tolerated(
+        self, sample, b, add_task_entity
+    ):
+        t = add_task_entity(title="no today tag")
+        del sample["state"]["tag"]["entities"]["TODAY"]
+        sample["state"]["tag"]["ids"].remove("TODAY")
+        mut.plan_today(sample, b, [t["id"]])  # must not raise
+        assert _task(sample, t["id"])["dueDay"] == today_str()
+
     def test_remove_from_today(self, sample, b, add_task_entity):
         t = add_task_entity(title="rm", due_day=today_str())
         mut.plan_today(sample, b, [t["id"]])
@@ -285,6 +349,15 @@ class TestPlanning:
         mut.plan_for_day(sample, b, t["id"], today_str())
         assert _today_order(sample)[0] == t["id"]
         assert t["id"] not in sample["state"]["planner"]["days"].get(today_str(), [])
+        assert_doctor_clean(sample)
+
+    def test_plan_for_past_day_rejected(self, sample, b, add_task_entity):
+        t = add_task_entity(title="past")
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError, match="past day"):
+            mut.plan_for_day(sample, b, t["id"], yesterday)
+        assert len(b.ops) == n_ops  # no op emitted
         assert_doctor_clean(sample)
 
 
@@ -522,7 +595,10 @@ class TestArchive:
         arch = sample["archiveYoung"]["task"]
         assert done["id"] in arch["ids"]
         assert "S" * 21 in arch["ids"]
-        assert arch["entities"][done["id"]]["subTasks"] == []  # flattened
+        # flattened: archived entities carry no 'subTasks' key at all
+        assert "subTasks" not in arch["entities"][done["id"]]
+        assert "subTasks" not in arch["entities"]["S" * 21]
+        assert arch["entities"][done["id"]]["subTaskIds"] == ["S" * 21]
         assert arch["entities"]["S" * 21]["title"] == "done sub"
         assert "timeTracking" in sample["archiveYoung"]
         assert_doctor_clean(sample)

@@ -75,14 +75,13 @@ def is_today_member(task: dict, today: str | None = None) -> bool:
 
 
 def is_overdue(task: dict, today: str | None = None, now: int | None = None) -> bool:
+    """Overdue = due strictly before today. Tasks scheduled earlier TODAY are
+    today-members, not overdue. (`now` kept for signature compatibility.)"""
     if task.get("isDone"):
         return False
     today = today or today_str()
     if task.get("dueWithTime") is not None:
-        now = now if now is not None else int(
-            datetime.datetime.now().timestamp() * 1000
-        )
-        return task["dueWithTime"] < now
+        return day_of_ms(task["dueWithTime"]) < today
     due_day = task.get("dueDay")
     return due_day is not None and due_day < today
 

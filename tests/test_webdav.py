@@ -121,14 +121,24 @@ class TestGetPut:
         assert call["data"].startswith(b"pf_2__")
         assert client.etag == '"e2"'
 
-    def test_put_without_etag_sends_no_if_match(self, tmp_path):
+    def test_put_without_etag_refused(self, tmp_path):
+        session = FakeSession()
+        body = add_prefix(serialize(_minimal_file())).encode()
+        session.get_responses.append(FakeResponse(200, body, {}))
+        client = _client(tmp_path, session)
+        client.get()
+        with pytest.raises(WebDavError, match="ETag"):
+            client.put(_minimal_file())
+        assert session.put_calls == []  # nothing went over the wire
+
+    def test_put_without_etag_allowed_with_override(self, tmp_path):
         session = FakeSession()
         body = add_prefix(serialize(_minimal_file())).encode()
         session.get_responses.append(FakeResponse(200, body, {}))
         session.put_responses.append(FakeResponse(204, b"", {}))
         client = _client(tmp_path, session)
         client.get()
-        client.put(_minimal_file())
+        client.put(_minimal_file(), allow_unconditional=True)
         assert "If-Match" not in session.put_calls[0]["headers"]
 
     def test_412_raises_conflict(self, tmp_path):
@@ -158,7 +168,7 @@ class TestBackups:
         session = FakeSession()
         data = _minimal_file()
         body = add_prefix(serialize(data)).encode()
-        session.get_responses.append(FakeResponse(200, body, {}))
+        session.get_responses.append(FakeResponse(200, body, {"ETag": '"e1"'}))
         client = _client(tmp_path, session)
         client.get()
         self._do_put(client, session, data)
@@ -172,7 +182,7 @@ class TestBackups:
         body = add_prefix(serialize(data)).encode()
         client = _client(tmp_path, session)
         for _ in range(13):
-            session.get_responses.append(FakeResponse(200, body, {}))
+            session.get_responses.append(FakeResponse(200, body, {"ETag": '"e1"'}))
             client.get()
             self._do_put(client, session, data)
         backups = list((tmp_path / "backups").glob("sync-data-*.json"))
@@ -217,7 +227,9 @@ class TestStoreRetry:
 
         session = FakeSession()
         body = add_prefix(serialize(sample)).encode()
-        session.get_responses = [FakeResponse(200, body, {}) for _ in range(3)]
+        session.get_responses = [
+            FakeResponse(200, body, {"ETag": f'"e{i}"'}) for i in range(3)
+        ]
         session.put_responses = [FakeResponse(412, b"", {}) for _ in range(3)]
         client = _client(tmp_path, session)
         store = SyncStore(client, "B_test01")
