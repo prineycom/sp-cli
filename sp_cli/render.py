@@ -1,0 +1,180 @@
+"""Output helpers: durations, dates, tables, task rendering."""
+
+from __future__ import annotations
+
+import datetime
+import json
+import re
+
+SHORT_ID_LEN = 8
+TITLE_WIDTH = 42
+
+
+class RenderError(Exception):
+    pass
+
+
+_DURATION_RE = re.compile(
+    r"^\s*(?:(?P<h>\d+(?:\.\d+)?)\s*h)?\s*(?:(?P<m>\d+(?:\.\d+)?)\s*m)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_duration(text: str) -> int:
+    """'30m', '1h', '1.5h', '90m', '1h30m', bare '90' (minutes) → ms."""
+    if re.fullmatch(r"\d+", text.strip()):
+        return int(text.strip()) * 60_000
+    m = _DURATION_RE.match(text)
+    if not m or (m.group("h") is None and m.group("m") is None):
+        raise RenderError(f"cannot parse duration '{text}' (use e.g. 30m, 1.5h, 1h30m)")
+    hours = float(m.group("h") or 0)
+    minutes = float(m.group("m") or 0)
+    return int(round((hours * 60 + minutes) * 60_000))
+
+
+def format_duration(ms: int | None) -> str:
+    if not ms:
+        return "-"
+    total_min = int(round(ms / 60_000))
+    h, m = divmod(total_min, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
+def parse_offset(text: str) -> int:
+    """Reminder offset like 10m / 1h / 0m → ms."""
+    return parse_duration(text)
+
+
+def format_ts(ms: int | None) -> str:
+    if ms is None:
+        return "-"
+    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def format_time(ms: int | None) -> str:
+    if ms is None:
+        return "-"
+    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%H:%M")
+
+
+def short_id(task_id: str) -> str:
+    return task_id[:SHORT_ID_LEN]
+
+
+def truncate(text: str, width: int) -> str:
+    text = (text or "").replace("\n", " ")
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        print("(none)")
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print(fmt.format(*["-" * w for w in widths]))
+    for row in rows:
+        print(fmt.format(*[str(c) for c in row]))
+
+
+def _due_str(task: dict) -> str:
+    if task.get("dueWithTime") is not None:
+        return format_ts(task["dueWithTime"])
+    return task.get("dueDay") or "-"
+
+
+def task_rows(d: dict, tasks: list[dict]) -> list[list[str]]:
+    projects = d["state"]["project"]["entities"]
+    tags = d["state"]["tag"]["entities"]
+    rows = []
+    for t in tasks:
+        tag_names = ",".join(
+            tags[tg]["title"] for tg in t.get("tagIds", []) if tg in tags
+        )
+        project = projects.get(t.get("projectId"), {}).get("title", "?")
+        est = format_duration(t.get("timeEstimate"))
+        spent = format_duration(t.get("timeSpent"))
+        rows.append(
+            [
+                short_id(t["id"]),
+                ("x" if t.get("isDone") else " "),
+                truncate(t.get("title", ""), TITLE_WIDTH),
+                project,
+                _due_str(t),
+                f"{est}/{spent}",
+                tag_names,
+            ]
+        )
+    return rows
+
+
+def print_tasks(d: dict, tasks: list[dict]) -> None:
+    print_table(["id", "✓", "title", "project", "due", "est/spent", "tags"], task_rows(d, tasks))
+
+
+def print_json(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def task_card(d: dict, task: dict) -> str:
+    state = d["state"]
+    projects = state["project"]["entities"]
+    tags = state["tag"]["entities"]
+    cfgs = state.get("taskRepeatCfg", {}).get("entities", {})
+    lines = [
+        f"id:       {task['id']}",
+        f"title:    {task.get('title', '')}",
+        f"project:  {projects.get(task.get('projectId'), {}).get('title', '?')} ({task.get('projectId')})",
+        f"done:     {'yes (' + format_ts(task.get('doneOn')) + ')' if task.get('isDone') else 'no'}",
+        f"created:  {format_ts(task.get('created'))}",
+        f"estimate: {format_duration(task.get('timeEstimate'))}",
+        f"spent:    {format_duration(task.get('timeSpent'))}",
+    ]
+    if task.get("tagIds"):
+        names = ", ".join(tags[t]["title"] for t in task["tagIds"] if t in tags)
+        lines.append(f"tags:     {names}")
+    if task.get("dueDay"):
+        lines.append(f"due:      {task['dueDay']}")
+    if task.get("dueWithTime") is not None:
+        lines.append(f"due at:   {format_ts(task['dueWithTime'])}")
+    if task.get("remindAt") is not None:
+        lines.append(f"remind:   {format_ts(task['remindAt'])}")
+    if task.get("deadlineDay"):
+        lines.append(f"deadline: {task['deadlineDay']}")
+    if task.get("deadlineWithTime") is not None:
+        lines.append(f"deadline: {format_ts(task['deadlineWithTime'])}")
+    if task.get("repeatCfgId"):
+        cfg = cfgs.get(task["repeatCfgId"], {})
+        lines.append(
+            f"repeat:   {cfg.get('repeatCycle', '?')} every {cfg.get('repeatEvery', '?')}"
+        )
+    if task.get("parentId"):
+        lines.append(f"parent:   {task['parentId']}")
+    if task.get("timeSpentOnDay"):
+        per_day = ", ".join(
+            f"{day}: {format_duration(ms)}"
+            for day, ms in sorted(task["timeSpentOnDay"].items())
+        )
+        lines.append(f"per day:  {per_day}")
+    if task.get("notes"):
+        lines.append("notes:")
+        for ln in task["notes"].splitlines():
+            lines.append(f"  {ln}")
+    subs = task.get("subTaskIds", [])
+    if subs:
+        lines.append("subtasks:")
+        entities = state["task"]["entities"]
+        for sid in subs:
+            sub = entities.get(sid)
+            if sub:
+                mark = "x" if sub.get("isDone") else " "
+                lines.append(f"  [{mark}] {short_id(sid)} {sub.get('title', '')}")
+    return "\n".join(lines)
