@@ -3397,8 +3397,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = _rewrite_argv(list(sys.argv[1:] if argv is None else argv))
+def main(argv: list[str] | None = None, *, rewrite: bool = True) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if rewrite:  # human-CLI alias layer; canonical argv (MCP) must skip it
+        argv = _rewrite_argv(argv)
     group_help = _board_group_help(argv) or _provider_group_help(argv)
     if group_help:
         print(group_help, file=sys.stderr)
