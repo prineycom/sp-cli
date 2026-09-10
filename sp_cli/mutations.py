@@ -1284,6 +1284,12 @@ def set_deadline(
         payload["deadlineDay"] = deadline_day
     else:
         payload["deadlineWithTime"] = deadline_with_time
+    # The reducer rebuilds the reminder from the payload: a MISSING
+    # `deadlineRemindAt` CLEARS it. Editing the deadline day without an
+    # explicit --remind must therefore carry the current value over.
+    # `autoPlan*` is never sent.
+    if deadline_remind_at is None:
+        deadline_remind_at = task.get("deadlineRemindAt")
     if deadline_remind_at is not None:
         payload["deadlineRemindAt"] = deadline_remind_at
     b.op("HDL", "UPD", "TASK", task_id, payload)
@@ -1294,8 +1300,40 @@ def set_deadline(
     else:
         task["deadlineWithTime"] = deadline_with_time
         task["deadlineDay"] = None
-    if deadline_remind_at is not None:
-        task["deadlineRemindAt"] = deadline_remind_at
+    task["deadlineRemindAt"] = deadline_remind_at
+
+
+def remove_deadline(d: dict, b: OpBuilder, task_id: str) -> None:
+    """HXD — clears deadlineDay + deadlineWithTime + deadlineRemindAt.
+
+    The `due*` fields are a separate axis and stay untouched.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    b.op("HXD", "UPD", "TASK", task_id, {"taskId": task_id})
+    task["deadlineDay"] = None
+    task["deadlineWithTime"] = None
+    task["deadlineRemindAt"] = None
+
+
+def clear_deadline_reminder(d: dict, b: OpBuilder, task_id: str) -> None:
+    """HCR — clears only `deadlineRemindAt`; the deadline itself survives."""
+    state = _state(d)
+    task = _task(state, task_id)
+    b.op("HCR", "UPD", "TASK", task_id, {"taskId": task_id})
+    task["deadlineRemindAt"] = None
+
+
+def dismiss_reminder(d: dict, b: OpBuilder, task_id: str) -> None:
+    """HRX — clears only `remindAt` (payload key is `id`, not `taskId`).
+
+    `dueWithTime` / `dueDay` / TODAY membership are all kept: this is the
+    "stop nagging me" action, not an unschedule.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    b.op("HRX", "UPD", "TASK", task_id, {"id": task_id})
+    task["remindAt"] = None
 
 
 # ---------------------------------------------------------------- tracking

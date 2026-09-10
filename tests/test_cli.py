@@ -2514,3 +2514,68 @@ class TestAttachCommands:
         out = capsys.readouterr().out
         assert "attachments:" in out
         assert "[LINK] One — https://a/one.txt" in out
+
+
+class TestDeadlineClearCommands:
+    def test_clear_emits_hxd(self, fake_ctx, sample, add_task_entity, capsys):
+        t = add_task_entity(title="dl")
+        t["deadlineDay"] = "2030-06-01"
+        assert cli.cmd_deadline(_args(["deadline", t["id"], "--clear"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HXD"
+        assert op["p"]["actionPayload"] == {"taskId": t["id"]}
+        assert "cleared" in capsys.readouterr().out
+
+    def test_clear_reminder_emits_hcr(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        t["deadlineWithTime"] = 1900000000000
+        t["deadlineRemindAt"] = 1899999000000
+        assert cli.cmd_deadline(_args(["deadline", t["id"], "--clear-reminder"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HCR"
+        assert op["p"]["actionPayload"] == {"taskId": t["id"]}
+        assert sample["state"]["task"]["entities"][t["id"]]["deadlineWithTime"] == (
+            1900000000000
+        )
+
+    def test_clear_rejects_both_flags(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        with pytest.raises(cli.CliError, match="exclusive"):
+            cli.cmd_deadline(
+                _args(["deadline", t["id"], "--clear", "--clear-reminder"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_clear_rejects_a_value_flag(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        with pytest.raises(cli.CliError, match="takes no"):
+            cli.cmd_deadline(
+                _args(["deadline", t["id"], "--clear", "--day", "2030-06-01"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_deadline_edit_carries_the_existing_reminder(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="dl")
+        t["deadlineRemindAt"] = 1899999000000
+        assert cli.cmd_deadline(
+            _args(["deadline", t["id"], "--day", "2030-07-01"])
+        ) == 0
+        p = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert p["deadlineDay"] == "2030-07-01"
+        assert p["deadlineRemindAt"] == 1899999000000
+
+    def test_dismiss_emits_hrx_with_id_key(
+        self, fake_ctx, sample, add_task_entity, capsys
+    ):
+        t = add_task_entity(title="rem", due_with_time=1900000000000)
+        t["remindAt"] = 1899999000000
+        assert cli.cmd_dismiss(_args(["dismiss", t["id"]])) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"]) == ("HRX", "TASK")
+        assert op["p"]["actionPayload"] == {"id": t["id"]}
+        task = sample["state"]["task"]["entities"][t["id"]]
+        assert task["remindAt"] is None
+        assert task["dueWithTime"] == 1900000000000
+        assert "dismissed" in capsys.readouterr().out

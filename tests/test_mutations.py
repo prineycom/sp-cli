@@ -630,6 +630,88 @@ class TestDeadline:
         with pytest.raises(mut.MutationError):
             mut.set_deadline(sample, b, t["id"])
 
+    def test_existing_remind_survives_a_day_edit(self, sample, b, add_task_entity):
+        """Omitting deadlineRemindAt in an HDL payload CLEARS it — so an edit
+        that says nothing about the reminder must carry the old value along."""
+        t = add_task_entity(title="dl4")
+        t["deadlineRemindAt"] = 1899999000000
+        mut.set_deadline(sample, b, t["id"], deadline_day="2030-06-01")
+        p = _last_op(b)["p"]["actionPayload"]
+        assert p["deadlineRemindAt"] == 1899999000000
+        assert "autoPlanToday" not in p
+        assert "autoPlanStartOfNextDayDiffMs" not in p
+        assert _task(sample, t["id"])["deadlineRemindAt"] == 1899999000000
+
+    def test_explicit_remind_overrides_existing(self, sample, b, add_task_entity):
+        t = add_task_entity(title="dl5")
+        t["deadlineRemindAt"] = 1
+        mut.set_deadline(
+            sample,
+            b,
+            t["id"],
+            deadline_with_time=1900000000000,
+            deadline_remind_at=1899999000000,
+        )
+        p = _last_op(b)["p"]["actionPayload"]
+        assert p["deadlineRemindAt"] == 1899999000000
+        assert _task(sample, t["id"])["deadlineRemindAt"] == 1899999000000
+
+
+class TestDeadlineClear:
+    def test_remove_deadline(self, sample, b, add_task_entity):
+        t = add_task_entity(title="xd", due_day="2030-01-01")
+        t["deadlineDay"] = "2030-06-01"
+        t["deadlineWithTime"] = None
+        t["deadlineRemindAt"] = 1899999000000
+        mut.remove_deadline(sample, b, t["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("HXD", "UPD", "TASK", t["id"])
+        assert op["p"]["actionPayload"] == {"taskId": t["id"]}
+        task = _task(sample, t["id"])
+        assert task["deadlineDay"] is None
+        assert task["deadlineWithTime"] is None
+        assert task["deadlineRemindAt"] is None
+        assert task["dueDay"] == "2030-01-01"  # due* is a separate axis
+        assert_doctor_clean(sample)
+
+    def test_clear_deadline_reminder_keeps_the_deadline(
+        self, sample, b, add_task_entity
+    ):
+        t = add_task_entity(title="hcr")
+        t["deadlineWithTime"] = 1900000000000
+        t["deadlineRemindAt"] = 1899999000000
+        mut.clear_deadline_reminder(sample, b, t["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("HCR", "UPD", "TASK", t["id"])
+        assert op["p"]["actionPayload"] == {"taskId": t["id"]}
+        task = _task(sample, t["id"])
+        assert task["deadlineRemindAt"] is None
+        assert task["deadlineWithTime"] == 1900000000000
+        assert_doctor_clean(sample)
+
+    def test_dismiss_reminder_uses_id_key_and_keeps_schedule(
+        self, sample, b, add_task_entity
+    ):
+        t = add_task_entity(title="hrx", due_with_time=1900000000000)
+        t["remindAt"] = 1899999000000
+        _today_order(sample).append(t["id"])
+        mut.dismiss_reminder(sample, b, t["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("HRX", "UPD", "TASK", t["id"])
+        assert op["p"]["actionPayload"] == {"id": t["id"]}  # key is `id`, not taskId
+        task = _task(sample, t["id"])
+        assert task["remindAt"] is None
+        assert task["dueWithTime"] == 1900000000000
+        assert task.get("dueDay") is None
+        assert t["id"] in _today_order(sample)
+        assert_doctor_clean(sample)
+
+    def test_clears_reject_unknown_task(self, sample, b):
+        for fn in (mut.remove_deadline, mut.clear_deadline_reminder,
+                   mut.dismiss_reminder):
+            with pytest.raises(mut.MutationError):
+                fn(sample, b, "N" * 21)
+
 
 class TestTrackTime:
     def test_track(self, sample, b, add_task_entity):

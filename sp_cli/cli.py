@@ -677,6 +677,20 @@ def cmd_deadline(args) -> int:
     client, store = _ctx()
     d = client.get()
     tid = q.resolve_task(d, args.id)
+    if args.clear or args.clear_reminder:
+        if args.clear and args.clear_reminder:
+            raise CliError("deadline: --clear and --clear-reminder are exclusive")
+        if args.day or args.at or args.remind:
+            raise CliError("deadline: --clear* takes no --day / --at / --remind")
+        if args.clear:
+            store.commit([lambda dd, b: mut.remove_deadline(dd, b, tid)], initial=d)
+            print(f"deadline cleared on {render.short_id(tid)}")
+        else:
+            store.commit(
+                [lambda dd, b: mut.clear_deadline_reminder(dd, b, tid)], initial=d
+            )
+            print(f"deadline reminder cleared on {render.short_id(tid)}")
+        return 0
     if bool(args.day) == bool(args.at):
         raise CliError("deadline: give exactly one of --day / --at")
     day = _parse_day(args.day) if args.day else None
@@ -700,6 +714,15 @@ def cmd_deadline(args) -> int:
         initial=d,
     )
     print(f"deadline set on {render.short_id(tid)}")
+    return 0
+
+
+def cmd_dismiss(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    store.commit([lambda dd, b: mut.dismiss_reminder(dd, b, tid)], initial=d)
+    print(f"reminder dismissed on {render.short_id(tid)}")
     return 0
 
 
@@ -2691,6 +2714,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--day", help="YYYY-MM-DD")
     s.add_argument("--at", help="'YYYY-MM-DD HH:MM'")
     s.add_argument("--remind", help="offset before --at, e.g. 1h")
+    s.add_argument("--clear", action="store_true", help="remove the deadline")
+    s.add_argument(
+        "--clear-reminder",
+        action="store_true",
+        help="keep the deadline, drop its reminder",
+    )
+
+    s = add("dismiss", cmd_dismiss, "drop a task's reminder, keep its schedule")
+    s.add_argument("id")
 
     s = add("agenda", cmd_agenda, "overdue / today / scheduled / deadlines")
     s.add_argument("--json", action="store_true")

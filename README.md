@@ -173,6 +173,9 @@ restoreToToday?}`): задача возвращается вместе со вс
 ./sp schedule <id> --at "2026-09-10 14:00" [--remind 10m]
 ./sp unschedule <id>
 ./sp deadline <id> (--day YYYY-MM-DD | --at "YYYY-MM-DD HH:MM") [--remind 1h]
+./sp deadline <id> --clear            # снять дедлайн целиком (и его напоминание)
+./sp deadline <id> --clear-reminder   # оставить дедлайн, убрать напоминание
+./sp dismiss <id>                     # убрать напоминание задачи, время оставить
 ./sp repeat <id> --every day|week|month|year [--interval N] [--days mon,tue] \
              [--start-time HH:MM] [--start-date YYYY-MM-DD] \
              [--remind AtStart|m5|m10|m15|m30|h1]
@@ -186,6 +189,10 @@ restoreToToday?}`): задача возвращается вместе со вс
 ./sp repeat rm <cfg-id|title> [--yes]   # удалить repeat-конфиг; сами задачи остаются,
                                         # ссылка repeatCfgId снимается (живые + архив)
 ```
+
+`deadline --clear` не трогает `due*` (планирование и дедлайн — независимые оси),
+а `dismiss` не трогает дедлайн и не снимает задачу с расписания. Правка дедлайна
+без `--remind` сохраняет уже установленное напоминание.
 
 `repeat edit` шлёт `RU`. Очистка полей — только через `--clear`: очищаемые ключи
 уходят сиблингом `clearedFields` рядом с `taskRepeatCfg` в actionPayload, потому
