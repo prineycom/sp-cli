@@ -2520,11 +2520,32 @@ class TestProjectDelete:
         mut.plan_for_day(sample, b, "T" * 21, today_str())
         mut.note_add(sample, b, make_note("N" * 21, "note", project_id="P" * 21))
 
+        # A Section has NO projectId: {id, contextId, contextType, taskIds}.
+        # SEC3 is the TODAY-tag bucket, which holds a doomed task too.
         state["section"] = {
-            "ids": ["SEC1", "SEC2"],
+            "ids": ["SEC1", "SEC2", "SEC3"],
             "entities": {
-                "SEC1": {"id": "SEC1", "projectId": "P" * 21},
-                "SEC2": {"id": "SEC2", "projectId": "INBOX_PROJECT"},
+                "SEC1": {
+                    "id": "SEC1",
+                    "contextId": "P" * 21,
+                    "contextType": "PROJECT",
+                    "title": "doomed",
+                    "taskIds": ["T" * 21],
+                },
+                "SEC2": {
+                    "id": "SEC2",
+                    "contextId": "INBOX_PROJECT",
+                    "contextType": "PROJECT",
+                    "title": "kept",
+                    "taskIds": [],
+                },
+                "SEC3": {
+                    "id": "SEC3",
+                    "contextId": "TODAY",
+                    "contextType": "TAG",
+                    "title": "today",
+                    "taskIds": ["T" * 21],
+                },
             },
         }
         state["menuTree"] = {
@@ -2608,7 +2629,9 @@ class TestProjectDelete:
         assert _today_order(sample) == []
         assert state["planner"]["days"] == {}
         assert state["note"]["ids"] == []
-        assert state["section"]["ids"] == ["SEC2"]
+        # the project's own section is gone; the surviving ones lose the ids
+        assert state["section"]["ids"] == ["SEC2", "SEC3"]
+        assert state["section"]["entities"]["SEC3"]["taskIds"] == []
         assert state["menuTree"]["projectTree"][1]["children"] == []
         assert state["issueProvider"]["entities"]["I" * 21]["defaultProjectId"] is None
         arch = state["archiveYoung"]["task"]
@@ -3242,6 +3265,17 @@ class TestProjectMove:
         with pytest.raises(mut.MutationError, match="anchor"):
             mut.project_move_after(sample, b, a["id"], other["id"])
 
+    def test_a_task_without_a_project_degrades_to_a_mutation_error(
+        self, sample, b, add_task_entity
+    ):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        a.pop("projectId")
+        with pytest.raises(mut.MutationError, match="no project"):
+            mut.project_move(sample, b, a["id"], "up")
+        with pytest.raises(mut.MutationError, match="no project"):
+            mut.project_move_after(sample, b, a["id"], None)
+        assert b.ops == []
+
 
 class TestSubtaskMove:
     def _seed(self, sample, add_task_entity):
@@ -3606,6 +3640,23 @@ class TestPromote:
             mut.promote(sample, b, parent["id"])
         assert b.ops == []
 
+    def test_tag_list_without_the_old_parent_appends(
+        self, sample, b, add_task_entity
+    ):
+        """`moveItemAfterAnchor` degrades to an append when the anchor (the
+        former parent) is missing from that tag's list — the subtask carries a
+        tag its parent never had."""
+        parent, sub = self._seed(sample, add_task_entity)
+        tag = make_tag("G" * 21, "own only")
+        mut.tag_add(sample, b, tag)
+        other = add_task_entity(task_id="O" * 21, title="other")
+        mut.add_tag_to_task(sample, b, other["id"], tag["id"])
+        mut.add_tag_to_task(sample, b, sub["id"], tag["id"])
+        assert parent["id"] not in tag["taskIds"]
+        mut.promote(sample, b, sub["id"])
+        assert tag["taskIds"] == [other["id"], sub["id"]]
+        assert_doctor_clean(sample)
+
 
 class TestPlannerMoveBefore:
     def _seed(self, sample, add_task_entity):
@@ -3672,6 +3723,164 @@ class TestPlannerMoveBefore:
         a, _target = self._seed(sample, add_task_entity)
         with pytest.raises(mut.MutationError, match="task not found"):
             mut.planner_move_before(sample, b, a["id"], "Z" * 21)
+
+    def test_unplanned_anchor_without_due_day_is_refused(
+        self, sample, b, add_task_entity
+    ):
+        a, target = self._seed(sample, add_task_entity)
+        del sample["state"]["planner"]["days"]["2030-01-02"]
+        target["dueDay"] = None
+        with pytest.raises(mut.MutationError, match="not planned for any day"):
+            mut.planner_move_before(sample, b, a["id"], target["id"])
+        assert b.ops == []
+        assert sample["state"]["planner"]["days"]["2030-01-01"] == [a["id"]]
+
+
+def _section(sid, ctx_type, ctx_id, task_ids):
+    return {
+        "id": sid,
+        "contextId": ctx_id,
+        "contextType": ctx_type,
+        "title": sid,
+        "taskIds": list(task_ids),
+    }
+
+
+def _sections(d):
+    return d["state"]["section"]["entities"]
+
+
+def _seed_sections(d, *sections):
+    d["state"]["section"] = {
+        "ids": [s["id"] for s in sections],
+        "entities": {s["id"]: s for s in sections},
+    }
+
+
+class TestSectionMirroring:
+    """A Section is {id, contextId, contextType, title, isExpanded?, taskIds}
+    — no `projectId`, and a task carries no `sectionId`. Every op that runs
+    section-shared.reducer.ts on the devices must land the same way here."""
+
+    def _seed(self, sample, add_task_entity, n=3):
+        tasks = [
+            add_task_entity(task_id=chr(65 + i) * 21, title=f"t{i}")
+            for i in range(n)
+        ]
+        _proj(sample)["taskIds"] = [t["id"] for t in tasks]
+        _today_order(sample)[:] = [t["id"] for t in tasks]
+        return tasks
+
+    def test_project_move_reorders_the_section(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        _seed_sections(
+            sample,
+            _section("S1", "PROJECT", "INBOX_PROJECT", [a["id"], bb["id"], c["id"]]),
+            # another context: untouched
+            _section("S2", "TAG", "TODAY", [a["id"], bb["id"], c["id"]]),
+        )
+        mut.project_move(sample, b, c["id"], "up")
+        assert _proj(sample)["taskIds"] == [a["id"], c["id"], bb["id"]]
+        assert _sections(sample)["S1"]["taskIds"] == [a["id"], c["id"], bb["id"]]
+        assert _sections(sample)["S2"]["taskIds"] == [a["id"], bb["id"], c["id"]]
+        mut.project_move(sample, b, c["id"], "bottom")
+        assert _sections(sample)["S1"]["taskIds"] == [a["id"], bb["id"], c["id"]]
+        assert_doctor_clean(sample)
+
+    def test_today_move_reorders_the_today_section_skipping_done(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, c = self._seed(sample, add_task_entity)
+        bb["isDone"] = True
+        _seed_sections(
+            sample,
+            _section("S1", "TAG", "TODAY", [a["id"], bb["id"], c["id"]]),
+            _section("S2", "TAG", "G" * 21, [a["id"], bb["id"], c["id"]]),
+        )
+        mut.tag_add(sample, b, make_tag("G" * 21, "other"))
+        mut.today_move(sample, b, c["id"], "up")
+        # the DONE neighbour is hopped over in both stores
+        assert _today_order(sample) == [c["id"], a["id"], bb["id"]]
+        assert _sections(sample)["S1"]["taskIds"] == [c["id"], a["id"], bb["id"]]
+        assert _sections(sample)["S2"]["taskIds"] == [a["id"], bb["id"], c["id"]]
+
+    def test_a_task_absent_from_the_section_is_left_alone(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, c = self._seed(sample, add_task_entity)
+        _seed_sections(
+            sample, _section("S1", "PROJECT", "INBOX_PROJECT", [a["id"], bb["id"]])
+        )
+        mut.project_move(sample, b, c["id"], "top")
+        assert _sections(sample)["S1"]["taskIds"] == [a["id"], bb["id"]]
+
+    def test_demote_strips_the_task_from_every_section(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, _c = self._seed(sample, add_task_entity)
+        _seed_sections(
+            sample,
+            _section("S1", "PROJECT", "INBOX_PROJECT", [a["id"], bb["id"]]),
+            _section("S2", "TAG", "TODAY", [bb["id"]]),
+        )
+        mut.demote(sample, b, bb["id"], a["id"])
+        assert _sections(sample)["S1"]["taskIds"] == [a["id"]]
+        assert _sections(sample)["S2"]["taskIds"] == []
+        assert_doctor_clean(sample)
+
+    def test_delete_strips_the_task_and_its_subtasks(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, _c = self._seed(sample, add_task_entity)
+        sub = _seed_sub(sample, add_task_entity, a, "S" * 21, title="sub")
+        _seed_sections(
+            sample,
+            # a stale subtask ref (pre-fix data) goes too
+            _section("S1", "PROJECT", "INBOX_PROJECT", [a["id"], sub["id"], bb["id"]]),
+        )
+        mut.delete_task(sample, b, a["id"])
+        assert _sections(sample)["S1"]["taskIds"] == [bb["id"]]
+        assert_doctor_clean(sample)
+
+    def test_move_to_project_clears_the_old_project_sections(
+        self, sample, b, add_task_entity
+    ):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        mut.project_add(sample, b, make_project("Q" * 21, "other"))
+        _seed_sections(
+            sample,
+            _section("S1", "PROJECT", "INBOX_PROJECT", [a["id"]]),
+            _section("S2", "PROJECT", "Q" * 21, []),
+        )
+        mut.move_to_project(sample, b, a["id"], "Q" * 21)
+        assert _sections(sample)["S1"]["taskIds"] == []
+        assert _sections(sample)["S2"]["taskIds"] == []
+        assert_doctor_clean(sample)
+
+    def test_restore_comes_back_section_less(self, sample, b, add_task_entity):
+        archived = make_task("R" * 21, "archived", "INBOX_PROJECT")
+        archived["isDone"] = True
+        sample["state"]["archiveYoung"]["task"] = {
+            "ids": [archived["id"]],
+            "entities": {archived["id"]: archived},
+        }
+        _seed_sections(
+            sample, _section("S1", "PROJECT", "INBOX_PROJECT", [archived["id"]])
+        )
+        mut.restore_task(sample, b, archived["id"])
+        assert _sections(sample)["S1"]["taskIds"] == []
+        # membership is not a task field
+        assert "sectionId" not in sample["state"]["task"]["entities"][archived["id"]]
+        assert_doctor_clean(sample)
+
+    def test_a_file_without_a_section_registry_is_tolerated(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, _c = self._seed(sample, add_task_entity)
+        sample["state"].pop("section", None)
+        mut.project_move(sample, b, bb["id"], "up")
+        mut.demote(sample, b, bb["id"], a["id"])
+        assert_doctor_clean(sample)
 
 
 class TestAttachments:

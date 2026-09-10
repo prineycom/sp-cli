@@ -108,6 +108,70 @@ def _move_item_after_anchor(lst: list, item_id: str, after_id: str | None) -> No
     lst.insert(lst.index(after_id) + 1, item_id)
 
 
+# ---------------------------------------------------------------- sections
+# SP's Section (features/section/section.model.ts) is
+#   {id, contextId, contextType: 'PROJECT'|'TAG', title, isExpanded?, taskIds}
+# — there is NO `projectId` on a section and NO `sectionId` on a task:
+# membership lives ONLY in `section.taskIds`. Sections are mirrored (never
+# emitted): the op we send re-runs section-shared.reducer.ts on every device,
+# so our snapshot has to end up where theirs does.
+
+
+def _sections(state: dict) -> list[dict]:
+    reg = state.get("section")
+    if not isinstance(reg, dict):
+        return []
+    entities = reg.get("entities")
+    if not isinstance(entities, dict):
+        return []
+    return [s for s in entities.values() if isinstance(s, dict)]
+
+
+def _section_task_ids(section: dict) -> list | None:
+    ids = section.get("taskIds")
+    return ids if isinstance(ids, list) else None
+
+
+def _section_remove_task_ids(
+    state: dict,
+    task_ids: list[str],
+    context_type: str | None = None,
+    context_id: str | None = None,
+) -> None:
+    """`cleanupSectionTaskIds` (both context filters None) and the
+    `removeTaskIdsFrom{Project,Today}Sections` variants: strip the ids from
+    every matching section's `taskIds`."""
+    if not task_ids:
+        return
+    for section in _sections(state):
+        if context_type is not None and section.get("contextType") != context_type:
+            continue
+        if context_id is not None and section.get("contextId") != context_id:
+            continue
+        ids = _section_task_ids(section)
+        if ids is None:
+            continue
+        for tid in task_ids:
+            _list_remove(ids, tid)
+
+
+def _section_reorder_task(
+    state: dict, context_type: str, context_id: str, task_id: str, apply_move
+) -> None:
+    """`reorderTaskInContextSections`: the work-context move that reorders
+    project/tag `taskIds` also reorders the task inside the section that holds
+    it for that context — same reducer pass, same `updateOrder` closure."""
+    for section in _sections(state):
+        if section.get("contextType") != context_type:
+            continue
+        if section.get("contextId") != context_id:
+            continue
+        ids = _section_task_ids(section)
+        if ids is None or task_id not in ids:
+            continue
+        apply_move(ids)
+
+
 def _today_order(state: dict) -> list:
     """The TODAY tag's ordering list; degrades to a detached no-op list
     when the TODAY tag is missing (matching queries.py's tolerance)."""
@@ -323,6 +387,8 @@ def _cascade_remove_task(state: dict, task_id: str) -> None:
         for tid in all_ids:
             _list_remove(tag.get("taskIds", []), tid)
     _planner_purge(state, all_ids)
+    # handleTaskRemoval: the ids leave EVERY section, whatever its context.
+    _section_remove_task_ids(state, all_ids)
     _clear_current_task_refs(state, all_ids)
 
 
@@ -397,6 +463,14 @@ def move_to_project(d: dict, b: OpBuilder, task_id: str, target_project_id: str)
     if old_project:
         _list_remove(old_project["taskIds"], task_id)
         _list_remove(old_project.get("backlogTaskIds", []), task_id)
+        # handleMoveToOtherProject: membership in the OLD project's sections
+        # is stale once the task (and its subtasks) left the project.
+        _section_remove_task_ids(
+            state,
+            [task_id] + list(task.get("subTaskIds", [])),
+            context_type="PROJECT",
+            context_id=old_project["id"],
+        )
     if task_id not in target["taskIds"]:
         target["taskIds"].append(task_id)
 
@@ -574,6 +648,7 @@ def today_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> None:
             f"task {task_id} is not in today's list ('sp today add' first)"
         )
 
+    undone = _undone_ids(state, order)
     b.op(
         _WM_ACTIONS[direction],
         "MOV",
@@ -582,12 +657,22 @@ def today_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> None:
         {
             "taskId": task_id,
             "workContextId": TODAY_TAG_ID,
-            "doneTaskIds": _undone_ids(state, order),
+            "doneTaskIds": undone,
             "workContextType": "TAG",
         },
     )
 
-    _move_in_list(order, task_id, direction, _undone_ids(state, order))
+    _move_in_list(order, task_id, direction, undone)
+    # Same op, same pass: the section holding the task for this context is
+    # reordered with the very same closure (payload `doneTaskIds`, i.e. the
+    # context's NOT-done ids — a section id absent from it is stepped over).
+    _section_reorder_task(
+        state,
+        "TAG",
+        TODAY_TAG_ID,
+        task_id,
+        lambda ids: _move_in_list(ids, task_id, direction, undone),
+    )
 
 
 def _project_list_task(state: dict, task_id: str) -> tuple[dict, dict]:
@@ -596,7 +681,10 @@ def _project_list_task(state: dict, task_id: str) -> tuple[dict, dict]:
         raise MutationError(
             "cannot reorder a subtask in the project list; use 'sp subtask move'"
         )
-    project = _project(state, task["projectId"])
+    project_id = task.get("projectId")
+    if not project_id:
+        raise MutationError(f"task {task_id} has no project to reorder it in")
+    project = _project(state, project_id)
     if task_id in project.get("backlogTaskIds", []):
         raise MutationError(
             f"task {task_id} is in the backlog of {project['id']} "
@@ -618,6 +706,7 @@ def project_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> str:
     project_id = project["id"]
     task_ids = project["taskIds"]
 
+    undone = _undone_ids(state, task_ids)
     b.op(
         _WM_ACTIONS[direction],
         "MOV",
@@ -626,12 +715,20 @@ def project_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> str:
         {
             "taskId": task_id,
             "workContextId": project_id,
-            "doneTaskIds": _undone_ids(state, task_ids),
+            "doneTaskIds": undone,
             "workContextType": "PROJECT",
         },
     )
 
-    _move_in_list(task_ids, task_id, direction, _undone_ids(state, task_ids))
+    _move_in_list(task_ids, task_id, direction, undone)
+    # reorderTaskInContextSections, with the closure the reducer uses.
+    _section_reorder_task(
+        state,
+        "PROJECT",
+        project_id,
+        task_id,
+        lambda ids: _move_in_list(ids, task_id, direction, undone),
+    )
     return project_id
 
 
@@ -831,6 +928,9 @@ def demote(
         _list_remove(project.setdefault("backlogTaskIds", []), task_id)
     _list_remove(_today_order(state), task_id)
     _planner_purge(state, [task_id])
+    # HCS runs handleTaskRemoval on the section slice: a task that became a
+    # subtask is no longer a member of ANY section (project or TODAY).
+    _section_remove_task_ids(state, [task_id])
     _move_item_after_anchor(
         target.setdefault("subTaskIds", []), task_id, after_task_id
     )
@@ -927,6 +1027,18 @@ def planner_move_before(d: dict, b: OpBuilder, task_id: str, to_task_id: str) ->
     target = _task(state, to_task_id)
     if task_id == to_task_id:
         raise MutationError("plan move: a task cannot be moved before itself")
+    days_map = (state.get("planner") or {}).get("days") or {}
+    anchor_day = next(
+        (day for day, day_list in days_map.items() if to_task_id in (day_list or [])),
+        None,
+    )
+    if anchor_day is None and not target.get("dueDay"):
+        raise MutationError(
+            f"anchor {to_task_id} is not planned for any day and has no dueDay: "
+            "the move would take the task out of every planner day and give it "
+            f"the anchor's (empty) dueDay. Plan {to_task_id} first "
+            f"('sp plan {to_task_id} --day <day>') or use 'sp today move --before'."
+        )
 
     b.op(
         "LB",
@@ -1553,13 +1665,21 @@ def project_delete(d: dict, b: OpBuilder, project_id: str) -> tuple[list, list]:
         _reg_remove(note_reg, nid)
         _list_remove(note_reg["todayOrder"], nid)
 
-    # sections of the project
+    # sections: `removeProjectSections` drops the ones OWNED by the project
+    # (a Section is keyed by contextType/contextId — it has no `projectId`),
+    # then `cleanupSectionTaskIds` strips the dead task ids from whatever
+    # sections remain (the TODAY-tag ones can hold them too).
     sections = state.get("section")
     if isinstance(sections, dict) and isinstance(sections.get("entities"), dict):
         sections.setdefault("ids", [])
         for sid, section in list(sections["entities"].items()):
-            if isinstance(section, dict) and section.get("projectId") == project_id:
+            if (
+                isinstance(section, dict)
+                and section.get("contextType") == "PROJECT"
+                and section.get("contextId") == project_id
+            ):
                 _reg_remove(sections, sid)
+    _section_remove_task_ids(state, all_task_ids)
 
     _menu_tree_prune(state, "p", project_id)
 
@@ -2720,7 +2840,10 @@ def _materialize_restore_today(
 def _normalize_restored(state: dict, root: dict, subs: list[dict]) -> None:
     """The receiver-side normalization of a restored task (HR reducer):
     live again, no doneOn, a project that exists, no TODAY tag, no dangling
-    repeatCfgId, section-less; subtasks re-pointed at the parent."""
+    repeatCfgId; subtasks re-pointed at the parent.
+
+    (Section membership is NOT a task field — see `_sections` — so nothing is
+    stripped from the entity here; `restore_task` clears the section refs.)"""
     projects = state["project"]["entities"]
     tags = state["tag"]["entities"]
     cfgs = (state.get("taskRepeatCfg") or {}).get("entities") or {}
@@ -2741,7 +2864,6 @@ def _normalize_restored(state: dict, root: dict, subs: list[dict]) -> None:
         entity["tagIds"] = [
             t for t in entity.get("tagIds", []) if t != TODAY_TAG_ID and t in tags
         ]
-        entity.pop("sectionId", None)
     for sub in subs:
         sub["parentId"] = root["id"]
         sub["projectId"] = root["projectId"]
@@ -2825,6 +2947,10 @@ def restore_task(
         for key in ("taskIds", "backlogTaskIds"):
             for tid in all_ids:
                 _list_remove(other.get(key) or [], tid)
+    # HR's section handler is `removeTaskIdsFromProjectSections` with no
+    # project filter: a restored task comes back section-less, so any ref a
+    # pre-fix archive left in a PROJECT section is stripped.
+    _section_remove_task_ids(state, all_ids, context_type="PROJECT")
     if project is not None:
         project.setdefault("taskIds", []).append(task_id)
     for entity in [root] + subs:

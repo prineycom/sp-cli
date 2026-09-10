@@ -75,6 +75,15 @@ NB: in our data model tasks always have projectId ⇒ orphan rule mostly moot, b
 - **HCS** convertToSubTask `{taskId, targetParentId, afterTaskId: string|null}`, o=UPD. **Eligibility guard (replicate; silent no-op otherwise): both exist, not self, target has no parentId (2-level), task has NO parentId/subTaskIds/repeatCfgId/issueId/issueProviderId/issueType/dueWithTime/reminderId/remindAt.** Effects: remove from project.taskIds AND backlogTaskIds, TODAY order, planner days; new parent subTaskIds anchor-insert; task.parentId/projectId set, dueDay=undefined, modified=now; tagIds UNCHANGED; deadline fields NOT cleared; time recalc on parent.
 - **HC** convertToMainTask `{task: Task, parentTagIds?, isPlanForToday?, afterTaskId?, isDone?, today?, doneOn?, modified?}`, o=UPD, d=task.id. **THROWS on receiver if parent unresolvable. Always pass today/doneOn/modified.** Effects: tagIds = own (TODAY-filtered) or inherit parent's filtered; old parent subTaskIds filter + both time recalcs; parentId=undefined; project.taskIds insert after old parent (backlog never); tags taskIds insert; TODAY if isPlanForToday; planner NOT touched.
 
+### Section side-effects (section-shared.reducer.ts) — mirror, never emit
+`Section = {id, contextId, contextType: 'PROJECT'|'TAG', title, isExpanded?, taskIds}`. **No `projectId` on a section, no `sectionId` on a task** — membership is ONLY `section.taskIds`. The same op that moves a task in a context list also runs the section meta-reducer on every device, so the CLI snapshot must apply it too:
+- `handleTaskRemoval` (= strip the id + its subTaskIds from EVERY section, any context): HD/HDM, HX archive, **HCS demote**.
+- `reorderTaskInContextSections`: **WMU/WMD/WMT/WMB** — in each section with the action's `contextType`/`contextId` that contains the task, apply the SAME closure (up/down step over every id missing from the payload's `doneTaskIds`, i.e. the context's not-done ids). WM (anchor) and HMT have NO section handler.
+- `handleMoveToOtherProject` (HMP): strip from the OLD project's sections only.
+- `HPD deleteProject`: remove sections with `contextType==='PROJECT' && contextId===projectId`, then strip `allTaskIds` from the survivors (TODAY sections hold them too).
+- `HR restoreTask`: `removeTaskIdsFromProjectSections` with no project filter — a restored task comes back section-less.
+- NOT mirrored: SP's diff-based TODAY-section prune (any id leaving `TODAY_TAG.taskIds` is stripped from TODAY sections), which is a post-pass over the whole reducer chain; `doctor` therefore does not cross-check TODAY sections against the TODAY ordering.
+
 ### Prefer move ops over PU/GU array rewrites
 Entity-LWW loss on PU/GU re-broadcasts the whole entity (replace mode) — silently reverts concurrent adds. Move ops are ordering-only, self-healing, anchor-based degrade. Mapping: Today reorder→HMT; project/tag list→WM/WMU..; backlog→PM/PMU..; subtasks→TMU..; reparent→TMS; promote/demote→HC/HCS; planner-day reorder→LB; set whole planner day→LU ok.
 

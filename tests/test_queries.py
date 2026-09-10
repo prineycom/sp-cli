@@ -205,6 +205,49 @@ class TestDoctor:
         assert q.doctor(sample) == []
 
     @staticmethod
+    def _seed_section(d, **fields):
+        section = {
+            "id": "SEC1",
+            "contextId": "INBOX_PROJECT",
+            "contextType": "PROJECT",
+            "title": "sec",
+            "taskIds": [],
+            **fields,
+        }
+        d["state"]["section"] = {
+            "ids": [section["id"]],
+            "entities": {section["id"]: section},
+        }
+        return section
+
+    def test_section_referencing_a_missing_task(self, sample):
+        self._seed_section(sample, taskIds=["Z" * 21])
+        assert any("references missing task" in p for p in q.doctor(sample))
+
+    def test_section_of_the_wrong_project(self, sample, add_task_entity):
+        task = add_task_entity(title="t")
+        self._seed_section(sample, contextId="Q" * 21, taskIds=[task["id"]])
+        problems = q.doctor(sample)
+        assert any("is not a project" in p for p in problems)
+
+    def test_section_holding_a_subtask(self, sample, add_task_entity):
+        parent = add_task_entity(title="parent")
+        sub = add_task_entity(title="sub", parent_id=parent["id"])
+        parent["subTaskIds"].append(sub["id"])
+        self._seed_section(sample, taskIds=[sub["id"]])
+        assert any("subtask" in p for p in q.doctor(sample))
+
+    def test_section_with_a_legacy_project_id_is_flagged(self, sample):
+        # the field never existed on SP's Section model
+        self._seed_section(sample, contextType=None, contextId=None)
+        assert any("is not PROJECT/TAG" in p for p in q.doctor(sample))
+
+    def test_clean_section(self, sample, add_task_entity):
+        task = add_task_entity(title="t")
+        self._seed_section(sample, taskIds=[task["id"]])
+        assert q.doctor(sample) == []
+
+    @staticmethod
     def _seed_provider(d, pid="P" * 21, key="ICAL", **overrides):
         provider = make_issue_provider(pid, key, **overrides)
         reg = d["state"].setdefault("issueProvider", {"ids": [], "entities": {}})

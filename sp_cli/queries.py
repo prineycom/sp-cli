@@ -637,6 +637,7 @@ def doctor(d: dict) -> list[str]:
         "simpleCounter",
         "metric",
         "issueProvider",
+        "section",
     ):
         reg = state.get(name)
         if not reg:
@@ -722,6 +723,35 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"tag {tg}: taskIds references missing task {tid}")
             elif tg not in tasks[tid].get("tagIds", []):
                 problems.append(f"tag {tg}: task {tid} lacks the tag (membership desync)")
+
+    # Sections: {id, contextId, contextType, title, isExpanded?, taskIds} —
+    # membership is ONLY the taskIds list (a task carries no sectionId).
+    # NOTE: TODAY-tag sections are not cross-checked against the TODAY
+    # ordering; SP prunes those with a post-pass diff of TODAY_TAG.taskIds
+    # that the CLI does not reproduce, so a leftover there is not a defect
+    # we can distinguish from a legitimate state.
+    for sid, section in ((state.get("section") or {}).get("entities") or {}).items():
+        ctx_type = section.get("contextType")
+        ctx_id = section.get("contextId")
+        if ctx_type not in ("PROJECT", "TAG"):
+            problems.append(f"section {sid}: contextType '{ctx_type}' is not PROJECT/TAG")
+        elif ctx_type == "PROJECT" and ctx_id not in state["project"]["entities"]:
+            problems.append(f"section {sid}: contextId '{ctx_id}' is not a project")
+        elif ctx_type == "TAG" and ctx_id not in tags:
+            problems.append(f"section {sid}: contextId '{ctx_id}' is not a tag")
+        section_task_ids = section.get("taskIds") or []
+        if len(set(section_task_ids)) != len(section_task_ids):
+            problems.append(f"section {sid}: duplicate taskIds")
+        for tid in section_task_ids:
+            if tid not in task_ids:
+                problems.append(f"section {sid}: taskIds references missing task {tid}")
+                continue
+            if tasks[tid].get("parentId"):
+                problems.append(f"section {sid}: subtask {tid} listed in a section")
+            elif ctx_type == "PROJECT" and tasks[tid].get("projectId") != ctx_id:
+                problems.append(
+                    f"section {sid}: task {tid} is not in project {ctx_id}"
+                )
 
     note_reg = state.get("note") or {}
     notes = note_reg.get("entities") or {}

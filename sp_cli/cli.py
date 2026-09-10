@@ -2639,13 +2639,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--parent", required=True)
     s.add_argument("--after", help="put it after this subtask of the parent")
 
-    s = add("promote", cmd_promote, "turn a subtask into a main task")
+    s = add(
+        "promote",
+        cmd_promote,
+        "turn a subtask into a main task (a DONE one is rescheduled to today)",
+    )
     s.add_argument("id")
     s.add_argument("--today", action="store_true", help="also plan it for today")
 
     s = add("plan-move", cmd_plan_move, "move a task before another in the planner")
     s.add_argument("id")
-    s.add_argument("--before", required=True)
+    s.add_argument(
+        "--before",
+        required=True,
+        help="anchor task; it decides the day, so it must be planned or have a due day",
+    )
 
     s = add("backlog", cmd_backlog, "list a project's backlog")
     s.add_argument("--project", required=True)
