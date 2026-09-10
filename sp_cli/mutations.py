@@ -6,6 +6,7 @@ effect of every op in recentOps."""
 from __future__ import annotations
 
 import copy
+import datetime
 
 from sp_cli.model import (
     TODAY_TAG_ID,
@@ -932,6 +933,19 @@ def _counter_reg(state: dict) -> dict:
     return reg
 
 
+def _counter_day(value: object, what: str) -> str:
+    """A countOnDay key must be a plain 'YYYY-MM-DD' string."""
+    if not isinstance(value, str):
+        raise MutationError(f"{what}: date must be a 'YYYY-MM-DD' string")
+    try:
+        parsed = datetime.date.fromisoformat(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.isoformat() != value:
+        raise MutationError(f"{what}: invalid date {value!r} (use YYYY-MM-DD)")
+    return value
+
+
 def _counter(state: dict, counter_id: str) -> dict:
     try:
         return state["simpleCounter"]["entities"][counter_id]
@@ -1045,6 +1059,12 @@ def counter_log_time(
     state = _state(d)
     _counter_reg(state)
     counter = _counter(state, counter_id)
+    if counter.get("type") != "StopWatch":
+        raise MutationError(
+            f"counter log: {counter_id} is not a StopWatch counter "
+            "(use counter_set / counter_inc)"
+        )
+    date = _counter_day(date, "counter log")
     if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
         raise MutationError("counter log: duration must be a non-negative integer (ms)")
 
@@ -1066,6 +1086,8 @@ def counter_order(d: dict, b: OpBuilder, counter_ids: list[str]) -> None:
     counter exactly once."""
     state = _state(d)
     reg = _counter_reg(state)
+    if not counter_ids:
+        raise MutationError("counter order: no counter ids given")
     if len(set(counter_ids)) != len(counter_ids):
         raise MutationError("counter order: duplicate ids")
     if sorted(counter_ids) != sorted(reg["ids"]):

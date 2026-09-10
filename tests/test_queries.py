@@ -488,6 +488,28 @@ class TestCounters:
         counter["countOnDay"]["2024-01-01"] = -3
         assert any("countOnDay" in p for p in q.doctor(sample))
 
+    def test_doctor_rejects_bool_count(self, sample):
+        counter = sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]
+        counter["countOnDay"]["2024-01-01"] = True
+        assert any("countOnDay" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_invalid_type(self, sample):
+        sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]["type"] = "Nope"
+        assert any("invalid type" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_missing_countdown_duration(self, sample):
+        del sample["state"]["simpleCounter"]["entities"]["STRETCHING_COUNTER"][
+            "countdownDuration"
+        ]
+        assert any("without countdownDuration" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_stray_countdown_duration(self, sample):
+        counter = sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]
+        counter["countdownDuration"] = 1800000
+        assert any(
+            "countdownDuration on a non-countdown" in p for p in q.doctor(sample)
+        )
+
     def test_doctor_detects_registry_desync(self, sample):
         sample["state"]["simpleCounter"]["ids"].remove("COFFEE_COUNTER")
         assert any("COFFEE_COUNTER" in p for p in q.doctor(sample))

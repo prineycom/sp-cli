@@ -376,12 +376,18 @@ def cmd_reorder(args) -> int:
     d = client.get()
     pid = q.resolve_project(d, args.project)
     listed = _resolve_tasks(d, args.ids)
-    current = list(d["state"]["project"]["entities"][pid]["taskIds"])
-    for tid in listed:
-        if tid not in current:
-            raise CliError(f"task {tid} is not a top-level task of project {pid}")
-    ordered = listed + [t for t in current if t not in listed]
-    store.commit([lambda dd, b: mut.reorder_project(dd, b, pid, ordered)], initial=d)
+
+    def _reorder(dd, b):
+        # Recomputed inside the closure: on a 412 retry the project's taskIds
+        # may differ, and a stale permutation would abort the commit.
+        current = list(dd["state"]["project"]["entities"][pid]["taskIds"])
+        for tid in listed:
+            if tid not in current:
+                raise CliError(f"task {tid} is not a top-level task of project {pid}")
+        ordered = listed + [t for t in current if t not in listed]
+        mut.reorder_project(dd, b, pid, ordered)
+
+    store.commit([_reorder], initial=d)
     print(f"reordered {pid}")
     return 0
 
@@ -1136,8 +1142,7 @@ def cmd_counter_add(args) -> int:
     client, store = _ctx()
     d = client.get()
     counter_id = nanoid()
-
-    def _add(dd, b):
+    try:
         counter = make_simple_counter(
             counter_id,
             args.title,
@@ -1148,9 +1153,10 @@ def cmd_counter_add(args) -> int:
             week_days=days,
             countdown_duration=countdown,
         )
-        mut.counter_add(dd, b, counter)
+    except ValueError as e:
+        raise CliError(f"counter add: {e}") from None
 
-    store.commit([_add], initial=d)
+    store.commit([lambda dd, b: mut.counter_add(dd, b, counter)], initial=d)
     print(counter_id)
     return 0
 
@@ -1226,6 +1232,12 @@ def cmd_counter_inc(args) -> int:
     d = client.get()
     cid = q.resolve_counter(d, args.id)
     counter = d["state"]["simpleCounter"]["entities"][cid]
+    if counter.get("type") == "StopWatch":
+        raise CliError(
+            f"counter inc: '{counter.get('title')}' is a stopwatch counter "
+            "(it counts time, not clicks); use 'sp counter log ID 30m' "
+            "or 'sp counter set ID 30m'"
+        )
     by = _counter_amount(counter, args.by, "--by") if args.by else 1
     date = _parse_day(args.date) if args.date else today_str()
     result: list[int] = []
@@ -1267,10 +1279,18 @@ def cmd_counter_order(args) -> int:
     client, store = _ctx()
     d = client.get()
     listed = [q.resolve_counter(d, ref) for ref in args.ids]
-    current = [c["id"] for c in q.all_counters(d)]
-    ordered = listed + [cid for cid in current if cid not in listed]
-    store.commit([lambda dd, b: mut.counter_order(dd, b, ordered)], initial=d)
-    print(f"reordered counters: {', '.join(ordered)}")
+    final: list[str] = []
+
+    def _order(dd, b):
+        # Complete the permutation from the *fresh* state so a 412 retry
+        # against a changed registry still produces a valid id list.
+        current = [c["id"] for c in q.all_counters(dd)]
+        ordered = listed + [cid for cid in current if cid not in listed]
+        final[:] = ordered
+        mut.counter_order(dd, b, ordered)
+
+    store.commit([_order], initial=d)
+    print(f"reordered counters: {', '.join(final)}")
     return 0
 
 
@@ -1675,7 +1695,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="YYYY-MM-DD (default today)")
     s = add("counter-inc", cmd_counter_inc, "increment a counter")
     s.add_argument("id")
-    s.add_argument("--by", help="amount (default 1; duration for stopwatch)")
+    s.add_argument("--by", help="clicks (default 1); not for stopwatch counters")
     s.add_argument("--date", help="YYYY-MM-DD (default today)")
     s = add("counter-log", cmd_counter_log, "add time to a stopwatch counter")
     s.add_argument("id")

@@ -156,6 +156,19 @@ class _FakeCtx:
         return d
 
 
+class _RetryCtx(_FakeCtx):
+    """commit() drops the caller's stale snapshot and applies the closures to a
+    state that changed underneath — the SyncStore 412-retry path."""
+
+    def __init__(self, d, mutate):
+        super().__init__(d)
+        self.mutate = mutate
+
+    def commit(self, mutations, initial=None):
+        self.mutate(self.d)
+        return super().commit(mutations, initial=None)
+
+
 @pytest.fixture
 def fake_ctx(sample, monkeypatch):
     ctx = _FakeCtx(sample)
@@ -637,6 +650,35 @@ class TestCounterCommands:
         ]
         assert sample["state"]["simpleCounter"]["ids"][0] == "COFFEE_COUNTER"
 
+    def test_inc_on_stopwatch_is_exit_2(self, fake_ctx, capsys):
+        assert cli.main(["counter", "inc", "STANDING_DESK_ID"]) == 2
+        assert "counter log" in capsys.readouterr().err
+        assert fake_ctx.ops == []
+
+    def test_inc_by_on_stopwatch_is_exit_2(self, fake_ctx):
+        assert cli.main(["counter", "inc", "STANDING_DESK_ID", "--by", "30m"]) == 2
+        assert fake_ctx.ops == []
+
+    def test_order_recomputes_ids_on_retry(self, sample, monkeypatch, capsys):
+        from sp_cli.model import make_simple_counter
+
+        def _foreign_add(d):
+            reg = d["state"]["simpleCounter"]
+            if "N" * 21 in reg["entities"]:
+                return
+            counter = make_simple_counter("N" * 21, "Foreign")
+            reg["ids"].append("N" * 21)
+            reg["entities"]["N" * 21] = counter
+
+        ctx = _RetryCtx(sample, _foreign_add)
+        monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+        assert cli.cmd_counter_order(_args(["counter", "order", "COFFEE_COUNTER"])) == 0
+        ids = ctx.ops[-1]["p"]["actionPayload"]["ids"]
+        assert ids[0] == "COFFEE_COUNTER"
+        assert "N" * 21 in ids
+        assert sample["state"]["simpleCounter"]["ids"] == ids
+        assert "N" * 21 in capsys.readouterr().out
+
     def test_counters_list_renders(self, fake_ctx, sample, capsys):
         from sp_cli.model import today_str
 
@@ -650,3 +692,39 @@ class TestCounterCommands:
     def test_counters_json(self, fake_ctx, capsys):
         assert cli.cmd_counters(_args(["counters", "--json"])) == 0
         assert '"COFFEE_COUNTER"' in capsys.readouterr().out
+
+    def test_zero_stopwatch_renders_as_duration(self, fake_ctx, capsys):
+        assert cli.cmd_counters(_args(["counters"])) == 0
+        row = next(
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "STANDING_DESK_ID" in line
+        )
+        assert "0m" in row
+
+
+class TestReorderRetry:
+    def test_reorder_recomputes_task_ids_on_retry(self, sample, monkeypatch, capsys):
+        from sp_cli.model import make_task
+
+        project = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        first, second = project["taskIds"][0], project["taskIds"][1]
+
+        def _foreign_add(d):
+            if "F" * 21 in d["state"]["task"]["entities"]:
+                return
+            task = make_task("F" * 21, "foreign", "INBOX_PROJECT")
+            d["state"]["task"]["ids"].append("F" * 21)
+            d["state"]["task"]["entities"]["F" * 21] = task
+            d["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"].append(
+                "F" * 21
+            )
+
+        ctx = _RetryCtx(sample, _foreign_add)
+        monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+        args = _args(["reorder", "--project", "INBOX_PROJECT", second, first])
+        assert cli.cmd_reorder(args) == 0
+        changes = ctx.ops[-1]["p"]["actionPayload"]["project"]["changes"]
+        assert changes["taskIds"][:2] == [second, first]
+        assert "F" * 21 in changes["taskIds"]
+        assert project["taskIds"] == changes["taskIds"]

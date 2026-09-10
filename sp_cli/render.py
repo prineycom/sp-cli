@@ -179,7 +179,7 @@ _WEEK_DAY_LABEL = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
 def counter_value_str(counter: dict, value: int) -> str:
     """StopWatch counts milliseconds; everything else counts clicks."""
     if counter.get("type") == "StopWatch":
-        return format_duration(value) if value else "0"
+        return format_duration(value) if value else "0m"
     return str(value)
 
 

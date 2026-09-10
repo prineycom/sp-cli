@@ -1371,6 +1371,17 @@ class TestSimpleCounters:
             mut.counter_log_time(sample, b, "STANDING_DESK_ID", "2024-05-01", -1)
         assert b.ops == []
 
+    def test_log_time_on_non_stopwatch_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="not a StopWatch"):
+            mut.counter_log_time(sample, b, "COFFEE_COUNTER", "2024-05-01", 60000)
+        assert b.ops == []
+
+    @pytest.mark.parametrize("date", ["2024-13-01", "20240501", "today", "", None])
+    def test_log_time_invalid_date_rejected(self, sample, b, date):
+        with pytest.raises(mut.MutationError):
+            mut.counter_log_time(sample, b, "STANDING_DESK_ID", date, 60000)
+        assert b.ops == []
+
     def test_order_emits_sm(self, sample, b):
         ids = ["COFFEE_COUNTER", "STRETCHING_COUNTER", "STANDING_DESK_ID"]
         mut.counter_order(sample, b, ids)
@@ -1385,6 +1396,11 @@ class TestSimpleCounters:
     def test_order_partial_list_rejected(self, sample, b):
         with pytest.raises(mut.MutationError, match="permutation"):
             mut.counter_order(sample, b, ["COFFEE_COUNTER"])
+
+    def test_order_empty_list_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="no counter ids"):
+            mut.counter_order(sample, b, [])
+        assert b.ops == []
 
     def test_order_duplicates_rejected(self, sample, b):
         with pytest.raises(mut.MutationError, match="duplicate"):

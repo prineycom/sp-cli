@@ -169,13 +169,15 @@ pip install requests
     [--streak|--no-streak] [--streak-min N] [--streak-days mon,...] [--countdown 30m]
 ./sp counter rm <id> [--yes]                  # с подтверждением
 ./sp counter set <id> <value> [--date DAY]    # абсолютное значение за день
-./sp counter inc <id> [--by N] [--date DAY]   # +1 по умолчанию
+./sp counter inc <id> [--by N] [--date DAY]   # +1 клик по умолчанию (не для stopwatch)
 ./sp counter log <id> 30m [--date DAY]        # добавить время в stopwatch-счётчик
 ./sp counter order <id>...                    # перечисленные — первыми
 ```
 
 У `stopwatch`-счётчиков значение — длительность (`45m`, `1.5h`), у остальных — число
-кликов; то же правило действует для `--streak-min` и `--by`. `set`/`inc` всегда шлют
+кликов; то же правило действует для `--streak-min`. `inc`/`--by` — только про клики:
+для stopwatch-счётчика команда откажется работать и отправит к `counter log` (время)
+или `counter set` (абсолютная длительность). `set`/`inc` всегда шлют
 абсолютное значение (клампится до ≥0), `log` — дельту. Флаг «счётчик сейчас запущен»
 (`isOn`) device-local: CLI всегда пишет `false` и не умеет запускать/останавливать таймер.
 

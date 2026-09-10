@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import datetime
 
-from sp_cli.model import PANEL_SORT_BY, TODAY_TAG_ID, day_of_ms, today_str
+from sp_cli.model import (
+    PANEL_SORT_BY,
+    SIMPLE_COUNTER_TYPES,
+    TODAY_TAG_ID,
+    day_of_ms,
+    today_str,
+)
 
 
 class QueryError(Exception):
@@ -535,8 +541,20 @@ def doctor(d: dict) -> list[str]:
         cid = counter["id"]
         if counter.get("isOn"):
             problems.append(f"counter {cid}: isOn is true (must be device-local false)")
+        ctype = counter.get("type")
+        if ctype not in SIMPLE_COUNTER_TYPES.values():
+            problems.append(f"counter {cid}: invalid type {ctype!r}")
+        has_countdown = "countdownDuration" in counter
+        if ctype == "RepeatedCountdownReminder" and not has_countdown:
+            problems.append(
+                f"counter {cid}: countdown counter without countdownDuration"
+            )
+        elif ctype != "RepeatedCountdownReminder" and has_countdown:
+            problems.append(
+                f"counter {cid}: countdownDuration on a non-countdown counter"
+            )
         for day, val in (counter.get("countOnDay") or {}).items():
-            if not isinstance(val, (int, float)) or val < 0:
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
                 problems.append(f"counter {cid}: countOnDay[{day}] = {val!r} is invalid")
 
     for day, ids in (state.get("planner", {}).get("days") or {}).items():
