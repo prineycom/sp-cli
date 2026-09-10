@@ -747,10 +747,20 @@ def cmd_deadline(args) -> int:
     day = _parse_day(args.day) if args.day else None
     ts = _parse_dt(args.at) if args.at else None
     remind = None
+    drop_reminder = False
     if args.remind:
-        if ts is None:
-            raise CliError("deadline: --remind requires --at")
-        remind = ts - render.parse_offset(args.remind)
+        # `--remind none` = set the deadline and explicitly drop its reminder.
+        # With --day it is redundant (a day deadline never carries one in SP)
+        # but accepted; any other offset with --day is an error.
+        if args.remind.lower() == "none":
+            drop_reminder = True
+        elif ts is None:
+            raise CliError(
+                "deadline: --remind requires --at — a day deadline (--day) "
+                "carries no reminder in SP (use --at, or --remind none)"
+            )
+        else:
+            remind = ts - render.parse_offset(args.remind)
     store.commit(
         [
             lambda dd, b: mut.set_deadline(
@@ -760,6 +770,7 @@ def cmd_deadline(args) -> int:
                 deadline_day=day,
                 deadline_with_time=ts,
                 deadline_remind_at=remind,
+                drop_reminder=drop_reminder,
             )
         ],
         initial=d,
@@ -2774,7 +2785,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s.add_argument("--day", help="YYYY-MM-DD")
     s.add_argument("--at", help="'YYYY-MM-DD HH:MM'")
-    s.add_argument("--remind", help="offset before --at, e.g. 1h")
+    s.add_argument(
+        "--remind",
+        help="offset before --at, e.g. 1h; 'none' drops the reminder",
+    )
     s.add_argument("--clear", action="store_true", help="remove the deadline")
     s.add_argument(
         "--clear-reminder",

@@ -1273,25 +1273,47 @@ def set_deadline(
     deadline_day: str | None = None,
     deadline_with_time: int | None = None,
     deadline_remind_at: int | None = None,
+    drop_reminder: bool = False,
 ) -> None:
+    """HDL — set a day-only or timed deadline.
+
+    The reducer rebuilds the reminder from the payload: a MISSING
+    `deadlineRemindAt` CLEARS it, so every kept reminder must be re-sent.
+    Mirrors SP's deadline dialog:
+
+    * day-only (`deadlineDay`) — the dialog never sends a reminder, so the
+      old one is deliberately dropped;
+    * timed (`deadlineWithTime`) without an explicit reminder — the dialog
+      keeps the user's *offset* (the reminder option), not the old absolute
+      timestamp, so the carried reminder is recomputed against the new
+      deadline. The carry is skipped when the previous deadline was day-only,
+      had no reminder, or the recomputed instant is already in the past.
+
+    `autoPlan*` is never sent.
+    """
     state = _state(d)
     task = _task(state, task_id)
     if (deadline_day is None) == (deadline_with_time is None):
         raise MutationError("deadline: exactly one of day / with-time required")
+    if deadline_day is not None and deadline_remind_at is not None:
+        raise MutationError("deadline: a day-only deadline carries no reminder")
 
     payload: dict = {"taskId": task_id}
     if deadline_day is not None:
         payload["deadlineDay"] = deadline_day
+        new_remind = None
     else:
         payload["deadlineWithTime"] = deadline_with_time
-    # The reducer rebuilds the reminder from the payload: a MISSING
-    # `deadlineRemindAt` CLEARS it. Editing the deadline day without an
-    # explicit --remind must therefore carry the current value over.
-    # `autoPlan*` is never sent.
-    if deadline_remind_at is None:
-        deadline_remind_at = task.get("deadlineRemindAt")
-    if deadline_remind_at is not None:
-        payload["deadlineRemindAt"] = deadline_remind_at
+        new_remind = deadline_remind_at
+        if new_remind is None and not drop_reminder:
+            old_ts = task.get("deadlineWithTime")
+            old_remind = task.get("deadlineRemindAt")
+            if old_ts is not None and old_remind is not None:
+                candidate = deadline_with_time - (old_ts - old_remind)
+                if candidate > now_ms():
+                    new_remind = candidate
+        if new_remind is not None:
+            payload["deadlineRemindAt"] = new_remind
     b.op("HDL", "UPD", "TASK", task_id, payload)
 
     if deadline_day is not None:
@@ -1300,7 +1322,7 @@ def set_deadline(
     else:
         task["deadlineWithTime"] = deadline_with_time
         task["deadlineDay"] = None
-    task["deadlineRemindAt"] = deadline_remind_at
+    task["deadlineRemindAt"] = new_remind
 
 
 def remove_deadline(d: dict, b: OpBuilder, task_id: str) -> None:

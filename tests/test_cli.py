@@ -2554,17 +2554,78 @@ class TestDeadlineClearCommands:
             )
         assert fake_ctx.ops == []
 
-    def test_deadline_edit_carries_the_existing_reminder(
-        self, fake_ctx, sample, add_task_entity
-    ):
+    def test_clear_rejects_day_and_remind(self, fake_ctx, sample, add_task_entity):
         t = add_task_entity(title="dl")
+        for extra in (["--day", "2030-06-01"], ["--remind", "1h"]):
+            with pytest.raises(cli.CliError, match="takes no"):
+                cli.cmd_deadline(
+                    _args(["deadline", t["id"], "--clear-reminder", *extra])
+                )
+        assert fake_ctx.ops == []
+
+    def test_a_day_edit_drops_the_reminder(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        t["deadlineWithTime"] = 1900000000000
         t["deadlineRemindAt"] = 1899999000000
         assert cli.cmd_deadline(
             _args(["deadline", t["id"], "--day", "2030-07-01"])
         ) == 0
         p = fake_ctx.ops[-1]["p"]["actionPayload"]
         assert p["deadlineDay"] == "2030-07-01"
-        assert p["deadlineRemindAt"] == 1899999000000
+        assert "deadlineRemindAt" not in p
+        assert sample["state"]["task"]["entities"][t["id"]]["deadlineRemindAt"] is None
+
+    def test_timed_edit_recomputes_the_reminder_offset(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="dl")
+        ts = int(dt.datetime(2030, 6, 1, 12, 0).timestamp() * 1000)
+        t["deadlineWithTime"] = ts
+        t["deadlineRemindAt"] = ts - 3600000
+        assert cli.cmd_deadline(
+            _args(["deadline", t["id"], "--at", "2030-06-02 12:00"])
+        ) == 0
+        p = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert p["deadlineRemindAt"] == p["deadlineWithTime"] - 3600000
+
+    def test_no_reminder_in_payload_when_nothing_supplies_one(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="dl")
+        assert cli.cmd_deadline(
+            _args(["deadline", t["id"], "--at", "2030-06-02 12:00"])
+        ) == 0
+        assert "deadlineRemindAt" not in fake_ctx.ops[-1]["p"]["actionPayload"]
+
+    def test_remind_none_drops_the_reminder(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        t["deadlineWithTime"] = 1900000000000
+        t["deadlineRemindAt"] = 1899999000000
+        assert cli.cmd_deadline(
+            _args(["deadline", t["id"], "--at", "2030-06-02 12:00", "--remind", "none"])
+        ) == 0
+        p = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert "deadlineRemindAt" not in p
+        assert sample["state"]["task"]["entities"][t["id"]]["deadlineRemindAt"] is None
+
+    def test_remind_none_is_accepted_with_day(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="dl")
+        assert cli.cmd_deadline(
+            _args(["deadline", t["id"], "--day", "2030-07-01", "--remind", "none"])
+        ) == 0
+        p = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert p["deadlineDay"] == "2030-07-01"
+        assert "deadlineRemindAt" not in p
+
+    def test_remind_offset_with_day_is_rejected(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="dl")
+        with pytest.raises(cli.CliError, match="carries no reminder"):
+            cli.cmd_deadline(
+                _args(["deadline", t["id"], "--day", "2030-07-01", "--remind", "1h"])
+            )
+        assert fake_ctx.ops == []
 
     def test_dismiss_emits_hrx_with_id_key(
         self, fake_ctx, sample, add_task_entity, capsys

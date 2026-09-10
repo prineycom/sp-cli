@@ -15,6 +15,7 @@ from sp_cli.model import (
     make_simple_counter,
     make_tag,
     make_task,
+    now_ms,
     today_str,
 )
 from sp_cli.ops import OpBuilder
@@ -630,17 +631,30 @@ class TestDeadline:
         with pytest.raises(mut.MutationError):
             mut.set_deadline(sample, b, t["id"])
 
-    def test_existing_remind_survives_a_day_edit(self, sample, b, add_task_entity):
-        """Omitting deadlineRemindAt in an HDL payload CLEARS it — so an edit
-        that says nothing about the reminder must carry the old value along."""
+    def test_a_day_edit_drops_the_reminder(self, sample, b, add_task_entity):
+        """SP's day-only branch sends no deadlineRemindAt at all, and a missing
+        key CLEARS it — a day deadline carries no reminder."""
         t = add_task_entity(title="dl4")
+        t["deadlineWithTime"] = 1900000000000
         t["deadlineRemindAt"] = 1899999000000
         mut.set_deadline(sample, b, t["id"], deadline_day="2030-06-01")
         p = _last_op(b)["p"]["actionPayload"]
-        assert p["deadlineRemindAt"] == 1899999000000
+        assert "deadlineRemindAt" not in p
         assert "autoPlanToday" not in p
         assert "autoPlanStartOfNextDayDiffMs" not in p
-        assert _task(sample, t["id"])["deadlineRemindAt"] == 1899999000000
+        assert _task(sample, t["id"])["deadlineRemindAt"] is None
+        assert_doctor_clean(sample)
+
+    def test_day_edit_rejects_an_explicit_reminder(self, sample, b, add_task_entity):
+        t = add_task_entity(title="dl4b")
+        with pytest.raises(mut.MutationError, match="no reminder"):
+            mut.set_deadline(
+                sample,
+                b,
+                t["id"],
+                deadline_day="2030-06-01",
+                deadline_remind_at=1899999000000,
+            )
 
     def test_explicit_remind_overrides_existing(self, sample, b, add_task_entity):
         t = add_task_entity(title="dl5")
@@ -655,6 +669,60 @@ class TestDeadline:
         p = _last_op(b)["p"]["actionPayload"]
         assert p["deadlineRemindAt"] == 1899999000000
         assert _task(sample, t["id"])["deadlineRemindAt"] == 1899999000000
+        assert_doctor_clean(sample)
+
+    def test_timed_edit_recomputes_the_reminder_offset(
+        self, sample, b, add_task_entity
+    ):
+        """The dialog keeps the reminder OPTION (an offset), not the old
+        absolute instant — moving the deadline moves the reminder with it."""
+        t = add_task_entity(title="dl6")
+        t["deadlineWithTime"] = 1900000000000
+        t["deadlineRemindAt"] = 1900000000000 - 3600000  # 1h before
+        mut.set_deadline(sample, b, t["id"], deadline_with_time=1900086400000)
+        p = _last_op(b)["p"]["actionPayload"]
+        assert p["deadlineRemindAt"] == 1900086400000 - 3600000
+        assert _task(sample, t["id"])["deadlineRemindAt"] == 1900086400000 - 3600000
+        assert_doctor_clean(sample)
+
+    def test_no_carry_from_a_day_only_deadline(self, sample, b, add_task_entity):
+        t = add_task_entity(title="dl7")
+        t["deadlineDay"] = "2030-06-01"
+        t["deadlineWithTime"] = None
+        t["deadlineRemindAt"] = 1899999000000  # stale, no anchor to offset from
+        mut.set_deadline(sample, b, t["id"], deadline_with_time=1900000000000)
+        p = _last_op(b)["p"]["actionPayload"]
+        assert "deadlineRemindAt" not in p
+        assert _task(sample, t["id"])["deadlineRemindAt"] is None
+
+    def test_no_carry_when_the_task_has_no_reminder(self, sample, b, add_task_entity):
+        t = add_task_entity(title="dl8")
+        t["deadlineWithTime"] = 1900000000000
+        mut.set_deadline(sample, b, t["id"], deadline_with_time=1900086400000)
+        assert "deadlineRemindAt" not in _last_op(b)["p"]["actionPayload"]
+
+    def test_no_carry_when_the_recomputed_reminder_is_in_the_past(
+        self, sample, b, add_task_entity
+    ):
+        t = add_task_entity(title="dl9")
+        now = now_ms()
+        t["deadlineWithTime"] = now + 86400000
+        t["deadlineRemindAt"] = now - 86400000  # a 2-day offset
+        mut.set_deadline(sample, b, t["id"], deadline_with_time=now + 3600000)
+        p = _last_op(b)["p"]["actionPayload"]
+        assert "deadlineRemindAt" not in p
+        assert _task(sample, t["id"])["deadlineRemindAt"] is None
+
+    def test_drop_reminder_skips_the_carry(self, sample, b, add_task_entity):
+        t = add_task_entity(title="dl10")
+        t["deadlineWithTime"] = 1900000000000
+        t["deadlineRemindAt"] = 1899999000000
+        mut.set_deadline(
+            sample, b, t["id"], deadline_with_time=1900086400000, drop_reminder=True
+        )
+        p = _last_op(b)["p"]["actionPayload"]
+        assert "deadlineRemindAt" not in p
+        assert _task(sample, t["id"])["deadlineRemindAt"] is None
 
 
 class TestDeadlineClear:
