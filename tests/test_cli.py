@@ -3,6 +3,7 @@ import json
 import pytest
 
 from sp_cli import cli
+from sp_cli import mutations as mut
 from sp_cli import queries as q
 from sp_cli import model
 from sp_cli import timer
@@ -2040,3 +2041,147 @@ class TestRepeatsListing:
     )
     def test_subcommand_rewrites(self, argv, expected):
         assert cli._rewrite_argv(argv)[0] == expected
+
+
+class TestReorderConvertCommands:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["today", "move", "x", "--up"], "today-move"),
+            (["plan", "move", "x", "--before", "y"], "plan-move"),
+            (["subtask", "move", "x", "--up"], "subtask-move"),
+            (["subtask", "reparent", "x", "--parent", "y"], "subtask-reparent"),
+        ],
+    )
+    def test_subcommand_rewrites(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    @staticmethod
+    def _seed(sample, n=3):
+        from sp_cli.model import make_task
+
+        ids = []
+        for i in range(n):
+            tid = chr(65 + i) * 21
+            task = make_task(tid, f"t{i}", "INBOX_PROJECT")
+            sample["state"]["task"]["ids"].append(tid)
+            sample["state"]["task"]["entities"][tid] = task
+            sample["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"].append(tid)
+            ids.append(tid)
+        return ids
+
+    @staticmethod
+    def _seed_sub(sample, parent_id, sub_id):
+        from sp_cli.model import make_task
+
+        sub = make_task(sub_id, "sub", "INBOX_PROJECT", parent_id=parent_id)
+        sample["state"]["task"]["ids"].append(sub_id)
+        sample["state"]["task"]["entities"][sub_id] = sub
+        sample["state"]["task"]["entities"][parent_id]["subTaskIds"].append(sub_id)
+        return sub
+
+    def test_today_move_up(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        sample["state"]["tag"]["entities"]["TODAY"]["taskIds"] = list(ids)
+        assert cli.cmd_today_move(_args(["today", "move", ids[2], "--up"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "WMU"
+
+    def test_today_move_before(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        sample["state"]["tag"]["entities"]["TODAY"]["taskIds"] = list(ids)
+        argv = ["today", "move", ids[2], "--before", ids[0]]
+        assert cli.cmd_today_move(_args(argv)) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HMT" and op["ds"] == [ids[0], ids[2]]
+
+    def test_today_move_needs_a_direction(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        with pytest.raises(cli.CliError, match="--before"):
+            cli.cmd_today_move(_args(["today", "move", ids[0]]))
+        assert fake_ctx.ops == []
+
+    def test_today_move_rejects_mixed_flags(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        argv = ["today", "move", ids[0], "--before", ids[1], "--up"]
+        with pytest.raises(cli.CliError, match="cannot be combined"):
+            cli.cmd_today_move(_args(argv))
+
+    def test_two_directions_rejected(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        argv = ["today", "move", ids[0], "--up", "--down"]
+        with pytest.raises(cli.CliError, match="exactly one direction"):
+            cli.cmd_today_move(_args(argv))
+
+    def test_move_in_project_top(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        assert cli.cmd_move_in_project(_args(["move-in-project", ids[2], "--top"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "WMT"
+        assert sample["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"][0] == ids[2]
+
+    def test_move_in_project_after(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        argv = ["move-in-project", ids[0], "--after", ids[2]]
+        assert cli.cmd_move_in_project(_args(argv)) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "WM" and op["p"]["actionPayload"]["afterTaskId"] == ids[2]
+
+    def test_move_in_project_needs_an_option(self, fake_ctx, sample):
+        ids = self._seed(sample)
+        with pytest.raises(cli.CliError, match="--after"):
+            cli.cmd_move_in_project(_args(["move-in-project", ids[0]]))
+
+    def test_subtask_move(self, fake_ctx, sample):
+        ids = self._seed(sample, n=1)
+        sub = self._seed_sub(sample, ids[0], "S" * 21)
+        self._seed_sub(sample, ids[0], "T" * 21)
+        assert cli.cmd_subtask_move(_args(["subtask", "move", sub["id"], "--down"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "TMD"
+
+    def test_subtask_move_needs_a_direction(self, fake_ctx, sample):
+        ids = self._seed(sample, n=1)
+        sub = self._seed_sub(sample, ids[0], "S" * 21)
+        with pytest.raises(cli.CliError, match="--up"):
+            cli.cmd_subtask_move(_args(["subtask", "move", sub["id"]]))
+
+    def test_subtask_reparent(self, fake_ctx, sample):
+        ids = self._seed(sample, n=2)
+        sub = self._seed_sub(sample, ids[0], "S" * 21)
+        argv = ["subtask", "reparent", sub["id"], "--parent", ids[1]]
+        assert cli.cmd_subtask_reparent(_args(argv)) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "TMS"
+        assert op["p"]["actionPayload"]["targetTaskId"] == ids[1]
+        assert sub["parentId"] == ids[1]
+
+    def test_demote(self, fake_ctx, sample):
+        ids = self._seed(sample, n=2)
+        assert cli.cmd_demote(_args(["demote", ids[1], "--parent", ids[0]])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HCS"
+        assert op["p"]["actionPayload"]["targetParentId"] == ids[0]
+
+    def test_demote_reports_the_reason(self, fake_ctx, sample):
+        ids = self._seed(sample, n=2)
+        sample["state"]["task"]["entities"][ids[1]]["repeatCfgId"] = "R" * 21
+        with pytest.raises(mut.MutationError, match="repeating"):
+            cli.cmd_demote(_args(["demote", ids[1], "--parent", ids[0]]))
+        assert fake_ctx.ops == []
+
+    def test_promote(self, fake_ctx, sample):
+        ids = self._seed(sample, n=1)
+        sub = self._seed_sub(sample, ids[0], "S" * 21)
+        assert cli.cmd_promote(_args(["promote", sub["id"], "--today"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HC"
+        assert op["p"]["actionPayload"]["isPlanForToday"] is True
+
+    def test_plan_move(self, fake_ctx, sample):
+        ids = self._seed(sample, n=2)
+        sample["state"]["planner"]["days"]["2030-01-01"] = [ids[0]]
+        sample["state"]["task"]["entities"][ids[1]]["dueDay"] = "2030-01-02"
+        sample["state"]["planner"]["days"]["2030-01-02"] = [ids[1]]
+        argv = ["plan", "move", ids[0], "--before", ids[1]]
+        assert cli.cmd_plan_move(_args(argv)) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"]) == ("LB", "PLANNER")
+        assert sample["state"]["planner"]["days"]["2030-01-02"] == [ids[0], ids[1]]

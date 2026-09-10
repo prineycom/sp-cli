@@ -70,9 +70,38 @@ pip install requests
 ./sp subtask <parent> "Title" [--est 30m] [--notes "..."]
 ./sp move <id> --project P
 ./sp tag <id> [--add T ...] [--remove T ...]
-./sp reorder --project P <id...>
+./sp reorder --project P <id...>   # полная перезапись порядка, см. ниже
 ./sp archive [--yes]           # заархивировать сделанные задачи
 ```
+
+### Порядок и конвертация
+
+Точечные сдвиги — отдельными move-операциями (сдвиг, а не перезапись списка):
+
+```sh
+./sp today move <id> --before <other>          # поставить прямо перед другой задачей
+./sp today move <id> --up|--down|--top|--bottom
+./sp move-in-project <id> --up|--down|--top|--bottom
+./sp move-in-project <id> --after <other>
+./sp subtask move <id> --up|--down|--top|--bottom     # среди сабтасков родителя
+./sp subtask reparent <id> --parent <new> [--after <sib>]   # к другому родителю
+./sp demote <id> --parent <target> [--after <sib>]    # задача → сабтаск
+./sp promote <id> [--today]                           # сабтаск → задача
+./sp plan move <id> --before <other>                  # в планировщике (день берётся у якоря)
+```
+
+`--up`/`--down` перепрыгивают через выполненные соседи — как в приложении.
+При переносе сабтасков (`reparent`, `demote`, `promote`) времена обоих
+родителей пересчитываются: `timeSpentOnDay`/`timeSpent` — сумма по сабтаскам,
+`timeEstimate` — остаток работы (`max(0, оценка − потрачено)` по невыполненным).
+
+`demote` откажется, если приложение всё равно не применит конвертацию: у задачи
+есть родитель, свои сабтаски, повтор, привязка к issue, время (`--at`) или
+напоминание; либо цель сама сабтаск (вложенность только двухуровневая).
+
+⚠️ **Каверза:** старый `sp reorder` переписывает `taskIds` проекта целиком (op
+`PU`). При гонке с другим устройством entity-LWW может откатить чужие правки
+проекта. Для точечных перестановок используйте move-команды выше.
 
 ### Архив
 

@@ -2995,3 +2995,655 @@ class TestRepeatSkipInstance:
     def test_unknown_cfg_is_refused(self, sample, b):
         with pytest.raises(mut.MutationError, match="repeat config not found"):
             mut.repeat_skip_instance(sample, b, "Z" * 21, "2026-09-10")
+
+
+# ------------------------------------------- reordering & conversion (b2-15)
+
+def _proj(d, project_id="INBOX_PROJECT"):
+    return d["state"]["project"]["entities"][project_id]
+
+
+def _seed_sub(sample, add_task_entity, parent, sub_id, **kw):
+    """Attach a real subtask entity to `parent` (no ops)."""
+    sub = add_task_entity(task_id=sub_id, parent_id=parent["id"], **kw)
+    parent["subTaskIds"].append(sub_id)
+    return sub
+
+
+class TestTodayMoveBefore:
+    def _seed(self, sample, add_task_entity, n=3):
+        tasks = [
+            add_task_entity(task_id=chr(65 + i) * 21, title=f"t{i}")
+            for i in range(n)
+        ]
+        _today_order(sample)[:] = [t["id"] for t in tasks]
+        return tasks
+
+    def test_hmt_shape_target_first_in_ds(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.today_move_before(sample, b, c["id"], a["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"]) == ("HMT", "MOV", "TASK")
+        # ds is [toTaskId, fromTaskId] — the TARGET comes first
+        assert op["ds"] == [a["id"], c["id"]]
+        assert op["d"] == a["id"]
+        assert op["p"]["actionPayload"] == {
+            "toTaskId": a["id"],
+            "fromTaskId": c["id"],
+        }
+
+    def test_state_moves_item_before_anchor(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.today_move_before(sample, b, c["id"], bb["id"])
+        assert _today_order(sample) == [a["id"], c["id"], bb["id"]]
+        assert_doctor_clean(sample)
+
+    def test_forward_move_accounts_for_the_shift(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.today_move_before(sample, b, a["id"], c["id"])
+        assert _today_order(sample) == [bb["id"], a["id"], c["id"]]
+
+    def test_anchor_outside_today_is_refused(self, sample, b, add_task_entity):
+        a, bb, _c = self._seed(sample, add_task_entity)
+        outside = add_task_entity(task_id="Z" * 21, title="outside")
+        with pytest.raises(mut.MutationError, match="not in today's list"):
+            mut.today_move_before(sample, b, a["id"], outside["id"])
+        assert b.ops == []
+
+    def test_task_outside_today_is_refused(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        outside = add_task_entity(task_id="Z" * 21, title="outside")
+        with pytest.raises(mut.MutationError, match="not in today's list"):
+            mut.today_move_before(sample, b, outside["id"], a["id"])
+        assert b.ops == []
+
+    def test_self_move_is_refused(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="before itself"):
+            mut.today_move_before(sample, b, a["id"], a["id"])
+
+
+class TestTodayMove:
+    def _seed(self, sample, add_task_entity):
+        tasks = [
+            add_task_entity(task_id=chr(65 + i) * 21, title=f"t{i}")
+            for i in range(3)
+        ]
+        _today_order(sample)[:] = [t["id"] for t in tasks]
+        return tasks
+
+    @pytest.mark.parametrize(
+        "direction,action",
+        [("up", "WMU"), ("down", "WMD"), ("top", "WMT"), ("bottom", "WMB")],
+    )
+    def test_shape(self, sample, b, add_task_entity, direction, action):
+        _a, bb, _c = self._seed(sample, add_task_entity)
+        mut.today_move(sample, b, bb["id"], direction)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (action, "MOV", "TAG", "TODAY")
+        assert op["p"]["actionPayload"] == {
+            "taskId": bb["id"],
+            "workContextId": "TODAY",
+            "doneTaskIds": ["A" * 21, "B" * 21, "C" * 21],
+            "workContextType": "TAG",
+        }
+
+    def test_done_task_ids_carries_the_not_done_ids(
+        self, sample, b, add_task_entity
+    ):
+        a, bb, c = self._seed(sample, add_task_entity)
+        a["isDone"] = True
+        mut.today_move(sample, b, c["id"], "up")
+        payload = _last_op(b)["p"]["actionPayload"]
+        # inverted wire name: the DONE task is the one missing from the list
+        assert payload["doneTaskIds"] == [bb["id"], c["id"]]
+
+    def test_up_hops_over_a_done_neighbour(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        bb["isDone"] = True
+        mut.today_move(sample, b, c["id"], "up")
+        assert _today_order(sample) == [c["id"], a["id"], bb["id"]]
+
+    def test_up_down_top_bottom_state(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.today_move(sample, b, c["id"], "up")
+        assert _today_order(sample) == [a["id"], c["id"], bb["id"]]
+        mut.today_move(sample, b, c["id"], "down")
+        assert _today_order(sample) == [a["id"], bb["id"], c["id"]]
+        mut.today_move(sample, b, c["id"], "top")
+        assert _today_order(sample) == [c["id"], a["id"], bb["id"]]
+        mut.today_move(sample, b, c["id"], "bottom")
+        assert _today_order(sample) == [a["id"], bb["id"], c["id"]]
+        assert_doctor_clean(sample)
+
+    def test_first_item_up_is_a_no_op(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.today_move(sample, b, a["id"], "up")
+        assert _today_order(sample) == [a["id"], bb["id"], c["id"]]
+
+    def test_task_outside_today_is_refused(self, sample, b, add_task_entity):
+        self._seed(sample, add_task_entity)
+        outside = add_task_entity(task_id="Z" * 21, title="outside")
+        with pytest.raises(mut.MutationError, match="not in today's list"):
+            mut.today_move(sample, b, outside["id"], "up")
+        assert b.ops == []
+
+    def test_unknown_direction(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="unknown direction"):
+            mut.today_move(sample, b, a["id"], "sideways")
+
+
+class TestProjectMove:
+    def _seed(self, sample, add_task_entity):
+        _proj(sample)["taskIds"] = []
+        return [
+            add_task_entity(task_id=chr(65 + i) * 21, title=f"t{i}")
+            for i in range(3)
+        ]
+
+    @pytest.mark.parametrize(
+        "direction,action",
+        [("up", "WMU"), ("down", "WMD"), ("top", "WMT"), ("bottom", "WMB")],
+    )
+    def test_shape(self, sample, b, add_task_entity, direction, action):
+        _a, bb, _c = self._seed(sample, add_task_entity)
+        assert mut.project_move(sample, b, bb["id"], direction) == "INBOX_PROJECT"
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            action, "MOV", "PROJECT", "INBOX_PROJECT",
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": bb["id"],
+            "workContextId": "INBOX_PROJECT",
+            "doneTaskIds": ["A" * 21, "B" * 21, "C" * 21],
+            "workContextType": "PROJECT",
+        }
+
+    def test_state_and_done_skipping(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        bb["isDone"] = True
+        mut.project_move(sample, b, c["id"], "up")
+        assert _proj(sample)["taskIds"] == [c["id"], a["id"], bb["id"]]
+        mut.project_move(sample, b, c["id"], "bottom")
+        assert _proj(sample)["taskIds"] == [a["id"], bb["id"], c["id"]]
+        assert_doctor_clean(sample)
+
+    def test_after_emits_wm_with_src_target(self, sample, b, add_task_entity):
+        a, bb, c = self._seed(sample, add_task_entity)
+        mut.project_move_after(sample, b, a["id"], c["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "WM", "MOV", "PROJECT", "INBOX_PROJECT",
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": a["id"],
+            "afterTaskId": c["id"],
+            "workContextType": "PROJECT",
+            "workContextId": "INBOX_PROJECT",
+            "src": "UNDONE",
+            "target": "UNDONE",
+        }
+        assert _proj(sample)["taskIds"] == [bb["id"], c["id"], a["id"]]
+        assert_doctor_clean(sample)
+
+    def test_after_none_prepends(self, sample, b, add_task_entity):
+        _a, _bb, c = self._seed(sample, add_task_entity)
+        mut.project_move_after(sample, b, c["id"], None)
+        assert _proj(sample)["taskIds"][0] == c["id"]
+        assert _last_op(b)["p"]["actionPayload"]["afterTaskId"] is None
+
+    def test_subtask_is_refused(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        sub = _seed_sub(sample, add_task_entity, a, "S" * 21)
+        with pytest.raises(mut.MutationError, match="subtask"):
+            mut.project_move(sample, b, sub["id"], "up")
+        assert b.ops == []
+
+    def test_backlog_task_is_refused(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        project = _enable_backlog(sample)
+        mut.backlog_add(sample, b, a["id"])
+        n = len(b.ops)
+        assert a["id"] in project["backlogTaskIds"]
+        with pytest.raises(mut.MutationError, match="backlog"):
+            mut.project_move(sample, b, a["id"], "top")
+        assert len(b.ops) == n
+
+    def test_anchor_outside_the_list_is_refused(self, sample, b, add_task_entity):
+        a, _bb, _c = self._seed(sample, add_task_entity)
+        other = add_task_entity(task_id="Z" * 21, parent_id=a["id"])
+        a["subTaskIds"].append(other["id"])
+        with pytest.raises(mut.MutationError, match="anchor"):
+            mut.project_move_after(sample, b, a["id"], other["id"])
+
+
+class TestSubtaskMove:
+    def _seed(self, sample, add_task_entity):
+        parent = add_task_entity(task_id="P" * 21, title="parent")
+        subs = [
+            _seed_sub(sample, add_task_entity, parent, chr(88 + i) * 21)
+            for i in range(3)
+        ]
+        return parent, subs
+
+    @pytest.mark.parametrize(
+        "direction,action",
+        [("up", "TMU"), ("down", "TMD"), ("top", "TMT"), ("bottom", "TMB")],
+    )
+    def test_shape(self, sample, b, add_task_entity, direction, action):
+        parent, subs = self._seed(sample, add_task_entity)
+        assert mut.subtask_move(sample, b, subs[1]["id"], direction) == parent["id"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            action, "MOV", "TASK", subs[1]["id"],
+        )
+        assert op["p"]["actionPayload"] == {
+            "id": subs[1]["id"],
+            "parentId": parent["id"],
+        }
+
+    def test_state_only_touches_sub_task_ids(self, sample, b, add_task_entity):
+        parent, subs = self._seed(sample, add_task_entity)
+        before = list(_proj(sample)["taskIds"])
+        mut.subtask_move(sample, b, subs[2]["id"], "top")
+        assert parent["subTaskIds"] == [subs[2]["id"], subs[0]["id"], subs[1]["id"]]
+        assert _proj(sample)["taskIds"] == before
+        assert_doctor_clean(sample)
+
+    def test_done_siblings_are_not_skipped(self, sample, b, add_task_entity):
+        parent, subs = self._seed(sample, add_task_entity)
+        subs[1]["isDone"] = True
+        mut.subtask_move(sample, b, subs[2]["id"], "up")
+        assert parent["subTaskIds"] == [subs[0]["id"], subs[2]["id"], subs[1]["id"]]
+
+    def test_main_task_is_refused(self, sample, b, add_task_entity):
+        parent, _subs = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="not a subtask"):
+            mut.subtask_move(sample, b, parent["id"], "up")
+        assert b.ops == []
+
+    def test_missing_from_sub_task_ids_is_refused(self, sample, b, add_task_entity):
+        parent, subs = self._seed(sample, add_task_entity)
+        parent["subTaskIds"].remove(subs[0]["id"])
+        with pytest.raises(mut.MutationError, match="subTaskIds"):
+            mut.subtask_move(sample, b, subs[0]["id"], "up")
+
+
+class TestSubtaskReparent:
+    def _seed(self, sample, add_task_entity):
+        src = add_task_entity(task_id="P" * 21, title="src parent")
+        target = add_task_entity(task_id="Q" * 21, title="target parent")
+        sub = _seed_sub(
+            sample, add_task_entity, src, "S" * 21, title="sub", time_estimate=600
+        )
+        sub["timeSpentOnDay"] = {"2026-09-01": 100}
+        sub["timeSpent"] = 100
+        return src, target, sub
+
+    def test_tms_shape(self, sample, b, add_task_entity):
+        src, target, sub = self._seed(sample, add_task_entity)
+        assert mut.subtask_reparent(sample, b, sub["id"], target["id"]) == src["id"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "TMS", "MOV", "TASK", sub["id"],
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": sub["id"],
+            "srcTaskId": src["id"],
+            "targetTaskId": target["id"],
+            "afterTaskId": None,
+        }
+
+    def test_state_and_time_rollups_on_both_parents(
+        self, sample, b, add_task_entity
+    ):
+        src, target, sub = self._seed(sample, add_task_entity)
+        src["timeSpentOnDay"] = {"2026-09-01": 100}
+        src["timeSpent"] = 100
+        src["timeEstimate"] = 500
+        mut.subtask_reparent(sample, b, sub["id"], target["id"])
+        assert src["subTaskIds"] == []
+        assert target["subTaskIds"] == [sub["id"]]
+        assert sub["parentId"] == target["id"]
+        # old parent: emptied aggregates
+        assert src["timeSpentOnDay"] == {} and src["timeSpent"] == 0
+        assert src["timeEstimate"] == 0
+        # new parent: sum over its subtasks (estimate = work LEFT)
+        assert target["timeSpentOnDay"] == {"2026-09-01": 100}
+        assert target["timeSpent"] == 100
+        assert target["timeEstimate"] == 500
+        assert_doctor_clean(sample)
+
+    def test_done_subtask_contributes_no_estimate(self, sample, b, add_task_entity):
+        _src, target, sub = self._seed(sample, add_task_entity)
+        sub["isDone"] = True
+        mut.subtask_reparent(sample, b, sub["id"], target["id"])
+        assert target["timeEstimate"] == 0
+        assert target["timeSpent"] == 100
+
+    def test_project_id_follows_the_new_parent(self, sample, b, add_task_entity):
+        _src, target, sub = self._seed(sample, add_task_entity)
+        project = make_project("N" * 21, "other")
+        mut.project_add(sample, b, project)
+        target["projectId"] = "N" * 21
+        _proj(sample)["taskIds"].remove(target["id"])
+        project["taskIds"].append(target["id"])
+        mut.subtask_reparent(sample, b, sub["id"], target["id"])
+        assert sub["projectId"] == "N" * 21
+        assert_doctor_clean(sample)
+
+    def test_after_anchor_positions_it(self, sample, b, add_task_entity):
+        _src, target, sub = self._seed(sample, add_task_entity)
+        other = _seed_sub(sample, add_task_entity, target, "O" * 21)
+        mut.subtask_reparent(sample, b, sub["id"], target["id"], other["id"])
+        assert target["subTaskIds"] == [other["id"], sub["id"]]
+        assert _last_op(b)["p"]["actionPayload"]["afterTaskId"] == other["id"]
+
+    def test_main_task_is_refused(self, sample, b, add_task_entity):
+        src, target, _sub = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="not a subtask"):
+            mut.subtask_reparent(sample, b, src["id"], target["id"])
+        assert b.ops == []
+
+    def test_target_that_is_a_subtask_is_refused(self, sample, b, add_task_entity):
+        _src, target, sub = self._seed(sample, add_task_entity)
+        nested = _seed_sub(sample, add_task_entity, target, "N" * 21)
+        with pytest.raises(mut.MutationError, match="two levels"):
+            mut.subtask_reparent(sample, b, sub["id"], nested["id"])
+
+    def test_self_parent_is_refused(self, sample, b, add_task_entity):
+        _src, _target, sub = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="own parent"):
+            mut.subtask_reparent(sample, b, sub["id"], sub["id"])
+
+    def test_circular_reference_is_refused(self, sample, b, add_task_entity):
+        src, target, sub = self._seed(sample, add_task_entity)
+        # a (corrupt) descendant link: the target hangs under the moved task
+        sub["subTaskIds"] = [target["id"]]
+        with pytest.raises(mut.MutationError, match="circular"):
+            mut.subtask_reparent(sample, b, sub["id"], target["id"])
+
+    def test_anchor_of_another_parent_is_refused(self, sample, b, add_task_entity):
+        src, target, sub = self._seed(sample, add_task_entity)
+        stray = _seed_sub(sample, add_task_entity, src, "R" * 21)
+        with pytest.raises(mut.MutationError, match="anchor"):
+            mut.subtask_reparent(sample, b, sub["id"], target["id"], stray["id"])
+
+
+class TestDemote:
+    def _seed(self, sample, add_task_entity):
+        parent = add_task_entity(task_id="P" * 21, title="parent")
+        task = add_task_entity(task_id="T" * 21, title="task", time_estimate=900)
+        return parent, task
+
+    def test_hcs_shape(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        mut.demote(sample, b, task["id"], parent["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "HCS", "UPD", "TASK", task["id"],
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": task["id"],
+            "targetParentId": parent["id"],
+            "afterTaskId": None,
+        }
+
+    def test_state_effects(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        _enable_backlog(sample)
+        task["dueDay"] = today_str()
+        _today_order(sample)[:] = [task["id"]]
+        sample["state"]["planner"]["days"]["2030-01-01"] = [task["id"]]
+        mut.demote(sample, b, task["id"], parent["id"])
+        assert task["id"] not in _proj(sample)["taskIds"]
+        assert task["id"] not in _proj(sample)["backlogTaskIds"]
+        assert _today_order(sample) == []
+        assert sample["state"]["planner"]["days"] == {}
+        assert parent["subTaskIds"] == [task["id"]]
+        assert task["parentId"] == parent["id"]
+        assert task["projectId"] == parent["projectId"]
+        assert task["dueDay"] is None
+        assert task["modified"] > 0
+        # the new parent now aggregates the subtask's estimate
+        assert parent["timeEstimate"] == 900
+        assert_doctor_clean(sample)
+
+    def test_tag_ids_are_left_alone(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        tag = make_tag("G" * 21, "work")
+        mut.tag_add(sample, b, tag)
+        mut.add_tag_to_task(sample, b, task["id"], tag["id"])
+        mut.demote(sample, b, task["id"], parent["id"])
+        assert task["tagIds"] == [tag["id"]]
+        assert tag["taskIds"] == [task["id"]]
+        assert_doctor_clean(sample)
+
+    def test_after_anchor(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        first = _seed_sub(sample, add_task_entity, parent, "S" * 21)
+        mut.demote(sample, b, task["id"], parent["id"], first["id"])
+        assert parent["subTaskIds"] == [first["id"], task["id"]]
+        assert _last_op(b)["p"]["actionPayload"]["afterTaskId"] == first["id"]
+
+    def test_anchor_of_another_parent_is_refused(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        other = add_task_entity(task_id="O" * 21, title="other parent")
+        stray = _seed_sub(sample, add_task_entity, other, "S" * 21)
+        with pytest.raises(mut.MutationError, match="anchor"):
+            mut.demote(sample, b, task["id"], parent["id"], stray["id"])
+        assert b.ops == []
+
+    def test_self_target_is_refused(self, sample, b, add_task_entity):
+        _parent, task = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="own parent"):
+            mut.demote(sample, b, task["id"], task["id"])
+
+    def test_target_that_is_a_subtask_is_refused(self, sample, b, add_task_entity):
+        parent, task = self._seed(sample, add_task_entity)
+        nested = _seed_sub(sample, add_task_entity, parent, "S" * 21)
+        with pytest.raises(mut.MutationError, match="two levels"):
+            mut.demote(sample, b, task["id"], nested["id"])
+
+    @pytest.mark.parametrize(
+        "field,value,message",
+        [
+            ("subTaskIds", ["S" * 21], "subtasks of its own"),
+            ("repeatCfgId", "R" * 21, "repeating"),
+            ("issueId", "42", "issue provider"),
+            ("issueProviderId", "I" * 21, "issue provider"),
+            ("issueType", "ICAL", "issue provider"),
+            ("dueWithTime", 1788848927644, "scheduled at a time"),
+            ("reminderId", "M" * 21, "reminder"),
+            ("remindAt", 1788848927644, "reminder"),
+        ],
+    )
+    def test_eligibility_blockers(
+        self, sample, b, add_task_entity, field, value, message
+    ):
+        parent, task = self._seed(sample, add_task_entity)
+        task[field] = value
+        with pytest.raises(mut.MutationError, match=message):
+            mut.demote(sample, b, task["id"], parent["id"])
+        assert b.ops == []
+
+    def test_already_a_subtask_is_refused(self, sample, b, add_task_entity):
+        parent, _task = self._seed(sample, add_task_entity)
+        sub = _seed_sub(sample, add_task_entity, parent, "S" * 21)
+        other = add_task_entity(task_id="O" * 21, title="other parent")
+        with pytest.raises(mut.MutationError, match="already a subtask"):
+            mut.demote(sample, b, sub["id"], other["id"])
+
+
+class TestPromote:
+    def _seed(self, sample, add_task_entity, **sub_kw):
+        parent = add_task_entity(task_id="P" * 21, title="parent")
+        sub = _seed_sub(
+            sample, add_task_entity, parent, "S" * 21, title="sub", **sub_kw
+        )
+        return parent, sub
+
+    def test_hc_shape_carries_every_optional_field(
+        self, sample, b, add_task_entity
+    ):
+        parent, sub = self._seed(sample, add_task_entity)
+        tag = make_tag("G" * 21, "work")
+        mut.tag_add(sample, b, tag)
+        parent["tagIds"] = [tag["id"]]
+        tag["taskIds"].append(parent["id"])
+        assert mut.promote(sample, b, sub["id"]) == parent["id"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("HC", "UPD", "TASK", sub["id"])
+        payload = op["p"]["actionPayload"]
+        assert payload["task"]["id"] == sub["id"]
+        assert payload["task"]["parentId"] == parent["id"]  # snapshot BEFORE
+        assert payload["parentTagIds"] == [tag["id"]]
+        assert payload["isPlanForToday"] is False
+        assert payload["afterTaskId"] == parent["id"]
+        assert payload["isDone"] is False
+        assert payload["today"] == model.logical_today_str(sample)
+        assert payload["modified"] > 0
+        assert "doneOn" not in payload  # only meaningful for a done task
+
+    def test_done_task_carries_done_on(self, sample, b, add_task_entity):
+        _parent, sub = self._seed(sample, add_task_entity)
+        sub["isDone"] = True
+        sub["doneOn"] = 1788848927644
+        mut.promote(sample, b, sub["id"])
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["isDone"] is True
+        assert payload["doneOn"] == 1788848927644
+        # SP marks a converted done task as done TODAY
+        assert sub["dueDay"] == payload["today"]
+        assert sub["dueWithTime"] is None
+
+    def test_state_effects(self, sample, b, add_task_entity):
+        parent, sub = self._seed(sample, add_task_entity, time_estimate=300)
+        mut.promote(sample, b, sub["id"])
+        assert "parentId" not in sub
+        assert parent["subTaskIds"] == []
+        assert parent["timeEstimate"] == 0
+        assert parent["timeSpentOnDay"] == {}
+        # inserted right AFTER its former parent
+        task_ids = _proj(sample)["taskIds"]
+        assert task_ids.index(sub["id"]) == task_ids.index(parent["id"]) + 1
+        assert_doctor_clean(sample)
+
+    def test_own_tags_win_over_the_parents(self, sample, b, add_task_entity):
+        parent, sub = self._seed(sample, add_task_entity)
+        own = make_tag("G" * 21, "own")
+        inherited = make_tag("H" * 21, "parents")
+        mut.tag_add(sample, b, own)
+        mut.tag_add(sample, b, inherited)
+        parent["tagIds"] = [inherited["id"]]
+        inherited["taskIds"].append(parent["id"])
+        mut.add_tag_to_task(sample, b, sub["id"], own["id"])
+        mut.promote(sample, b, sub["id"])
+        assert sub["tagIds"] == [own["id"]]
+        assert sub["id"] in own["taskIds"]
+        assert sub["id"] not in inherited["taskIds"]
+        assert_doctor_clean(sample)
+
+    def test_tagless_subtask_inherits_the_parents_tags(
+        self, sample, b, add_task_entity
+    ):
+        parent, sub = self._seed(sample, add_task_entity)
+        tag = make_tag("G" * 21, "work")
+        mut.tag_add(sample, b, tag)
+        parent["tagIds"] = [tag["id"]]
+        tag["taskIds"].append(parent["id"])
+        mut.promote(sample, b, sub["id"])
+        assert sub["tagIds"] == [tag["id"]]
+        assert tag["taskIds"] == [parent["id"], sub["id"]]
+        assert_doctor_clean(sample)
+
+    def test_plan_for_today_sets_due_day_and_today_order(
+        self, sample, b, add_task_entity
+    ):
+        parent, sub = self._seed(sample, add_task_entity)
+        mut.promote(sample, b, sub["id"], plan_for_today=True)
+        today = model.logical_today_str(sample)
+        assert sub["dueDay"] == today
+        assert sub["id"] in _today_order(sample)
+        assert _last_op(b)["p"]["actionPayload"]["isPlanForToday"] is True
+        assert_doctor_clean(sample)
+
+    def test_planner_days_are_not_touched(self, sample, b, add_task_entity):
+        parent, sub = self._seed(sample, add_task_entity)
+        sample["state"]["planner"]["days"]["2030-01-01"] = [sub["id"]]
+        mut.promote(sample, b, sub["id"])
+        assert sample["state"]["planner"]["days"]["2030-01-01"] == [sub["id"]]
+
+    def test_main_task_is_refused(self, sample, b, add_task_entity):
+        parent, _sub = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="not a subtask"):
+            mut.promote(sample, b, parent["id"])
+        assert b.ops == []
+
+
+class TestPlannerMoveBefore:
+    def _seed(self, sample, add_task_entity):
+        a = add_task_entity(task_id="A" * 21, title="a")
+        target = add_task_entity(task_id="B" * 21, title="b", due_day="2030-01-02")
+        days = sample["state"]["planner"]["days"]
+        days["2030-01-01"] = [a["id"]]
+        days["2030-01-02"] = [target["id"]]
+        return a, target
+
+    def test_lb_shape(self, sample, b, add_task_entity):
+        a, target = self._seed(sample, add_task_entity)
+        mut.planner_move_before(sample, b, a["id"], target["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "LB", "MOV", "PLANNER", a["id"],
+        )
+        payload = op["p"]["actionPayload"]
+        assert payload["toTaskId"] == target["id"]
+        assert payload["fromTask"]["id"] == a["id"]
+
+    def test_moves_between_days_and_inherits_due_day(
+        self, sample, b, add_task_entity
+    ):
+        a, target = self._seed(sample, add_task_entity)
+        mut.planner_move_before(sample, b, a["id"], target["id"])
+        days = sample["state"]["planner"]["days"]
+        assert "2030-01-01" not in days  # emptied
+        assert days["2030-01-02"] == [a["id"], target["id"]]
+        assert a["dueDay"] == "2030-01-02"
+        assert a["dueWithTime"] is None
+        assert_doctor_clean(sample)
+
+    def test_moving_onto_a_today_anchor_enters_today_order(
+        self, sample, b, add_task_entity
+    ):
+        a, target = self._seed(sample, add_task_entity)
+        target["dueDay"] = today_str()
+        del sample["state"]["planner"]["days"]["2030-01-02"]
+        _today_order(sample)[:] = [target["id"]]
+        mut.planner_move_before(sample, b, a["id"], target["id"])
+        assert _today_order(sample) == [a["id"], target["id"]]
+        assert a["dueDay"] == today_str()
+        assert_doctor_clean(sample)
+
+    def test_moving_away_from_today_leaves_the_order(
+        self, sample, b, add_task_entity
+    ):
+        a, target = self._seed(sample, add_task_entity)
+        a["dueDay"] = today_str()
+        _today_order(sample)[:] = [a["id"]]
+        mut.planner_move_before(sample, b, a["id"], target["id"])
+        assert _today_order(sample) == []
+        assert a["dueDay"] == "2030-01-02"
+        assert_doctor_clean(sample)
+
+    def test_self_move_is_refused(self, sample, b, add_task_entity):
+        a, _target = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="before itself"):
+            mut.planner_move_before(sample, b, a["id"], a["id"])
+        assert b.ops == []
+
+    def test_missing_anchor_is_refused(self, sample, b, add_task_entity):
+        a, _target = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="task not found"):
+            mut.planner_move_before(sample, b, a["id"], "Z" * 21)

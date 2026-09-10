@@ -408,6 +408,123 @@ def cmd_reorder(args) -> int:
     return 0
 
 
+def _direction(args) -> str | None:
+    """The single --up/--down/--top/--bottom flag, or None."""
+    chosen = [name for name in mut.DIRECTIONS if getattr(args, name, False)]
+    if len(chosen) > 1:
+        raise CliError(
+            "pick exactly one direction (--up / --down / --top / --bottom)"
+        )
+    return chosen[0] if chosen else None
+
+
+def cmd_today_move(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    direction = _direction(args)
+    if args.before and direction:
+        raise CliError("today move: --before cannot be combined with a direction")
+    if not args.before and not direction:
+        raise CliError(
+            "today move: pass --before ID or --up / --down / --top / --bottom"
+        )
+    if args.before:
+        anchor = q.resolve_task(d, args.before)
+        store.commit(
+            [lambda dd, b: mut.today_move_before(dd, b, tid, anchor)], initial=d
+        )
+        print(f"{render.short_id(tid)} moved before {render.short_id(anchor)} in today")
+        return 0
+    store.commit([lambda dd, b: mut.today_move(dd, b, tid, direction)], initial=d)
+    print(f"{render.short_id(tid)} moved {direction} in today")
+    return 0
+
+
+def cmd_move_in_project(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    direction = _direction(args)
+    if args.after and direction:
+        raise CliError("move-in-project: --after cannot be combined with a direction")
+    if not args.after and not direction:
+        raise CliError(
+            "move-in-project: pass --after ID or --up / --down / --top / --bottom"
+        )
+    if args.after:
+        anchor = q.resolve_task(d, args.after)
+        store.commit(
+            [lambda dd, b: mut.project_move_after(dd, b, tid, anchor)], initial=d
+        )
+        print(f"{render.short_id(tid)} moved after {render.short_id(anchor)}")
+        return 0
+    store.commit([lambda dd, b: mut.project_move(dd, b, tid, direction)], initial=d)
+    print(f"{render.short_id(tid)} moved {direction} in its project")
+    return 0
+
+
+def cmd_subtask_move(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    direction = _direction(args)
+    if not direction:
+        raise CliError("subtask move: pass --up / --down / --top / --bottom")
+    store.commit([lambda dd, b: mut.subtask_move(dd, b, tid, direction)], initial=d)
+    print(f"{render.short_id(tid)} moved {direction} among its siblings")
+    return 0
+
+
+def cmd_subtask_reparent(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    parent_id = q.resolve_task(d, args.parent)
+    after = q.resolve_task(d, args.after) if args.after else None
+    store.commit(
+        [lambda dd, b: mut.subtask_reparent(dd, b, tid, parent_id, after)], initial=d
+    )
+    print(f"{render.short_id(tid)} is now a subtask of {render.short_id(parent_id)}")
+    return 0
+
+
+def cmd_demote(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    parent_id = q.resolve_task(d, args.parent)
+    after = q.resolve_task(d, args.after) if args.after else None
+    store.commit(
+        [lambda dd, b: mut.demote(dd, b, tid, parent_id, after)], initial=d
+    )
+    print(f"{render.short_id(tid)} is now a subtask of {render.short_id(parent_id)}")
+    return 0
+
+
+def cmd_promote(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    store.commit(
+        [lambda dd, b: mut.promote(dd, b, tid, plan_for_today=args.today)], initial=d
+    )
+    print(f"{render.short_id(tid)} is now a main task")
+    return 0
+
+
+def cmd_plan_move(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    anchor = q.resolve_task(d, args.before)
+    store.commit(
+        [lambda dd, b: mut.planner_move_before(dd, b, tid, anchor)], initial=d
+    )
+    print(f"{render.short_id(tid)} moved before {render.short_id(anchor)}")
+    return 0
+
+
 def cmd_backlog(args) -> int:
     client, _ = _ctx()
     d = client.get()
@@ -2128,7 +2245,11 @@ def cmd_backup(args) -> int:
 _SUBCOMMAND_REWRITES = {
     ("today", "add"): "today-add",
     ("today", "rm"): "today-rm",
+    ("today", "move"): "today-move",
     ("plan", "show"): "plan-show",
+    ("plan", "move"): "plan-move",
+    ("subtask", "move"): "subtask-move",
+    ("subtask", "reparent"): "subtask-reparent",
     ("project", "add"): "project-add",
     ("project", "edit"): "project-edit",
     ("project", "archive"): "project-archive",
@@ -2335,9 +2456,49 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--add", action="append")
     s.add_argument("--remove", action="append")
 
-    s = add("reorder", cmd_reorder, "reorder tasks in a project")
+    s = add(
+        "reorder",
+        cmd_reorder,
+        "rewrite a project's whole task order (prefer 'move-in-project')",
+    )
     s.add_argument("--project", required=True)
     s.add_argument("ids", nargs="+")
+
+    def _directions(sp):
+        for name in mut.DIRECTIONS:
+            sp.add_argument(f"--{name}", action="store_true")
+        return sp
+
+    s = _directions(add("today-move", cmd_today_move, "reorder today's list"))
+    s.add_argument("id")
+    s.add_argument("--before", help="put it directly before this task")
+
+    s = _directions(
+        add("move-in-project", cmd_move_in_project, "reorder a task in its project")
+    )
+    s.add_argument("id")
+    s.add_argument("--after", help="put it directly after this task")
+
+    s = _directions(add("subtask-move", cmd_subtask_move, "reorder a subtask"))
+    s.add_argument("id")
+
+    s = add("subtask-reparent", cmd_subtask_reparent, "move a subtask to another parent")
+    s.add_argument("id")
+    s.add_argument("--parent", required=True)
+    s.add_argument("--after", help="put it after this subtask of the new parent")
+
+    s = add("demote", cmd_demote, "turn a task into a subtask")
+    s.add_argument("id")
+    s.add_argument("--parent", required=True)
+    s.add_argument("--after", help="put it after this subtask of the parent")
+
+    s = add("promote", cmd_promote, "turn a subtask into a main task")
+    s.add_argument("id")
+    s.add_argument("--today", action="store_true", help="also plan it for today")
+
+    s = add("plan-move", cmd_plan_move, "move a task before another in the planner")
+    s.add_argument("id")
+    s.add_argument("--before", required=True)
 
     s = add("backlog", cmd_backlog, "list a project's backlog")
     s.add_argument("--project", required=True)

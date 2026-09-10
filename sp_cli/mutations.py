@@ -417,6 +417,543 @@ def reorder_project(d: dict, b: OpBuilder, project_id: str, ordered: list[str]) 
     project["taskIds"] = list(ordered)
 
 
+# ------------------------------------------------- reordering & conversion
+
+DIRECTIONS = ("up", "down", "top", "bottom")
+
+_WM_ACTIONS = {"up": "WMU", "down": "WMD", "top": "WMT", "bottom": "WMB"}
+_TM_ACTIONS = {"up": "TMU", "down": "TMD", "top": "TMT", "bottom": "TMB"}
+
+
+def _array_move(lst: list, from_i: int, to_i: int) -> None:
+    """SP's `arrayMove` (splice out, splice in) — in place."""
+    lst.insert(to_i, lst.pop(from_i))
+
+
+def _move_left_until(lst: list, value: str, skip) -> None:
+    """SP's `arrayMoveLeftUntil`: step left over every neighbour `skip()`
+    accepts (the DONE ones), stopping at index 0."""
+    if value not in lst:
+        return
+    old = lst.index(value)
+    new = old - 1
+    while new > 0 and skip(lst[new]):
+        new -= 1
+    if new >= 0:
+        _array_move(lst, old, new)
+
+
+def _move_right_until(lst: list, value: str, skip) -> None:
+    """SP's `arrayMoveRightUntil` (mirror of `_move_left_until`)."""
+    if value not in lst:
+        return
+    old = lst.index(value)
+    new = old + 1
+    while new < len(lst) and skip(lst[new]):
+        new += 1
+    if new < len(lst):
+        _array_move(lst, old, new)
+
+
+def _move_in_list(lst: list, value: str, direction: str, undone: list[str]) -> None:
+    """The four WM*/TM* shifts. `undone` is the NOT-done id list: up/down step
+    OVER done neighbours (SP skips every id absent from it)."""
+    if value not in lst:
+        return
+    undone_set = set(undone)
+
+    def _skip(item: str) -> bool:
+        return item not in undone_set
+
+    if direction == "up":
+        _move_left_until(lst, value, _skip)
+    elif direction == "down":
+        _move_right_until(lst, value, _skip)
+    elif direction == "top":
+        _array_move(lst, lst.index(value), 0)
+    elif direction == "bottom":
+        _array_move(lst, lst.index(value), len(lst) - 1)
+    else:
+        raise MutationError(f"unknown direction: {direction}")
+
+
+def _move_item_before_anchor(lst: list, from_id: str, to_id: str) -> None:
+    """SP's `moveItemBeforeItem` — in place, callers guard membership."""
+    to_index = lst.index(to_id)
+    from_index = lst.index(from_id)
+    adjusted = to_index - 1 if from_index < to_index else to_index
+    _array_move(lst, from_index, adjusted)
+
+
+def _undone_ids(state: dict, ids: list[str]) -> list[str]:
+    entities = state["task"]["entities"]
+    return [tid for tid in ids if not (entities.get(tid) or {}).get("isDone")]
+
+
+def _recalc_parent_times(state: dict, parent_id: str) -> None:
+    """SP's `reCalcTimesForParentIfParent`: a parent task's times are pure
+    aggregates over its CURRENT subtasks.
+
+    - `timeSpentOnDay` = per-day sum over the subtasks (falsy values skipped)
+    - `timeSpent`      = sum of that map
+    - `timeEstimate`   = `sumSubTaskTimeLeft`: the work still OUTSTANDING, i.e.
+      sum of `max(0, estimate - spent)` over the NOT-done subtasks (a done
+      subtask contributes nothing) — 0 when the last subtask leaves.
+    """
+    parent = state["task"]["entities"].get(parent_id)
+    if parent is None:
+        return
+    entities = state["task"]["entities"]
+    subs = [
+        entities[sid]
+        for sid in parent.get("subTaskIds", [])
+        if sid in entities
+    ]
+    per_day: dict[str, int] = {}
+    for sub in subs:
+        for day, value in (sub.get("timeSpentOnDay") or {}).items():
+            if not value:
+                continue
+            per_day[day] = per_day.get(day, 0) + int(value)
+    parent["timeSpentOnDay"] = per_day
+    parent["timeSpent"] = sum(per_day.values())
+    parent["timeEstimate"] = sum(
+        0
+        if sub.get("isDone")
+        else max(0, int(sub.get("timeEstimate") or 0) - int(sub.get("timeSpent") or 0))
+        for sub in subs
+    )
+
+
+def today_move_before(d: dict, b: OpBuilder, task_id: str, to_task_id: str) -> None:
+    """HMT: put `task_id` directly BEFORE `to_task_id` in the TODAY ordering.
+
+    A bulk op whose `ds` is **[toTaskId, fromTaskId]** — target first. The
+    receiver silently ignores the move unless BOTH ids are in the TODAY list,
+    so membership is checked here instead of shipping a dead op.
+    """
+    state = _state(d)
+    _task(state, task_id)
+    _task(state, to_task_id)
+    if task_id == to_task_id:
+        raise MutationError("today move: a task cannot be moved before itself")
+    order = _today_order(state)
+    for tid in (task_id, to_task_id):
+        if tid not in order:
+            raise MutationError(
+                f"task {tid} is not in today's list "
+                "(both tasks must be in it: 'sp today add' first)"
+            )
+
+    b.op(
+        "HMT",
+        "MOV",
+        "TASK",
+        to_task_id,
+        {"toTaskId": to_task_id, "fromTaskId": task_id},
+        ds=[to_task_id, task_id],
+    )
+
+    _move_item_before_anchor(order, task_id, to_task_id)
+
+
+def today_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> None:
+    """WMU/WMD/WMT/WMB on the TODAY tag list.
+
+    ⚠️ `doneTaskIds` is a wire-frozen misnomer: it carries the NOT-done ids of
+    the context, and up/down hop OVER every neighbour missing from it.
+    """
+    if direction not in DIRECTIONS:
+        raise MutationError(f"unknown direction: {direction}")
+    state = _state(d)
+    _task(state, task_id)
+    order = _today_order(state)
+    if task_id not in order:
+        raise MutationError(
+            f"task {task_id} is not in today's list ('sp today add' first)"
+        )
+
+    b.op(
+        _WM_ACTIONS[direction],
+        "MOV",
+        "TAG",
+        TODAY_TAG_ID,
+        {
+            "taskId": task_id,
+            "workContextId": TODAY_TAG_ID,
+            "doneTaskIds": _undone_ids(state, order),
+            "workContextType": "TAG",
+        },
+    )
+
+    _move_in_list(order, task_id, direction, _undone_ids(state, order))
+
+
+def _project_list_task(state: dict, task_id: str) -> tuple[dict, dict]:
+    task = _task(state, task_id)
+    if task.get("parentId"):
+        raise MutationError(
+            "cannot reorder a subtask in the project list; use 'sp subtask move'"
+        )
+    project = _project(state, task["projectId"])
+    if task_id in project.get("backlogTaskIds", []):
+        raise MutationError(
+            f"task {task_id} is in the backlog of {project['id']} "
+            "(use 'sp backlog rm' first)"
+        )
+    if task_id not in project.get("taskIds", []):
+        raise MutationError(
+            f"task {task_id} is not in project {project['id']}'s task list"
+        )
+    return task, project
+
+
+def project_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> str:
+    """WMU/WMD/WMT/WMB in the task's own project list. Returns the project id."""
+    if direction not in DIRECTIONS:
+        raise MutationError(f"unknown direction: {direction}")
+    state = _state(d)
+    _task_, project = _project_list_task(state, task_id)
+    project_id = project["id"]
+    task_ids = project["taskIds"]
+
+    b.op(
+        _WM_ACTIONS[direction],
+        "MOV",
+        "PROJECT",
+        project_id,
+        {
+            "taskId": task_id,
+            "workContextId": project_id,
+            "doneTaskIds": _undone_ids(state, task_ids),
+            "workContextType": "PROJECT",
+        },
+    )
+
+    _move_in_list(task_ids, task_id, direction, _undone_ids(state, task_ids))
+    return project_id
+
+
+def project_move_after(
+    d: dict, b: OpBuilder, task_id: str, after_task_id: str | None
+) -> str:
+    """WM: anchor-based move inside the project list (`after_task_id` None
+    prepends). Returns the project id."""
+    state = _state(d)
+    _task_, project = _project_list_task(state, task_id)
+    project_id = project["id"]
+    if after_task_id is not None:
+        if after_task_id == task_id:
+            raise MutationError("move: a task cannot be moved after itself")
+        if after_task_id not in project.get("taskIds", []):
+            raise MutationError(
+                f"anchor {after_task_id} is not in project {project_id}'s task list"
+            )
+
+    b.op(
+        "WM",
+        "MOV",
+        "PROJECT",
+        project_id,
+        {
+            "taskId": task_id,
+            "afterTaskId": after_task_id,
+            "workContextType": "PROJECT",
+            "workContextId": project_id,
+            "src": "UNDONE",
+            "target": "UNDONE",
+        },
+    )
+
+    _move_item_after_anchor(project["taskIds"], task_id, after_task_id)
+    return project_id
+
+
+def subtask_move(d: dict, b: OpBuilder, task_id: str, direction: str) -> str:
+    """TMU/TMD/TMT/TMB: shift a subtask inside its parent. Returns parent id.
+
+    The op writes ONLY `parent.subTaskIds` and is a silent no-op on the
+    receivers when the parent is gone or the id is not among its subtasks.
+    """
+    if direction not in DIRECTIONS:
+        raise MutationError(f"unknown direction: {direction}")
+    state = _state(d)
+    task = _task(state, task_id)
+    parent_id = task.get("parentId")
+    if not parent_id:
+        raise MutationError(f"task {task_id} is not a subtask")
+    parent = _task(state, parent_id)
+    sub_ids = parent.setdefault("subTaskIds", [])
+    if task_id not in sub_ids:
+        raise MutationError(
+            f"task {task_id} is not listed in parent {parent_id}'s subTaskIds"
+        )
+
+    b.op(
+        _TM_ACTIONS[direction],
+        "MOV",
+        "TASK",
+        task_id,
+        {"id": task_id, "parentId": parent_id},
+    )
+
+    # Subtask lists have no done/undone skipping: every sibling counts.
+    _move_in_list(sub_ids, task_id, direction, list(sub_ids))
+    return parent_id
+
+
+def subtask_reparent(
+    d: dict,
+    b: OpBuilder,
+    task_id: str,
+    target_parent_id: str,
+    after_task_id: str | None = None,
+) -> str:
+    """TMS: move a subtask under another parent. Returns the old parent id.
+
+    Both parents' aggregate times are recomputed, exactly as the reducer does.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    src_id = task.get("parentId")
+    if not src_id:
+        raise MutationError(
+            f"task {task_id} is not a subtask (use 'sp demote' to nest it)"
+        )
+    src = _task(state, src_id)
+    target = _task(state, target_parent_id)
+    if task_id in (src_id, target_parent_id):
+        raise MutationError("reparent: a task cannot be its own parent")
+    if target.get("parentId"):
+        raise MutationError(
+            f"{target_parent_id} is itself a subtask; SuperProductivity nests "
+            "only two levels"
+        )
+    if target_parent_id in task.get("subTaskIds", []):
+        raise MutationError("reparent: that would create a circular reference")
+    if after_task_id is not None and after_task_id not in target.get("subTaskIds", []):
+        raise MutationError(
+            f"anchor {after_task_id} is not a subtask of {target_parent_id}"
+        )
+
+    b.op(
+        "TMS",
+        "MOV",
+        "TASK",
+        task_id,
+        {
+            "taskId": task_id,
+            "srcTaskId": src_id,
+            "targetTaskId": target_parent_id,
+            "afterTaskId": after_task_id,
+        },
+    )
+
+    _list_remove(src.setdefault("subTaskIds", []), task_id)
+    _recalc_parent_times(state, src_id)
+    _move_item_after_anchor(
+        target.setdefault("subTaskIds", []), task_id, after_task_id
+    )
+    task["parentId"] = target_parent_id
+    task["projectId"] = target["projectId"]
+    _recalc_parent_times(state, target_parent_id)
+    return src_id
+
+
+# The eligibility rule of SP's `canConvertTaskToSubTask`, field by field, with
+# the message explaining why the app would refuse. Replicated here because HCS
+# is a SILENT no-op on the receivers when it does not hold.
+_DEMOTE_BLOCKERS = (
+    ("parentId", "it is already a subtask"),
+    ("subTaskIds", "it has subtasks of its own (only two levels are nested)"),
+    ("repeatCfgId", "it is a repeating task"),
+    ("issueId", "it comes from an issue provider"),
+    ("issueProviderId", "it comes from an issue provider"),
+    ("issueType", "it comes from an issue provider"),
+    ("dueWithTime", "it is scheduled at a time ('sp unschedule' first)"),
+    ("reminderId", "it has a reminder ('sp unschedule' first)"),
+    ("remindAt", "it has a reminder ('sp unschedule' first)"),
+)
+
+
+def demote(
+    d: dict,
+    b: OpBuilder,
+    task_id: str,
+    target_parent_id: str,
+    after_task_id: str | None = None,
+) -> None:
+    """HCS convertToSubTask: turn a main task into a subtask of another task.
+
+    Every eligibility condition is checked here: the receivers apply the op
+    only when it holds, and a rejected op would leave the CLI's snapshot and
+    the devices permanently out of step.
+
+    Effects mirror the reducer: the task leaves the project's list AND backlog,
+    the TODAY ordering and every planner day; it is anchor-inserted into the
+    parent's subTaskIds; `parentId`/`projectId` are set, `dueDay` cleared,
+    `modified` bumped. `tagIds` and the deadline fields are left alone.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    target = _task(state, target_parent_id)
+    if task_id == target_parent_id:
+        raise MutationError("demote: a task cannot be its own parent")
+    if target.get("parentId"):
+        raise MutationError(
+            f"{target_parent_id} is itself a subtask; SuperProductivity nests "
+            "only two levels"
+        )
+    for field, reason in _DEMOTE_BLOCKERS:
+        if task.get(field):
+            raise MutationError(f"cannot convert {task_id} to a subtask: {reason}")
+    if after_task_id is not None and after_task_id not in target.get("subTaskIds", []):
+        raise MutationError(
+            f"anchor {after_task_id} is not a subtask of {target_parent_id}"
+        )
+
+    b.op(
+        "HCS",
+        "UPD",
+        "TASK",
+        task_id,
+        {
+            "taskId": task_id,
+            "targetParentId": target_parent_id,
+            "afterTaskId": after_task_id,
+        },
+    )
+
+    project = state["project"]["entities"].get(task.get("projectId"))
+    if project is not None:
+        _list_remove(project.setdefault("taskIds", []), task_id)
+        _list_remove(project.setdefault("backlogTaskIds", []), task_id)
+    _list_remove(_today_order(state), task_id)
+    _planner_purge(state, [task_id])
+    _move_item_after_anchor(
+        target.setdefault("subTaskIds", []), task_id, after_task_id
+    )
+    task["parentId"] = target_parent_id
+    task["projectId"] = target["projectId"]
+    task["dueDay"] = None
+    task["modified"] = now_ms()
+    _recalc_parent_times(state, target_parent_id)
+
+
+def promote(d: dict, b: OpBuilder, task_id: str, plan_for_today: bool = False) -> str:
+    """HC convertToMainTask: lift a subtask back to a top-level task. Returns
+    the former parent id.
+
+    The receiver THROWS when it cannot resolve the parent, so the payload
+    carries the task snapshot taken BEFORE the change and every optional field
+    explicitly (`today`, `doneOn`, `modified`) — replay must not depend on the
+    receiving device's clock.
+
+    Effects mirror the reducer: the task keeps its own tags (TODAY filtered) or
+    inherits the parent's when it has none; the old parent loses it from
+    `subTaskIds` and has its times recomputed; the task is inserted right after
+    its former parent in the project list and in each of its tags; TODAY gets
+    it when `plan_for_today`. The planner is NOT touched.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    parent_id = task.get("parentId")
+    if not parent_id:
+        raise MutationError(f"task {task_id} is not a subtask")
+    parent = _task(state, parent_id)
+
+    snapshot = copy.deepcopy(task)  # BEFORE the change
+    today = logical_today_str(d)
+    is_done = bool(task.get("isDone"))
+    modified = now_ms()
+    own_tags = [t for t in (task.get("tagIds") or []) if t != TODAY_TAG_ID]
+    parent_tags = [t for t in (parent.get("tagIds") or []) if t != TODAY_TAG_ID]
+    kept_tags = own_tags if own_tags else list(parent_tags)
+
+    payload = {
+        "task": snapshot,
+        "parentTagIds": list(parent.get("tagIds") or []),
+        "isPlanForToday": bool(plan_for_today),
+        "afterTaskId": parent_id,
+        "isDone": is_done,
+        "today": today,
+        "modified": modified,
+    }
+    if is_done:
+        # Only consulted for a done task (`capturedDoneOn ?? Date.now()`), but
+        # then it must be OURS, not the receiving device's clock.
+        payload["doneOn"] = task.get("doneOn") or modified
+    b.op("HC", "UPD", "TASK", task_id, payload)
+
+    # old parent: unlink + recompute its aggregates
+    _list_remove(parent.setdefault("subTaskIds", []), task_id)
+    _recalc_parent_times(state, parent_id)
+
+    task.pop("parentId", None)
+    task["tagIds"] = list(kept_tags)
+    task["modified"] = modified
+    if plan_for_today and not task.get("dueWithTime"):
+        task["dueDay"] = today
+    if is_done:
+        task["doneOn"] = payload["doneOn"]
+        task["dueDay"] = today
+        task["dueWithTime"] = None
+    else:
+        task["doneOn"] = None
+
+    # position: right after the former parent, in the project and in the tags
+    project = state["project"]["entities"].get(task.get("projectId"))
+    if project is not None:
+        _move_item_after_anchor(project.setdefault("taskIds", []), task_id, parent_id)
+    tag_ids = list(kept_tags) + ([TODAY_TAG_ID] if plan_for_today else [])
+    for tag_id in tag_ids:
+        tag = state["tag"]["entities"].get(tag_id)
+        if tag is None:
+            continue
+        _move_item_after_anchor(tag.setdefault("taskIds", []), task_id, parent_id)
+    return parent_id
+
+
+def planner_move_before(d: dict, b: OpBuilder, task_id: str, to_task_id: str) -> None:
+    """LB: drop a task right before another one in the planner.
+
+    The anchor decides the day: the task leaves every planner day, is inserted
+    before the anchor in the anchor's day, and inherits the anchor's `dueDay`
+    (its `dueWithTime` is dropped). TODAY membership follows the anchor.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    target = _task(state, to_task_id)
+    if task_id == to_task_id:
+        raise MutationError("plan move: a task cannot be moved before itself")
+
+    b.op(
+        "LB",
+        "MOV",
+        "PLANNER",
+        task_id,
+        {"fromTask": copy.deepcopy(task), "toTaskId": to_task_id},
+    )
+
+    days = state.setdefault("planner", {"days": {}}).setdefault("days", {})
+    for day, day_list in list(days.items()):
+        _list_remove(day_list, task_id)
+        if to_task_id in day_list:
+            day_list.insert(day_list.index(to_task_id), task_id)
+        if not day_list:
+            del days[day]
+
+    task["dueDay"] = target.get("dueDay")
+    task["dueWithTime"] = None
+
+    order = _today_order(state)
+    if to_task_id in order:
+        _list_remove(order, task_id)
+        order.insert(order.index(to_task_id), task_id)
+    elif task_id in order:
+        _list_remove(order, task_id)
+
+
 # ---------------------------------------------------------------- backlog
 
 def backlog_add(
