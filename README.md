@@ -145,7 +145,13 @@ pip install requests
 `--exclude-tags-match all|any`, `--project P` (повторяемый) | `--all-projects`,
 `--done all|done|undone`, `--scheduled all|scheduled|not`,
 `--backlog all|no|only`, `--parents-only` | `--no-parents-only`,
-`--sort dueDate|created|title|timeEstimate [--dir asc|desc]`.
+`--sort dueDate|created|title|timeEstimate [--dir asc|desc]`,
+`--sort manual` (= `--no-sort`) — убрать сортировку и вернуться к ручному
+порядку.
+
+Важно: `board panel order` работает только на панели без сортировки: если у
+панели задан `sortBy`, SP игнорирует ручной порядок — сначала
+`./sp board panel edit <panel-id> --sort manual`.
 
 Важно: `board panel order` задаёт **только порядок** задач в панели —
 состав панели всегда вычисляется из фильтров, добавить туда задачу вручную

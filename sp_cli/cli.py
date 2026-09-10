@@ -890,7 +890,17 @@ def _panel_args(sp) -> None:
     sp.add_argument("--backlog", choices=sorted(BACKLOG_STATE))
     sp.add_argument("--parents-only", action="store_true")
     sp.add_argument("--no-parents-only", action="store_true")
-    sp.add_argument("--sort", choices=list(PANEL_SORT_BY))
+    sp.add_argument(
+        "--sort",
+        choices=[*PANEL_SORT_BY, "manual"],
+        help="sort field, or 'manual' to drop sorting and use the panel's "
+        "manual task order",
+    )
+    sp.add_argument(
+        "--no-sort",
+        action="store_true",
+        help="alias for --sort manual",
+    )
     sp.add_argument("--dir", choices=["asc", "desc"])
 
 
@@ -927,8 +937,17 @@ def _panel_changes(d: dict, args) -> dict:
         changes["isParentTasksOnly"] = True
     if args.no_parents_only:
         changes["isParentTasksOnly"] = False
-    if args.sort:
-        changes["sortBy"] = args.sort
+    sort = "manual" if args.no_sort else args.sort
+    if args.no_sort and args.sort and args.sort != "manual":
+        raise CliError("--no-sort and --sort are mutually exclusive")
+    if sort == "manual":
+        if args.dir:
+            raise CliError("--dir cannot be combined with --sort manual")
+        # None drops both keys in the sanitizer: back to manual (BT) order.
+        changes["sortBy"] = None
+        changes["sortDir"] = None
+    elif sort:
+        changes["sortBy"] = sort
         changes["sortDir"] = args.dir or "asc"
     elif args.dir:
         raise CliError("--dir requires --sort")
@@ -946,7 +965,13 @@ def cmd_boards(args) -> int:
     return 0
 
 
+def _check_cols(cols) -> None:
+    if cols is not None and int(cols) < 1:
+        raise CliError("--cols must be 1 or more")
+
+
 def cmd_board_add(args) -> int:
+    _check_cols(args.cols)
     client, store = _ctx()
     d = client.get()
     board_id = nanoid()
@@ -963,6 +988,7 @@ def cmd_board_add(args) -> int:
 
 
 def cmd_board_edit(args) -> int:
+    _check_cols(args.cols)
     client, store = _ctx()
     d = client.get()
     board_id = q.resolve_board(d, args.id)
@@ -1365,6 +1391,39 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
     return argv
 
 
+_BOARD_USAGE = """usage: sp board <subcommand> ...
+
+  sp boards [--json]                    list boards and their panels
+  sp board add TITLE [--cols N]         create a board
+  sp board edit ID [--title T] [--cols N]
+  sp board rm ID [--yes]
+  sp board sort ID [ID ...]             reorder boards (listed ones first)
+  sp board panel add BOARD TITLE [filters]
+  sp board panel edit PANEL [filters]
+  sp board panel rm PANEL
+  sp board panel order PANEL TASK [TASK ...]
+
+Run `sp board-panel-add --help` (etc.) for the full filter flags."""
+
+
+def _board_group_help(argv: list[str]) -> str | None:
+    """`sp board` / `sp board panel` (+ typos) get the group usage instead of
+    argparse's baffling "invalid choice: 'board'"."""
+    if not argv or argv[0] != "board":
+        return None
+    if len(argv) >= 2 and argv[1] == "panel":
+        bad = argv[2] if len(argv) > 2 else None
+        what = f"unknown board panel subcommand: {bad}" if bad else (
+            "sp board panel needs a subcommand (add, edit, rm, order)"
+        )
+    else:
+        bad = argv[1] if len(argv) > 1 else None
+        what = f"unknown board subcommand: {bad}" if bad else (
+            "sp board needs a subcommand (add, edit, rm, sort, panel)"
+        )
+    return f"{what}\n\n{_BOARD_USAGE}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sp", description="SuperProductivity CLI")
     sub = p.add_subparsers(dest="command", metavar="command")
@@ -1639,6 +1698,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = _rewrite_argv(list(sys.argv[1:] if argv is None else argv))
+    board_help = _board_group_help(argv)
+    if board_help:
+        print(board_help, file=sys.stderr)
+        return 2
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "fn", None):

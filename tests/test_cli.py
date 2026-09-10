@@ -330,6 +330,110 @@ class TestPanelChanges:
         args = self._args(["board", "panel", "add", "b", "T"])
         assert cli._panel_changes(sample, args) == {}
 
+    @pytest.mark.parametrize("flag", [["--sort", "manual"], ["--no-sort"]])
+    def test_manual_sort_clears_sort_keys(self, sample, flag):
+        args = self._args(["board", "panel", "edit", "TODO"] + flag)
+        changes = cli._panel_changes(sample, args)
+        assert changes == {"sortBy": None, "sortDir": None}
+
+    def test_manual_sort_rejects_dir(self, sample):
+        args = self._args(
+            ["board", "panel", "edit", "TODO", "--sort", "manual", "--dir", "asc"]
+        )
+        with pytest.raises(cli.CliError, match="--sort manual"):
+            cli._panel_changes(sample, args)
+
+    def test_no_sort_conflicts_with_a_real_sort(self, sample):
+        args = self._args(
+            ["board", "panel", "edit", "TODO", "--no-sort", "--sort", "title"]
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli._panel_changes(sample, args)
+
+
+class TestBoardCommands:
+    def _args(self, argv):
+        return cli.build_parser().parse_args(cli._rewrite_argv(argv))
+
+    def test_add_prints_id_and_emits_ba_without_ds(self, fake_ctx, sample, capsys):
+        assert cli.cmd_board_add(self._args(["board", "add", "Sprint"])) == 0
+        printed = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["d"]) == ("BA", printed)
+        assert "ds" not in op
+        assert op["p"]["actionPayload"]["board"]["cols"] == 2
+
+    def test_edit_emits_bu_without_ds(self, fake_ctx, sample):
+        rc = cli.cmd_board_edit(self._args(["board", "edit", "KANBAN", "--cols", "4"]))
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["d"]) == ("BU", "KANBAN_DEFAULT")
+        assert "ds" not in op
+        assert op["p"]["actionPayload"]["updates"] == {"cols": 4}
+
+    def test_panel_add_emits_bu_with_whole_array(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_board_panel_add(
+            self._args(["board", "panel", "add", "KANBAN", "Extra"])
+        )
+        assert rc == 0
+        panel_id = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "BU" and "ds" not in op
+        panels = op["p"]["actionPayload"]["updates"]["panels"]
+        assert [p["id"] for p in panels][-1] == panel_id
+        assert len(panels) == 4
+
+    def test_panel_edit_sort_manual_drops_sort_keys(self, fake_ctx, sample):
+        panel = sample["state"]["boards"]["boardCfgs"][1]["panels"][0]
+        panel["sortBy"] = "title"
+        panel["sortDir"] = "asc"
+        rc = cli.cmd_board_panel_edit(
+            self._args(["board", "panel", "edit", "TODO", "--sort", "manual"])
+        )
+        assert rc == 0
+        written = fake_ctx.ops[-1]["p"]["actionPayload"]["updates"]["panels"][0]
+        assert "sortBy" not in written and "sortDir" not in written
+
+    def test_panel_order_on_sorted_panel_is_exit_2(
+        self, fake_ctx, sample, add_task_entity, capsys
+    ):
+        tid = add_task_entity()["id"]
+        sample["state"]["boards"]["boardCfgs"][1]["panels"][0]["sortBy"] = "title"
+        assert cli.main(["board", "panel", "order", "TODO", tid]) == 2
+        assert "--sort manual" in capsys.readouterr().err
+        assert fake_ctx.ops == []
+
+    def test_sort_emits_bs_with_ds(self, fake_ctx, sample):
+        rc = cli.cmd_board_sort(self._args(["board", "sort", "KANBAN"]))
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "BS" and op["ds"] == ["KANBAN_DEFAULT"]
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["board", "add", "T", "--cols", "0"],
+            ["board", "edit", "KANBAN", "--cols", "-1"],
+        ],
+    )
+    def test_bad_cols_is_exit_2(self, fake_ctx, argv):
+        assert cli.main(argv) == 2
+        assert fake_ctx.ops == []
+
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["board"], "needs a subcommand"),
+            (["board", "panel"], "sp board panel needs a subcommand"),
+            (["board", "panel", "bogus"], "unknown board panel subcommand"),
+            (["board", "bogus"], "unknown board subcommand"),
+        ],
+    )
+    def test_incomplete_board_command_prints_usage(self, argv, expected, capsys):
+        assert cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert expected in err and "usage: sp board" in err
+
 
 class TestCounterArgvRewrites:
     @pytest.mark.parametrize(

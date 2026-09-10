@@ -408,6 +408,48 @@ class TestBoardsQueries:
         panel["includedTagIds"] = ["TODAY"]
         assert any("'TODAY' in includedTagIds" in p for p in q.doctor(sample))
 
+    def _panel(self, sample):
+        return sample["state"]["boards"]["boardCfgs"][0]["panels"][0]
+
+    def test_doctor_accepts_absent_or_empty_project_ids(self, sample):
+        """Absent/empty projectIds means 'All Projects' — not a problem."""
+        panel = self._panel(sample)
+        del panel["projectIds"]
+        assert q.doctor(sample) == []
+        panel["projectIds"] = []
+        assert q.doctor(sample) == []
+
+    def test_doctor_detects_non_list_project_ids(self, sample):
+        self._panel(sample)["projectIds"] = "WORK"
+        assert any("projectIds must be an array" in p for p in q.doctor(sample))
+
+    @pytest.mark.parametrize("legacy", ["projectId", "sortByDue"])
+    def test_doctor_detects_leftover_legacy_keys(self, sample, legacy):
+        self._panel(sample)[legacy] = "asc"
+        assert any(f"leftover legacy key '{legacy}'" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_invalid_sort_by(self, sample):
+        self._panel(sample)["sortBy"] = "nonsense"
+        assert any("invalid sortBy" in p for p in q.doctor(sample))
+
+    @pytest.mark.parametrize(
+        "key", ["sortDir", "includedTagsMatch", "excludedTagsMatch"]
+    )
+    def test_doctor_detects_null_optional_keys(self, sample, key):
+        self._panel(sample)[key] = None
+        assert any(f"{key} is null" in p for p in q.doctor(sample))
+
+    @pytest.mark.parametrize(
+        "key", ["taskDoneState", "scheduledState", "backlogState"]
+    )
+    def test_doctor_detects_non_numeric_enums(self, sample, key):
+        self._panel(sample)[key] = "all"
+        assert any(f"{key} = 'all' is not a number" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_missing_task_ids(self, sample):
+        del self._panel(sample)["taskIds"]
+        assert any("taskIds must be an array" in p for p in q.doctor(sample))
+
 
 class TestCounters:
     def test_all_counters_in_state_order(self, sample):

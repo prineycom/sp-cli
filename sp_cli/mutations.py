@@ -772,7 +772,7 @@ def _check_panels(state: dict, board_id: str, panels: list[dict]) -> list[dict]:
     clean = [sanitize_panel(p) for p in panels]
     seen: set[str] = set()
     for panel in clean:
-        if not panel["id"]:
+        if not panel.get("id"):
             raise MutationError("panel id must be a non-empty string")
         if panel["id"] in seen:
             raise MutationError(f"duplicate panel id: {panel['id']}")
@@ -790,7 +790,9 @@ def _check_panels(state: dict, board_id: str, panels: list[dict]) -> list[dict]:
         for panel in other.get("panels") or []:
             if panel.get("id") in seen:
                 raise MutationError(
-                    f"panel id {panel['id']} already used on board {other.get('id')}"
+                    f"panel id {panel['id']} already used on board "
+                    f"{other.get('id')} — run `sp doctor` and give one of them "
+                    "a fresh id"
                 )
     return clean
 
@@ -872,6 +874,13 @@ def panel_task_order(
     """BT: manual ORDERING only — membership stays derived from the filters."""
     state = _state(d)
     board, index = find_panel(state, panel_id)
+    panel = board["panels"][index]
+    if panel.get("sortBy"):
+        raise MutationError(
+            f"panel {panel_id} is sorted by '{panel['sortBy']}': sorted panels "
+            "ignore manual order — run `sp board panel edit "
+            f"{panel_id} --sort manual` first"
+        )
     for tid in task_ids:
         _task(state, tid)
 
@@ -889,6 +898,8 @@ def panel_task_order(
 def boards_sort(d: dict, b: OpBuilder, board_ids: list[str]) -> None:
     """BS: listed boards first, in the given order; the rest keep their tail."""
     state = _state(d)
+    if not board_ids:
+        raise MutationError("board sort: no board ids given")
     for bid in board_ids:
         _board(state, bid)
     if len(set(board_ids)) != len(board_ids):
@@ -904,9 +915,11 @@ def boards_sort(d: dict, b: OpBuilder, board_ids: list[str]) -> None:
     )
 
     cfgs = _board_cfgs(state)
-    by_id = {cfg["id"]: cfg for cfg in cfgs}
+    # Entries without an id can only come from a foreign writer: keep them in
+    # the tail rather than blowing up the reorder.
+    by_id = {cfg.get("id"): cfg for cfg in cfgs if cfg.get("id")}
     cfgs[:] = [by_id[bid] for bid in board_ids] + [
-        cfg for cfg in cfgs if cfg["id"] not in board_ids
+        cfg for cfg in cfgs if cfg.get("id") not in board_ids
     ]
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 
-from sp_cli.model import TODAY_TAG_ID, day_of_ms, today_str
+from sp_cli.model import PANEL_SORT_BY, TODAY_TAG_ID, day_of_ms, today_str
 
 
 class QueryError(Exception):
@@ -499,11 +499,35 @@ def doctor(d: dict) -> list[str]:
             elif pid in panel_ids:
                 problems.append(f"boards: duplicate panel id '{pid}'")
             panel_ids.add(pid)
+            # An absent or empty projectIds is VALID: it means "All Projects",
+            # same as the '' sentinel. Only a non-list or a mixed array is off.
             project_ids = panel.get("projectIds")
-            if not isinstance(project_ids, list) or not project_ids:
-                problems.append(f"panel {pid}: projectIds must be a non-empty array")
-            elif "" in project_ids and project_ids != [""]:
+            if project_ids is not None and not isinstance(project_ids, list):
+                problems.append(f"panel {pid}: projectIds must be an array")
+            elif isinstance(project_ids, list) and "" in project_ids and (
+                project_ids != [""]
+            ):
                 problems.append(f"panel {pid}: projectIds mixes '' with real ids")
+            for legacy in ("projectId", "sortByDue"):
+                if legacy in panel:
+                    problems.append(
+                        f"panel {pid}: leftover legacy key '{legacy}' "
+                        "(rewrite the panel to migrate it)"
+                    )
+            if "sortBy" in panel and panel["sortBy"] not in PANEL_SORT_BY:
+                problems.append(f"panel {pid}: invalid sortBy {panel['sortBy']!r}")
+            for key in ("sortDir", "includedTagsMatch", "excludedTagsMatch"):
+                if key in panel and panel[key] is None:
+                    problems.append(f"panel {pid}: {key} is null (must be absent)")
+            for key in ("taskDoneState", "scheduledState", "backlogState"):
+                if key in panel and (
+                    isinstance(panel[key], bool) or not isinstance(panel[key], int)
+                ):
+                    problems.append(
+                        f"panel {pid}: {key} = {panel[key]!r} is not a number"
+                    )
+            if not isinstance(panel.get("taskIds"), list):
+                problems.append(f"panel {pid}: taskIds must be an array")
             if TODAY_TAG_ID in (panel.get("includedTagIds") or []):
                 problems.append(f"panel {pid}: 'TODAY' in includedTagIds")
 

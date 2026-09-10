@@ -207,29 +207,52 @@ def _enum_value(value, default: int) -> int:
 
 
 def sanitize_panel(panel: dict) -> dict:
-    """Rebuild a BoardPanelCfg with only valid keys/values.
+    """Normalize a BoardPanelCfg for persistence — mirrors SP's sanitizePanelCfg.
 
-    Drops legacy keys (projectId, sortByDue), null match/sortDir values and
-    invalid sortBy; canonicalizes projectIds. Always run before writing."""
-    out = {
-        "id": panel["id"],
-        "title": panel.get("title") or "",
-        "taskIds": [str(t) for t in (panel.get("taskIds") or [])],
-        "includedTagIds": _clean_tag_ids(panel.get("includedTagIds")),
-        "excludedTagIds": _clean_tag_ids(panel.get("excludedTagIds")),
-        "taskDoneState": _enum_value(panel.get("taskDoneState"), 1),
-        "scheduledState": _enum_value(panel.get("scheduledState"), 1),
-        "backlogState": _enum_value(panel.get("backlogState"), 1),
-        "isParentTasksOnly": bool(panel.get("isParentTasksOnly")),
-        "projectIds": _clean_project_ids(panel.get("projectIds")),
-    }
+    MIGRATING, not a whitelist: every unknown key is preserved. Panels are only
+    ever written as a whole array (BU), so a whitelist rebuild would silently
+    strip fields a newer client wrote onto the untouched sibling panels.
+
+    Migrates legacy `projectId` → `projectIds` and `sortByDue` → `sortBy`/
+    `sortDir`; drops null match/sortDir values and unknown `sortBy`;
+    canonicalizes projectIds and the enum fields. Idempotent."""
+    out = dict(panel)
+
+    # Legacy `projectId` → `projectIds`. The legacy value wins over a
+    # default-looking [''] (SP: don't lose an explicit older-version choice).
+    if "projectId" in out:
+        legacy = out["projectId"]
+        current = out.get("projectIds")
+        if current is None or (isinstance(current, list) and current == [""]):
+            out["projectIds"] = [str(legacy) if legacy else ""]
+        del out["projectId"]
+
+    out["projectIds"] = _clean_project_ids(out.get("projectIds"))
+
+    # Legacy `sortByDue: 'asc'|'desc'` → sortBy/sortDir; the key always goes.
+    if out.get("sortByDue") in PANEL_SORT_DIR:
+        out["sortBy"] = "dueDate"
+        out["sortDir"] = out["sortByDue"]
+    out.pop("sortByDue", None)
+
+    if out.get("sortBy") in PANEL_SORT_BY:
+        if out.get("sortDir") not in PANEL_SORT_DIR:
+            out.pop("sortDir", None)
+    else:
+        out.pop("sortBy", None)
+        out.pop("sortDir", None)
     for key in ("includedTagsMatch", "excludedTagsMatch"):
-        if panel.get(key) in PANEL_TAGS_MATCH:
-            out[key] = panel[key]
-    if panel.get("sortBy") in PANEL_SORT_BY:
-        out["sortBy"] = panel["sortBy"]
-        if panel.get("sortDir") in PANEL_SORT_DIR:
-            out["sortDir"] = panel["sortDir"]
+        if out.get(key) not in PANEL_TAGS_MATCH:
+            out.pop(key, None)
+
+    out["title"] = out.get("title") or ""
+    out["taskIds"] = [str(t) for t in (out.get("taskIds") or [])]
+    out["includedTagIds"] = _clean_tag_ids(out.get("includedTagIds"))
+    out["excludedTagIds"] = _clean_tag_ids(out.get("excludedTagIds"))
+    out["taskDoneState"] = _enum_value(out.get("taskDoneState"), 1)
+    out["scheduledState"] = _enum_value(out.get("scheduledState"), 1)
+    out["backlogState"] = _enum_value(out.get("backlogState"), 1)
+    out["isParentTasksOnly"] = bool(out.get("isParentTasksOnly"))
     return out
 
 
