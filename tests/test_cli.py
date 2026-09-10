@@ -845,3 +845,267 @@ class TestMetricCommands:
         cli.cmd_metrics(_args(["metrics"]))
         out = capsys.readouterr().out
         assert "2026-01-01" in out and "1x 25m" in out
+
+
+def _seed_provider(d, pid, key="ICAL", **overrides):
+    from sp_cli.model import make_issue_provider
+
+    provider = make_issue_provider(pid, key, **overrides)
+    reg = d["state"]["issueProvider"]
+    reg["ids"].append(pid)
+    reg["entities"][pid] = provider
+    return provider
+
+
+class TestProviderArgvRewrites:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["provider", "add-ical", "u"], "provider-add-ical"),
+            (["provider", "add-caldav"], "provider-add-caldav"),
+            (["provider", "edit", "x"], "provider-edit"),
+            (["provider", "rm", "x"], "provider-rm"),
+            (["provider", "order", "x"], "provider-order"),
+        ],
+    )
+    def test_rewrite(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_bare_provider_is_providers(self):
+        assert cli._rewrite_argv(["provider"]) == ["providers"]
+        assert cli._rewrite_argv(["provider", "--json"]) == ["providers", "--json"]
+
+    def test_unknown_subcommand_gets_group_help(self, capsys):
+        assert cli.main(["provider", "add"]) == 2
+        assert "sp provider add-ical" in capsys.readouterr().err
+
+
+class TestProviderCommands:
+    @staticmethod
+    def _reg(d):
+        return d["state"]["issueProvider"]
+
+    def test_add_ical_emits_full_provider(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_provider_add_ical(
+            _args(
+                [
+                    "provider", "add-ical", "https://cal/x.ics",
+                    "--auto-import",
+                    "--project", "inbox",
+                    "--check-every", "30m",
+                ]
+            )
+        )
+        assert rc == 0
+        printed = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "IA", "CRT", "ISSUE_PROVIDER", printed,
+        )
+        provider = op["p"]["actionPayload"]["issueProvider"]
+        assert provider["issueProviderKey"] == "ICAL"
+        assert provider["icalUrl"] == "https://cal/x.ics"
+        assert provider["isAutoImportForCurrentDay"] is True
+        assert provider["isEnabled"] is True
+        assert provider["defaultProjectId"] == "INBOX_PROJECT"
+        assert provider["checkUpdatesEvery"] == 1800000
+        assert provider["showBannerBeforeThreshold"] == 7200000
+        assert provider["pollingMode"] == "whenProjectOpen"
+        assert provider["defaultTagIds"] == []
+        assert self._reg(sample)["ids"] == [printed]
+
+    def test_add_ical_does_not_create_cal_tasks(self, fake_ctx, sample):
+        before = list(sample["state"]["task"]["ids"])
+        cli.cmd_provider_add_ical(_args(["provider", "add-ical", "https://c/x.ics"]))
+        assert sample["state"]["task"]["ids"] == before
+        assert [op["a"] for op in fake_ctx.ops] == ["IA"]
+
+    def test_add_ical_with_tags(self, fake_ctx, sample):
+        cli.cmd_provider_add_ical(
+            _args(
+                [
+                    "provider", "add-ical", "https://c/x.ics",
+                    "--tag", "meetings", "--create-tags",
+                ]
+            )
+        )
+        provider = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]
+        assert len(provider["defaultTagIds"]) == 1
+        assert [op["a"] for op in fake_ctx.ops] == ["GA", "IA"]
+
+    def test_add_ical_regex_filters(self, fake_ctx):
+        cli.cmd_provider_add_ical(
+            _args(
+                [
+                    "provider", "add-ical", "https://c/x.ics",
+                    "--include-regex", "standup",
+                    "--exclude-regex", "",
+                ]
+            )
+        )
+        provider = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]
+        assert provider["filterIncludeRegex"] == "standup"
+        assert provider["filterExcludeRegex"] is None
+
+    def test_add_caldav_without_optin_is_refused(self, fake_ctx):
+        argv = [
+            "provider", "add-caldav",
+            "--url", "https://dav/",
+            "--resource", "cal",
+            "--username", "u",
+            "--password", "pw",
+        ]
+        with pytest.raises(cli.CliError, match="PLAIN TEXT"):
+            cli.cmd_provider_add_caldav(_args(argv))
+        assert fake_ctx.ops == []
+        assert cli.main(argv) == 2
+
+    def test_add_caldav_with_optin(self, fake_ctx, capsys):
+        rc = cli.cmd_provider_add_caldav(
+            _args(
+                [
+                    "provider", "add-caldav",
+                    "--url", "https://dav/",
+                    "--resource", "cal",
+                    "--username", "u",
+                    "--password", "pw",
+                    "--category-filter", "work",
+                    "--store-plaintext-credentials",
+                ]
+            )
+        )
+        assert rc == 0
+        capsys.readouterr()
+        provider = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]
+        assert provider["issueProviderKey"] == "CALDAV"
+        assert provider["caldavUrl"] == "https://dav/"
+        assert provider["resourceName"] == "cal"
+        assert provider["username"] == "u"
+        assert provider["password"] == "pw"
+        assert provider["categoryFilter"] == "work"
+        assert provider["isAddSubTasks"] is False
+
+    def test_edit_emits_iu(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21, icalUrl="https://old/x.ics")
+        rc = cli.cmd_provider_edit(
+            _args(
+                [
+                    "provider", "edit", "P" * 21,
+                    "--disable",
+                    "--url", "https://new/x.ics",
+                    "--no-auto-import",
+                    "--project", "inbox",
+                ]
+            )
+        )
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "IU", "UPD", "ISSUE_PROVIDER", "P" * 21,
+        )
+        changes = op["p"]["actionPayload"]["issueProvider"]["changes"]
+        assert changes == {
+            "isEnabled": False,
+            "icalUrl": "https://new/x.ics",
+            "isAutoImportForCurrentDay": False,
+            "defaultProjectId": "INBOX_PROJECT",
+        }
+
+    def test_edit_no_project_clears(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21, defaultProjectId="INBOX_PROJECT")
+        cli.cmd_provider_edit(_args(["provider", "edit", "P" * 21, "--no-project"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]["changes"]
+        assert changes == {"defaultProjectId": None}
+
+    def test_edit_caldav_url_field(self, fake_ctx, sample):
+        _seed_provider(sample, "C" * 21, key="CALDAV", caldavUrl="https://a/")
+        cli.cmd_provider_edit(
+            _args(["provider", "edit", "C" * 21, "--url", "https://b/"])
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]["changes"]
+        assert changes == {"caldavUrl": "https://b/"}
+
+    def test_edit_ical_only_flags_on_caldav_rejected(self, fake_ctx, sample):
+        _seed_provider(sample, "C" * 21, key="CALDAV")
+        with pytest.raises(cli.CliError, match="only apply to ICAL"):
+            cli.cmd_provider_edit(
+                _args(["provider", "edit", "C" * 21, "--auto-import"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_edit_conflicting_flags(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21)
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_provider_edit(
+                _args(["provider", "edit", "P" * 21, "--enable", "--disable"])
+            )
+
+    def test_edit_nothing_to_change(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21)
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_provider_edit(_args(["provider", "edit", "P" * 21]))
+
+    def test_rm_unlinks_live_and_archived(self, fake_ctx, sample, capsys):
+        from sp_cli.model import make_task
+
+        pid = "P" * 21
+        _seed_provider(sample, pid)
+        live = make_task("L" * 21, "cal event", "INBOX_PROJECT")
+        live["issueProviderId"] = pid
+        live["issueId"] = "ev1"
+        sample["state"]["task"]["ids"].append(live["id"])
+        sample["state"]["task"]["entities"][live["id"]] = live
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"].append(
+            live["id"]
+        )
+        arch = make_task("A" * 21, "old event", "INBOX_PROJECT")
+        arch["issueProviderId"] = pid
+        arch["issueId"] = "ev0"
+        sample["state"]["archiveOld"]["task"]["ids"].append(arch["id"])
+        sample["state"]["archiveOld"]["task"]["entities"][arch["id"]] = arch
+
+        rc = cli.cmd_provider_rm(_args(["provider", "rm", pid, "--yes"]))
+        assert rc == 0
+        assert "unlinked 2 task(s)" in capsys.readouterr().out
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "HID", "DEL", "ISSUE_PROVIDER", pid,
+        )
+        assert sorted(op["p"]["actionPayload"]["taskIdsToUnlink"]) == sorted(
+            [live["id"], arch["id"]]
+        )
+        assert "issueProviderId" not in live and "issueId" not in live
+        assert "issueProviderId" not in arch and "issueId" not in arch
+        assert self._reg(sample)["ids"] == []
+
+    def test_order_lists_providers_first(self, fake_ctx, sample, capsys):
+        for pid in ("A" * 21, "B" * 21, "C" * 21):
+            _seed_provider(sample, pid)
+        rc = cli.cmd_provider_order(_args(["provider", "order", "C" * 21]))
+        assert rc == 0
+        capsys.readouterr()
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"]) == ("IS", "MOV", "ISSUE_PROVIDER")
+        assert op["p"]["actionPayload"] == {"ids": ["C" * 21]}
+        assert self._reg(sample)["ids"] == ["C" * 21, "A" * 21, "B" * 21]
+
+    def test_providers_list_json(self, fake_ctx, sample, capsys):
+        _seed_provider(sample, "P" * 21, icalUrl="https://c/x.ics")
+        assert cli.cmd_providers(_args(["providers", "--json"])) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert [p["id"] for p in data] == ["P" * 21]
+
+    def test_providers_list_table(self, fake_ctx, sample, capsys):
+        _seed_provider(
+            sample,
+            "P" * 21,
+            icalUrl="https://c/x.ics",
+            defaultProjectId="INBOX_PROJECT",
+        )
+        assert cli.cmd_providers(_args(["providers"])) == 0
+        out = capsys.readouterr().out
+        assert "ICAL" in out and "https://c/x.ics" in out and "Inbox" in out
+
+    def test_providers_empty(self, fake_ctx, capsys):
+        assert cli.cmd_providers(_args(["providers"])) == 0
+        assert capsys.readouterr().out.strip() == "(none)"

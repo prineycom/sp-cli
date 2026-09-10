@@ -3,7 +3,7 @@ import datetime
 import pytest
 
 from sp_cli import queries as q
-from sp_cli.model import today_str
+from sp_cli.model import make_issue_provider, make_task, today_str
 from sp_cli.render import format_duration, parse_duration
 
 
@@ -569,3 +569,70 @@ class TestMetricsQueries:
     def test_doctor_clean_on_good_metric(self, sample):
         _add_metric(sample, "2026-01-01", impactOfWork=3, focusSessions=[1000])
         assert q.doctor(sample) == []
+
+
+def _add_provider(d, pid, key="ICAL", **overrides):
+    provider = make_issue_provider(pid, key, **overrides)
+    reg = d["state"]["issueProvider"]
+    reg["ids"].append(pid)
+    reg["entities"][pid] = provider
+    return provider
+
+
+class TestIssueProviderQueries:
+    def test_all_providers_follows_ids_order(self, sample):
+        _add_provider(sample, "A" * 21)
+        _add_provider(sample, "B" * 21)
+        sample["state"]["issueProvider"]["ids"] = ["B" * 21, "A" * 21]
+        assert [p["id"] for p in q.all_providers(sample)] == ["B" * 21, "A" * 21]
+
+    def test_provider_url_per_key(self, sample):
+        ical = _add_provider(sample, "A" * 21, icalUrl="https://c/x.ics")
+        dav = _add_provider(sample, "B" * 21, key="CALDAV", caldavUrl="https://dav/")
+        assert q.provider_url(ical) == "https://c/x.ics"
+        assert q.provider_url(dav) == "https://dav/"
+        assert q.provider_url({"issueProviderKey": "plugin:foo"}) == ""
+
+    def test_resolve_by_id_prefix_and_url(self, sample):
+        _add_provider(sample, "A" * 21, icalUrl="https://c/x.ics")
+        assert q.resolve_provider(sample, "A" * 21) == "A" * 21
+        assert q.resolve_provider(sample, "AAA") == "A" * 21
+        assert q.resolve_provider(sample, "https://C/x.ics") == "A" * 21
+
+    def test_resolve_ambiguous_prefix(self, sample):
+        _add_provider(sample, "AB" + "x" * 19)
+        _add_provider(sample, "AC" + "x" * 19)
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_provider(sample, "A")
+
+    def test_resolve_missing(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.resolve_provider(sample, "nope")
+
+    def test_tasks_of_provider_spans_archives(self, sample):
+        pid = "P" * 21
+        _add_provider(sample, pid)
+        live = make_task("L" * 21, "live", "INBOX_PROJECT")
+        live["issueProviderId"] = pid
+        sample["state"]["task"]["ids"].append(live["id"])
+        sample["state"]["task"]["entities"][live["id"]] = live
+        for key, tid in (("archiveYoung", "Y" * 21), ("archiveOld", "O" * 21)):
+            task = make_task(tid, "arch", "INBOX_PROJECT")
+            task["issueProviderId"] = pid
+            reg = sample["state"][key]["task"]
+            reg["ids"].append(tid)
+            reg["entities"][tid] = task
+        unrelated = make_task("U" * 21, "other", "INBOX_PROJECT")
+        unrelated["issueProviderId"] = "other"
+        sample["state"]["task"]["ids"].append(unrelated["id"])
+        sample["state"]["task"]["entities"][unrelated["id"]] = unrelated
+
+        assert sorted(q.tasks_of_provider(sample, pid)) == sorted(
+            ["L" * 21, "Y" * 21, "O" * 21]
+        )
+
+    def test_doctor_checks_issue_provider_registry(self, sample):
+        _add_provider(sample, "A" * 21)
+        assert q.doctor(sample) == []
+        sample["state"]["issueProvider"]["ids"] = []
+        assert any("issueProvider" in p for p in q.doctor(sample))

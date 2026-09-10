@@ -9,6 +9,7 @@ import copy
 import datetime
 
 from sp_cli.model import (
+    ISSUE_TASK_FIELDS,
     METRIC_DEAD_FIELDS,
     METRIC_FIELDS,
     TODAY_TAG_ID,
@@ -1222,6 +1223,140 @@ def metric_delete(d: dict, b: OpBuilder, day: str) -> None:
         raise MutationError(f"metric not found: {day}")
     b.op("ED", "DEL", "METRIC", day, {"id": day})
     _reg_remove(reg, day)
+
+
+# ------------------------------------------------------- issue providers
+
+def _provider_reg(state: dict) -> dict:
+    reg = state.setdefault("issueProvider", {"ids": [], "entities": {}})
+    reg.setdefault("ids", [])
+    reg.setdefault("entities", {})
+    return reg
+
+
+def _provider(state: dict, provider_id: str) -> dict:
+    try:
+        return state["issueProvider"]["entities"][provider_id]
+    except KeyError:
+        raise MutationError(f"issue provider not found: {provider_id}") from None
+
+
+def provider_add(d: dict, b: OpBuilder, provider: dict) -> str:
+    """IA: create an issue provider (built via model.make_issue_provider).
+
+    The payload carries the FULL provider object — SP validates built-in
+    provider cfgs with typia and rejects a partial one.
+    """
+    state = _state(d)
+    reg = _provider_reg(state)
+    provider = copy.deepcopy(provider)
+    pid = provider.get("id")
+    if not pid:
+        raise MutationError("provider add: missing id")
+    if pid in reg["entities"]:
+        raise MutationError(f"entity already exists: {pid}")
+
+    b.op("IA", "CRT", "ISSUE_PROVIDER", pid, {"issueProvider": copy.deepcopy(provider)})
+
+    _reg_add(reg, provider)
+    return pid
+
+
+def provider_update(d: dict, b: OpBuilder, provider_id: str, changes: dict) -> None:
+    state = _state(d)
+    _provider_reg(state)
+    provider = _provider(state, provider_id)
+    changes = dict(changes)
+    if "id" in changes or "issueProviderKey" in changes:
+        raise MutationError("provider edit: id / issueProviderKey are immutable")
+    if not changes:
+        return
+
+    b.op(
+        "IU",
+        "UPD",
+        "ISSUE_PROVIDER",
+        provider_id,
+        {"issueProvider": {"id": provider_id, "changes": copy.deepcopy(changes)}},
+    )
+
+    provider.update(copy.deepcopy(changes))
+
+
+def _unlink_issue_fields(task: dict) -> None:
+    for field in ISSUE_TASK_FIELDS:
+        task.pop(field, None)
+
+
+def provider_delete(d: dict, b: OpBuilder, provider_id: str) -> list[str]:
+    """HID: delete a provider and unlink every task that referenced it.
+
+    taskIdsToUnlink is collected from live tasks AND both archive blobs; the
+    issue fields are cleared in all three places. Returns the unlinked ids.
+    """
+    state = _state(d)
+    reg = _provider_reg(state)
+    _provider(state, provider_id)
+
+    live = [
+        tid
+        for tid in state["task"]["ids"]
+        if state["task"]["entities"].get(tid, {}).get("issueProviderId")
+        == provider_id
+    ]
+    archives = []
+    for key in ("archiveYoung", "archiveOld"):
+        blob = d.get(key) or state.get(key) or {}
+        arch_reg = blob.get("task") or {}
+        entities = arch_reg.get("entities") or {}
+        archives.append(entities)
+    task_ids = list(live)
+    for entities in archives:
+        for tid, task in entities.items():
+            if task.get("issueProviderId") == provider_id and tid not in task_ids:
+                task_ids.append(tid)
+
+    b.op(
+        "HID",
+        "DEL",
+        "ISSUE_PROVIDER",
+        provider_id,
+        {"issueProviderId": provider_id, "taskIdsToUnlink": list(task_ids)},
+    )
+
+    for tid in live:
+        _unlink_issue_fields(state["task"]["entities"][tid])
+    for entities in archives:
+        for task in entities.values():
+            if task.get("issueProviderId") == provider_id:
+                _unlink_issue_fields(task)
+    _reg_remove(reg, provider_id)
+    return task_ids
+
+
+def provider_order(d: dict, b: OpBuilder, provider_ids: list[str]) -> None:
+    """IS: listed providers first, in the given order; the rest keep their tail."""
+    state = _state(d)
+    reg = _provider_reg(state)
+    if not provider_ids:
+        raise MutationError("provider order: no provider ids given")
+    if len(set(provider_ids)) != len(provider_ids):
+        raise MutationError("provider order: duplicate ids")
+    for pid in provider_ids:
+        _provider(state, pid)
+
+    b.op(
+        "IS",
+        "MOV",
+        "ISSUE_PROVIDER",
+        provider_ids[0],
+        {"ids": list(provider_ids)},
+        ds=list(provider_ids),
+    )
+
+    reg["ids"] = list(provider_ids) + [
+        pid for pid in reg["ids"] if pid not in provider_ids
+    ]
 
 
 # ---------------------------------------------------------------- archive

@@ -203,6 +203,37 @@ id метрики — это сам день (`YYYY-MM-DD`), отдельной 
 payload затирает поля. Полей mood/productivity/obstruction/improvement в SP
 больше нет, CLI их не пишет и ругается на них в `doctor`.
 
+### Интеграции / календари (issue providers)
+
+```sh
+./sp providers [--json]                       # id, ключ, вкл/выкл, url, проект, авто-импорт
+                                              # `./sp provider` без подкоманды = ./sp providers
+./sp provider add-ical <url> [--auto-import] [--project P] [--tag T ...] [--create-tags] \
+    [--check-every 2h] [--banner-before 2h] [--include-regex RE] [--exclude-regex RE]
+./sp provider add-caldav --url U --resource R --username U --password P \
+    [--category-filter C] [--project P] [--tag T ...] --store-plaintext-credentials
+./sp provider edit <id> [--enable|--disable] [--url U] \
+    [--auto-import|--no-auto-import] [--project P|--no-project] [--check-every 2h]
+./sp provider rm <id> [--yes]                 # удалить провайдер и отвязать его задачи
+./sp provider order <id>...                   # перечисленные — первыми, хвост сохраняется
+```
+
+CLI только подключает и настраивает провайдера — задачи из календаря (`cal_*`)
+создаёт само приложение при следующем поллинге, CLI их не синтезирует.
+Провайдер всегда пишется целиком (полный cfg для своего ключа): SP валидирует
+built-in провайдеров через typia и отбраковывает частичный объект.
+`provider rm` собирает `taskIdsToUnlink` из живых задач **и обоих архивов**
+(`archiveYoung`/`archiveOld`) и вычищает у них поля привязки к issue
+(`issueId`, `issueProviderId`, `issueType`, `issueWasUpdated`,
+`issueLastUpdated`, `issueAttachmentNr`, `issueTimeTracked`, `issuePoints`).
+
+**Предупреждение про CalDAV:** логин и пароль хранятся в sync-файле
+**открытым текстом** (и попадают в каждый бэкап). Поэтому `add-caldav` без
+явного флага `--store-plaintext-credentials` отказывается работать.
+
+Поддерживаются ключи `ICAL` и `CALDAV`. Провайдеры-плагины (`plugin:*`) и
+`dismissedCalendarAutoImportEventIdsByProvider` CLI не трогает.
+
 ### Время / worklog
 
 ```sh
@@ -224,11 +255,12 @@ payload затирает поля. Полей mood/productivity/obstruction/impr
 - Перед каждым PUT автоматически делается бэкап в `~/.local/share/sp-cli/backups` (ротация: хранятся последние 10).
 - Оптимистичный локинг: PUT идёт с `ETag`/`If-Match`; на HTTP 412 (одновременная запись телефона) файл перечитывается и мутации применяются заново, до 3 попыток.
 - CLI пишет под собственным `client_id` (генерится при `init`), отличным от телефона — vector clock разруливает порядок изменений.
+- Пароль CalDAV-провайдера сохраняется в sync-файл (и в бэкапы) открытым текстом — команда требует явного `--store-plaintext-credentials`.
 
 ## Тестирование
 
 ```sh
-python3 -m pytest tests/ -q    # 419 unit-тестов, без сети
+python3 -m pytest tests/ -q    # 463 unit-теста, без сети
 ```
 
 Плюс интеграционный свип против тестового WebDAV-сервера (копия live-файла) и проверка, что настоящий SP подхватывает изменения синком.
@@ -242,6 +274,7 @@ python3 -m pytest tests/ -q    # 419 unit-тестов, без сети
 - [x] Доски: CRUD досок и панелей, фильтры панелей, порядок задач и досок
 - [x] Счётчики/привычки: CRUD, set/inc, лог времени stopwatch, порядок
 - [x] Метрики: оценка дня (impact/energy/notes/рефлексии), фокус-сессии
+- [x] Интеграции: календари ICAL/CalDAV — подключение, правка, удаление, порядок
 - [ ] YouTrack-мост (опционально)
 
 ## Известные ограничения

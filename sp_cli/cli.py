@@ -15,6 +15,7 @@ from sp_cli.ids import nanoid
 from sp_cli.model import (
     BACKLOG_STATE,
     INBOX_PROJECT_ID,
+    ISSUE_PROVIDER_URL_FIELD,
     PANEL_SORT_BY,
     SCHEDULED_STATE,
     SIMPLE_COUNTER_TYPES,
@@ -22,6 +23,7 @@ from sp_cli.model import (
     TASK_DONE_STATE,
     TODAY_TAG_ID,
     make_board,
+    make_issue_provider,
     make_note,
     make_panel,
     make_reflection,
@@ -1295,6 +1297,166 @@ def cmd_counter_order(args) -> int:
     return 0
 
 
+# ------------------------------------------------------- issue providers
+
+_PLAINTEXT_WARNING = (
+    "CalDAV credentials are stored in PLAIN TEXT inside the sync file "
+    "(and in every backup of it). Pass --store-plaintext-credentials to "
+    "confirm you accept that."
+)
+
+
+def _provider_common(args, d: dict) -> tuple[dict, list]:
+    """Shared add-flags → cfg fields; returns (fields, extra tag mutations)."""
+    fields: dict = {}
+    extra: list = []
+    if getattr(args, "project", None):
+        fields["defaultProjectId"] = q.resolve_project(d, args.project)
+    if getattr(args, "tag", None):
+        tag_ids, extra = _resolve_tag_refs(d, args.tag, args.create_tags)
+        fields["defaultTagIds"] = tag_ids
+    return fields, extra
+
+
+def cmd_providers(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    providers = q.all_providers(d)
+    if args.json:
+        render.print_json(providers)
+        return 0
+    projects = d["state"]["project"]["entities"]
+    names = [
+        (projects.get(p.get("defaultProjectId")) or {}).get(
+            "title", p.get("defaultProjectId") or ""
+        )
+        for p in providers
+    ]
+    render.print_providers(providers, [q.provider_url(p) for p in providers], names)
+    return 0
+
+
+def cmd_provider_add_ical(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    fields, extra = _provider_common(args, d)
+    fields["icalUrl"] = args.url
+    fields["isAutoImportForCurrentDay"] = bool(args.auto_import)
+    if args.check_every:
+        fields["checkUpdatesEvery"] = render.parse_duration(args.check_every)
+    if args.banner_before:
+        fields["showBannerBeforeThreshold"] = render.parse_duration(args.banner_before)
+    if args.include_regex is not None:
+        fields["filterIncludeRegex"] = args.include_regex or None
+    if args.exclude_regex is not None:
+        fields["filterExcludeRegex"] = args.exclude_regex or None
+    provider_id = nanoid()
+    provider = make_issue_provider(provider_id, "ICAL", **fields)
+    store.commit(
+        extra + [lambda dd, b: mut.provider_add(dd, b, provider)], initial=d
+    )
+    print(provider_id)
+    return 0
+
+
+def cmd_provider_add_caldav(args) -> int:
+    if not args.store_plaintext_credentials:
+        raise CliError(_PLAINTEXT_WARNING)
+    client, store = _ctx()
+    d = client.get()
+    fields, extra = _provider_common(args, d)
+    fields["caldavUrl"] = args.url
+    fields["resourceName"] = args.resource
+    fields["username"] = args.username
+    fields["password"] = args.password
+    if args.category_filter is not None:
+        fields["categoryFilter"] = args.category_filter or None
+    provider_id = nanoid()
+    provider = make_issue_provider(provider_id, "CALDAV", **fields)
+    store.commit(
+        extra + [lambda dd, b: mut.provider_add(dd, b, provider)], initial=d
+    )
+    print(provider_id)
+    return 0
+
+
+def cmd_provider_edit(args) -> int:
+    if args.enable and args.disable:
+        raise CliError("provider edit: --enable and --disable are mutually exclusive")
+    if args.auto_import and args.no_auto_import:
+        raise CliError(
+            "provider edit: --auto-import and --no-auto-import are mutually exclusive"
+        )
+    if args.project and args.no_project:
+        raise CliError("provider edit: --project and --no-project are mutually exclusive")
+    client, store = _ctx()
+    d = client.get()
+    pid = q.resolve_provider(d, args.id)
+    provider = d["state"]["issueProvider"]["entities"][pid]
+    key = provider.get("issueProviderKey")
+
+    changes: dict = {}
+    if args.enable:
+        changes["isEnabled"] = True
+    if args.disable:
+        changes["isEnabled"] = False
+    if args.url is not None:
+        field = ISSUE_PROVIDER_URL_FIELD.get(key)
+        if not field:
+            raise CliError(f"provider edit: --url is not supported for key {key}")
+        changes[field] = args.url
+    if args.auto_import:
+        changes["isAutoImportForCurrentDay"] = True
+    if args.no_auto_import:
+        changes["isAutoImportForCurrentDay"] = False
+    if args.project:
+        changes["defaultProjectId"] = q.resolve_project(d, args.project)
+    if args.no_project:
+        changes["defaultProjectId"] = None
+    if args.check_every:
+        changes["checkUpdatesEvery"] = render.parse_duration(args.check_every)
+    if ("isAutoImportForCurrentDay" in changes or "checkUpdatesEvery" in changes) and (
+        key != "ICAL"
+    ):
+        raise CliError(
+            "provider edit: --auto-import / --check-every only apply to ICAL providers"
+        )
+    if not changes:
+        raise CliError("provider edit: nothing to change")
+
+    store.commit([lambda dd, b: mut.provider_update(dd, b, pid, changes)], initial=d)
+    print(f"updated {pid}")
+    return 0
+
+
+def cmd_provider_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    pid = q.resolve_provider(d, args.id)
+    linked = q.tasks_of_provider(d, pid)
+    what = f"delete provider {pid} and unlink {len(linked)} task(s)?"
+    if not _confirm(what, args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    unlinked: list[list[str]] = []
+
+    def _rm(dd, b):
+        unlinked.append(mut.provider_delete(dd, b, pid))
+
+    store.commit([_rm], initial=d)
+    print(f"deleted {pid} (unlinked {len(unlinked[0])} task(s))")
+    return 0
+
+
+def cmd_provider_order(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    listed = [q.resolve_provider(d, ref) for ref in args.ids]
+    store.commit([lambda dd, b: mut.provider_order(dd, b, listed)], initial=d)
+    print(f"reordered providers: {', '.join(listed)}")
+    return 0
+
+
 # ---------------------------------------------------------------- metrics
 
 def cmd_metrics(args) -> int:
@@ -1432,6 +1594,7 @@ def cmd_pull(args) -> int:
     print(f"notes:        {len(q.all_notes(d))}")
     print(f"boards:       {len(q.all_boards(d))}")
     print(f"counters:     {len(q.all_counters(d))}")
+    print(f"providers:    {len(q.all_providers(d))}")
     return 0
 
 
@@ -1482,6 +1645,11 @@ _SUBCOMMAND_REWRITES = {
     ("counter", "inc"): "counter-inc",
     ("counter", "log"): "counter-log",
     ("counter", "order"): "counter-order",
+    ("provider", "add-ical"): "provider-add-ical",
+    ("provider", "add-caldav"): "provider-add-caldav",
+    ("provider", "edit"): "provider-edit",
+    ("provider", "rm"): "provider-rm",
+    ("provider", "order"): "provider-order",
     ("metric", "set"): "metric-set",
     ("metric", "focus"): "metric-focus",
     ("metric", "rm"): "metric-rm",
@@ -1506,6 +1674,9 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
     # bare `sp counter [--flags]` == `sp counters`
     if argv[:1] == ["counter"] and (len(argv) == 1 or argv[1].startswith("-")):
         return ["counters"] + argv[1:]
+    # bare `sp provider [--flags]` == `sp providers`
+    if argv[:1] == ["provider"] and (len(argv) == 1 or argv[1].startswith("-")):
+        return ["providers"] + argv[1:]
     # bare `sp metric [--flags]` == `sp metrics`
     if argv[:1] == ["metric"] and (len(argv) == 1 or argv[1].startswith("-")):
         return ["metrics"] + argv[1:]
@@ -1543,6 +1714,29 @@ def _board_group_help(argv: list[str]) -> str | None:
             "sp board needs a subcommand (add, edit, rm, sort, panel)"
         )
     return f"{what}\n\n{_BOARD_USAGE}"
+
+
+_PROVIDER_USAGE = """usage: sp provider <subcommand> ...
+
+  sp providers [--json]                 list issue providers / calendars
+  sp provider add-ical URL [--auto-import] [--project P] [--tag T]
+  sp provider add-caldav --url U --resource R --username U --password P \\
+      --store-plaintext-credentials
+  sp provider edit ID [--enable|--disable] [--url U] [--project P] ...
+  sp provider rm ID [--yes]
+  sp provider order ID [ID ...]         listed providers first
+
+Run `sp provider-add-ical --help` (etc.) for the full flags."""
+
+
+def _provider_group_help(argv: list[str]) -> str | None:
+    """`sp provider <typo>` gets the group usage, not argparse's
+    "invalid choice: 'provider'"."""
+    if not argv or argv[0] != "provider" or len(argv) < 2:
+        return None
+    return (
+        f"unknown provider subcommand: {argv[1]}\n\n{_PROVIDER_USAGE}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1805,6 +1999,52 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("counter-order", cmd_counter_order, "reorder counters (listed first)")
     s.add_argument("ids", nargs="+")
 
+    s = add("providers", cmd_providers, "list issue providers / calendars")
+    s.add_argument("--json", action="store_true")
+    s = add("provider-add-ical", cmd_provider_add_ical, "connect an ICAL calendar")
+    s.add_argument("url", help="the calendar's .ics URL")
+    s.add_argument(
+        "--auto-import",
+        action="store_true",
+        help="auto-import today's events as tasks (the app creates them)",
+    )
+    s.add_argument("--project", help="default project for imported tasks")
+    s.add_argument("--tag", action="append", help="default tag (repeatable)")
+    s.add_argument("--create-tags", action="store_true")
+    s.add_argument("--check-every", help="poll interval, e.g. 2h (default 2h)")
+    s.add_argument("--banner-before", help="banner lead time, e.g. 2h")
+    s.add_argument("--include-regex", help="only import matching events")
+    s.add_argument("--exclude-regex", help="skip matching events")
+    s = add("provider-add-caldav", cmd_provider_add_caldav, "connect a CalDAV server")
+    s.add_argument("--url", required=True)
+    s.add_argument("--resource", required=True, help="calendar/resource name")
+    s.add_argument("--username", required=True)
+    s.add_argument("--password", required=True)
+    s.add_argument("--category-filter")
+    s.add_argument("--project", help="default project for imported tasks")
+    s.add_argument("--tag", action="append", help="default tag (repeatable)")
+    s.add_argument("--create-tags", action="store_true")
+    s.add_argument(
+        "--store-plaintext-credentials",
+        action="store_true",
+        help="required: the password is stored in plain text in the sync file",
+    )
+    s = add("provider-edit", cmd_provider_edit, "edit an issue provider")
+    s.add_argument("id")
+    s.add_argument("--enable", action="store_true")
+    s.add_argument("--disable", action="store_true")
+    s.add_argument("--url")
+    s.add_argument("--auto-import", action="store_true")
+    s.add_argument("--no-auto-import", action="store_true")
+    s.add_argument("--project")
+    s.add_argument("--no-project", action="store_true")
+    s.add_argument("--check-every", help="poll interval, e.g. 2h")
+    s = add("provider-rm", cmd_provider_rm, "delete a provider, unlinking its tasks")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+    s = add("provider-order", cmd_provider_order, "reorder providers (listed first)")
+    s.add_argument("ids", nargs="+")
+
     s = add("metrics", cmd_metrics, "daily metrics / day rating")
     s.add_argument("--from", dest="from", help="YYYY-MM-DD | today | +N")
     s.add_argument("--to", help="YYYY-MM-DD | today | +N")
@@ -1840,9 +2080,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = _rewrite_argv(list(sys.argv[1:] if argv is None else argv))
-    board_help = _board_group_help(argv)
-    if board_help:
-        print(board_help, file=sys.stderr)
+    group_help = _board_group_help(argv) or _provider_group_help(argv)
+    if group_help:
+        print(group_help, file=sys.stderr)
         return 2
     parser = build_parser()
     args = parser.parse_args(argv)

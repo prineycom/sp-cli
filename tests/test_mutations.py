@@ -6,6 +6,7 @@ from conftest import assert_doctor_clean
 from sp_cli import mutations as mut
 from sp_cli.model import (
     make_board,
+    make_issue_provider,
     make_note,
     make_panel,
     make_project,
@@ -1583,3 +1584,215 @@ class TestMetrics:
         # EX is a FULL REPLACE (a partial payload wipes fields) — never emitted.
         assert "EX" not in actions and "EA" not in actions
         assert all(op["e"] == "METRIC" for op in b.ops)
+
+
+class TestIssueProviders:
+    @staticmethod
+    def _reg(d):
+        return d["state"]["issueProvider"]
+
+    @staticmethod
+    def _ical(pid="P" * 21, **overrides):
+        return make_issue_provider(pid, "ICAL", **overrides)
+
+    @staticmethod
+    def _archive(d, key, task):
+        blob = d.setdefault(key, {"task": {"ids": [], "entities": {}}})
+        reg = blob.setdefault("task", {"ids": [], "entities": {}})
+        reg.setdefault("ids", []).append(task["id"])
+        reg.setdefault("entities", {})[task["id"]] = task
+        return task
+
+    @staticmethod
+    def _linked_task(tid, provider_id):
+        task = make_task(tid, "cal event", "INBOX_PROJECT")
+        task.update(
+            {
+                "issueId": "ev1",
+                "issueProviderId": provider_id,
+                "issueType": "ICAL",
+                "issueWasUpdated": False,
+                "issueLastUpdated": 1,
+                "issueAttachmentNr": 0,
+                "issueTimeTracked": 0,
+                "issuePoints": None,
+            }
+        )
+        return task
+
+    def test_add_emits_full_cfg(self, sample, b):
+        provider = self._ical(icalUrl="https://cal/x.ics")
+        assert mut.provider_add(sample, b, provider) == "P" * 21
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "IA",
+            "CRT",
+            "ISSUE_PROVIDER",
+            "P" * 21,
+        )
+        payload = op["p"]["actionPayload"]["issueProvider"]
+        # Full cfg: COMMON + the ICAL defaults, flattened on the object.
+        assert set(payload) == {
+            "id",
+            "issueProviderKey",
+            "isEnabled",
+            "isAutoPoll",
+            "isAutoAddToBacklog",
+            "isIntegratedAddTaskBar",
+            "defaultProjectId",
+            "pinnedSearch",
+            "pollingMode",
+            "defaultTagIds",
+            "defaultNote",
+            "icalUrl",
+            "isAutoImportForCurrentDay",
+            "isReferenceCalendar",
+            "checkUpdatesEvery",
+            "showBannerBeforeThreshold",
+            "isDisabledForWebApp",
+            "filterIncludeRegex",
+            "filterExcludeRegex",
+        }
+        assert payload["isEnabled"] is True
+        assert payload["checkUpdatesEvery"] == 7200000
+        assert payload["showBannerBeforeThreshold"] == 7200000
+        assert self._reg(sample)["ids"] == ["P" * 21]
+        assert_doctor_clean(sample)
+
+    def test_add_caldav_full_cfg(self, sample, b):
+        provider = make_issue_provider(
+            "C" * 21,
+            "CALDAV",
+            caldavUrl="https://dav/",
+            resourceName="cal",
+            username="u",
+            password="pw",
+        )
+        mut.provider_add(sample, b, provider)
+        payload = _last_op(b)["p"]["actionPayload"]["issueProvider"]
+        assert payload["issueProviderKey"] == "CALDAV"
+        assert payload["password"] == "pw"
+        assert payload["categoryFilter"] is None
+        assert payload["twoWaySync"] == {
+            "isDone": "pullOnly",
+            "title": "pullOnly",
+            "notes": "off",
+        }
+
+    def test_add_duplicate_rejected(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        with pytest.raises(mut.MutationError, match="already exists"):
+            mut.provider_add(sample, b, self._ical())
+
+    def test_unknown_key_rejected(self):
+        with pytest.raises(ValueError, match="unsupported issue provider key"):
+            make_issue_provider("X" * 21, "JIRA")
+
+    def test_update_emits_iu(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        mut.provider_update(sample, b, "P" * 21, {"isEnabled": False})
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "IU",
+            "UPD",
+            "ISSUE_PROVIDER",
+            "P" * 21,
+        )
+        assert op["p"]["actionPayload"] == {
+            "issueProvider": {"id": "P" * 21, "changes": {"isEnabled": False}}
+        }
+        assert self._reg(sample)["entities"]["P" * 21]["isEnabled"] is False
+
+    def test_update_key_is_immutable(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        with pytest.raises(mut.MutationError, match="immutable"):
+            mut.provider_update(sample, b, "P" * 21, {"issueProviderKey": "CALDAV"})
+
+    def test_update_missing_provider(self, sample, b):
+        with pytest.raises(mut.MutationError, match="not found"):
+            mut.provider_update(sample, b, "nope", {"isEnabled": True})
+
+    def test_order_listed_first_tail_kept(self, sample, b):
+        for pid in ("A" * 21, "B" * 21, "C" * 21):
+            mut.provider_add(sample, b, self._ical(pid))
+        mut.provider_order(sample, b, ["C" * 21])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"]) == ("IS", "MOV", "ISSUE_PROVIDER")
+        assert op["d"] == "C" * 21
+        assert op["ds"] == ["C" * 21]
+        assert op["p"]["actionPayload"] == {"ids": ["C" * 21]}
+        assert self._reg(sample)["ids"] == ["C" * 21, "A" * 21, "B" * 21]
+        assert_doctor_clean(sample)
+
+    def test_order_rejects_duplicates_and_unknown(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        with pytest.raises(mut.MutationError, match="duplicate"):
+            mut.provider_order(sample, b, ["P" * 21, "P" * 21])
+        with pytest.raises(mut.MutationError, match="not found"):
+            mut.provider_order(sample, b, ["Z" * 21])
+        with pytest.raises(mut.MutationError, match="no provider ids"):
+            mut.provider_order(sample, b, [])
+
+    def test_delete_unlinks_live_and_archived_tasks(self, sample, b):
+        pid = "P" * 21
+        mut.provider_add(sample, b, self._ical(pid))
+        live = self._linked_task("L" * 21, pid)
+        sample["state"]["task"]["ids"].append(live["id"])
+        sample["state"]["task"]["entities"][live["id"]] = live
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"].append(
+            live["id"]
+        )
+        young = self._archive(
+            sample, "archiveYoung", self._linked_task("Y" * 21, pid)
+        )
+        old = self._archive(sample, "archiveOld", self._linked_task("O" * 21, pid))
+        other = self._archive(
+            sample, "archiveOld", self._linked_task("N" * 21, "other-provider")
+        )
+
+        unlinked = mut.provider_delete(sample, b, pid)
+        assert sorted(unlinked) == sorted([live["id"], young["id"], old["id"]])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "HID",
+            "DEL",
+            "ISSUE_PROVIDER",
+            pid,
+        )
+        assert op["p"]["actionPayload"]["issueProviderId"] == pid
+        assert sorted(op["p"]["actionPayload"]["taskIdsToUnlink"]) == sorted(unlinked)
+
+        fields = (
+            "issueId",
+            "issueProviderId",
+            "issueType",
+            "issueWasUpdated",
+            "issueLastUpdated",
+            "issueAttachmentNr",
+            "issueTimeTracked",
+            "issuePoints",
+        )
+        for task in (live, young, old):
+            assert not [f for f in fields if f in task]
+        # A task of a different provider keeps every field.
+        assert all(f in other for f in fields)
+        assert self._reg(sample)["ids"] == []
+        assert self._reg(sample)["entities"] == {}
+        assert_doctor_clean(sample)
+
+    def test_delete_without_linked_tasks(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        assert mut.provider_delete(sample, b, "P" * 21) == []
+        assert _last_op(b)["p"]["actionPayload"]["taskIdsToUnlink"] == []
+
+    def test_delete_missing_provider(self, sample, b):
+        with pytest.raises(mut.MutationError, match="not found"):
+            mut.provider_delete(sample, b, "nope")
+
+    def test_only_safe_actions_are_emitted(self, sample, b):
+        mut.provider_add(sample, b, self._ical())
+        mut.provider_update(sample, b, "P" * 21, {"isEnabled": False})
+        mut.provider_order(sample, b, ["P" * 21])
+        mut.provider_delete(sample, b, "P" * 21)
+        assert [op["a"] for op in b.ops] == ["IA", "IU", "IS", "HID"]
+        assert all(op["e"] == "ISSUE_PROVIDER" for op in b.ops)

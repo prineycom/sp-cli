@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 
 from sp_cli.model import (
+    ISSUE_PROVIDER_URL_FIELD,
     METRIC_DEAD_FIELDS,
     PANEL_SORT_BY,
     SIMPLE_COUNTER_TYPES,
@@ -300,6 +301,55 @@ def counter_value(counter: dict, date: str | None = None) -> int:
     return int((counter.get("countOnDay") or {}).get(date, 0))
 
 
+# ------------------------------------------------------- issue providers
+
+def all_providers(d: dict) -> list[dict]:
+    reg = d["state"].get("issueProvider") or {}
+    entities = reg.get("entities") or {}
+    return [entities[pid] for pid in reg.get("ids", []) if pid in entities]
+
+
+def provider_url(provider: dict) -> str:
+    field = ISSUE_PROVIDER_URL_FIELD.get(provider.get("issueProviderKey"))
+    if field:
+        return provider.get(field) or ""
+    # Unknown / plugin provider key: show whatever url-ish field it carries.
+    for name in ("icalUrl", "caldavUrl", "host", "url"):
+        if provider.get(name):
+            return provider[name]
+    return ""
+
+
+def resolve_provider(d: dict, ref: str) -> str:
+    """Provider by exact id, exact url (case-insensitive) or id prefix."""
+    providers = all_providers(d)
+    ids = [p["id"] for p in providers]
+    if ref in ids:
+        return ref
+    by_url = [p["id"] for p in providers if provider_url(p).lower() == ref.lower()]
+    if len(by_url) == 1:
+        return by_url[0]
+    if len(by_url) > 1:
+        raise AmbiguousIdError(ref, by_url)
+    matches = [pid for pid in ids if pid.startswith(ref)]
+    if not matches:
+        matches = [pid for pid in ids if pid.lstrip("-_").startswith(ref)]
+    if not matches:
+        raise NotFoundError(f"no issue provider with id or url '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
+def tasks_of_provider(d: dict, provider_id: str) -> list[str]:
+    """Ids of every task linked to the provider — live AND both archives."""
+    ids: list[str] = []
+    for task in list(all_tasks(d)) + _archive_tasks(d):
+        if task.get("issueProviderId") == provider_id and task["id"] not in ids:
+            ids.append(task["id"])
+    return ids
+
+
 # ---------------------------------------------------------------- metrics
 
 def all_metrics(d: dict) -> list[dict]:
@@ -424,6 +474,7 @@ def doctor(d: dict) -> list[str]:
         "note",
         "simpleCounter",
         "metric",
+        "issueProvider",
     ):
         reg = state.get(name)
         if not reg:

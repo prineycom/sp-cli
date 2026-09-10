@@ -337,6 +337,31 @@ def print_boards(d: dict, boards: list[dict]) -> None:
             )
 
 
+def provider_rows(
+    providers: list[dict], urls: list[str], project_names: list[str]
+) -> list[list[str]]:
+    return [
+        [
+            p["id"],
+            p.get("issueProviderKey", "?"),
+            "on" if p.get("isEnabled") else "off",
+            truncate(url, TITLE_WIDTH),
+            project or "-",
+            "yes" if p.get("isAutoImportForCurrentDay") else "no",
+        ]
+        for p, url, project in zip(providers, urls, project_names)
+    ]
+
+
+def print_providers(
+    providers: list[dict], urls: list[str], project_names: list[str]
+) -> None:
+    print_table(
+        ["id", "key", "enabled", "url", "project", "auto-import"],
+        provider_rows(providers, urls, project_names),
+    )
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 

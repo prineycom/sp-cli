@@ -475,6 +475,86 @@ def make_simple_counter(
     return counter
 
 
+# ------------------------------------------------------- issue providers
+
+# ISSUE_PROVIDER_DEFAULT_COMMON_CFG — shared by every provider key.
+ISSUE_PROVIDER_COMMON_CFG = {
+    "isAutoPoll": True,
+    "isAutoAddToBacklog": False,
+    "isIntegratedAddTaskBar": False,
+    "defaultProjectId": None,
+    "pinnedSearch": None,
+    "pollingMode": "whenProjectOpen",
+    "defaultTagIds": [],
+    "defaultNote": None,
+}
+
+# Per-key cfg defaults. Fields are FLATTENED onto the provider object
+# (discriminated union on issueProviderKey), and a built-in provider must be
+# COMPLETE for its key or SP's typia validation rejects the whole file.
+DEFAULT_CALENDAR_CFG = {
+    "isEnabled": False,
+    "icalUrl": "",
+    "isAutoImportForCurrentDay": False,
+    "isReferenceCalendar": False,
+    "checkUpdatesEvery": 7200000,
+    "showBannerBeforeThreshold": 7200000,
+    "isDisabledForWebApp": False,
+    "filterIncludeRegex": None,
+    "filterExcludeRegex": None,
+}
+
+DEFAULT_CALDAV_CFG = {
+    "isEnabled": False,
+    "caldavUrl": None,
+    "resourceName": None,
+    "username": None,
+    "password": None,
+    "categoryFilter": None,
+    "isAddSubTasks": False,
+    "twoWaySync": {"isDone": "pullOnly", "title": "pullOnly", "notes": "off"},
+}
+
+ISSUE_PROVIDER_DEFAULT_CFG = {
+    "ICAL": DEFAULT_CALENDAR_CFG,
+    "CALDAV": DEFAULT_CALDAV_CFG,
+}
+
+# The provider url field per key (for listing / resolution).
+ISSUE_PROVIDER_URL_FIELD = {"ICAL": "icalUrl", "CALDAV": "caldavUrl"}
+
+# Issue-link fields cleared on every task when its provider is deleted.
+ISSUE_TASK_FIELDS = (
+    "issueId",
+    "issueProviderId",
+    "issueType",
+    "issueWasUpdated",
+    "issueLastUpdated",
+    "issueAttachmentNr",
+    "issueTimeTracked",
+    "issuePoints",
+)
+
+
+def make_issue_provider(provider_id: str, key: str, **overrides) -> dict:
+    """A full IssueProvider: COMMON cfg + the key's default cfg + overrides.
+
+    Always emits the COMPLETE cfg for the key — a partial built-in provider
+    fails SP's typia validation.
+    """
+    if key not in ISSUE_PROVIDER_DEFAULT_CFG:
+        raise ValueError(f"unsupported issue provider key: {key}")
+    provider = copy.deepcopy(ISSUE_PROVIDER_COMMON_CFG)
+    provider.update(copy.deepcopy(ISSUE_PROVIDER_DEFAULT_CFG[key]))
+    provider["id"] = provider_id
+    provider["issueProviderKey"] = key
+    provider["isEnabled"] = True
+    for name, value in overrides.items():
+        if value is not None:
+            provider[name] = value
+    return provider
+
+
 def task_with_subtasks(state: dict, task_id: str) -> dict:
     """Snapshot: the task entity plus 'subTasks': [sub entities]."""
     entities = state["task"]["entities"]
