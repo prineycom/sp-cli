@@ -85,3 +85,91 @@ class TestNoteEditFlagRejection:
         )
         with pytest.raises(cli.CliError, match="mutually exclusive"):
             cli.cmd_note_edit(args)
+
+
+class TestBoardArgvRewrites:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["board", "add", "T"], "board-add"),
+            (["board", "edit", "x"], "board-edit"),
+            (["board", "rm", "x"], "board-rm"),
+            (["board", "sort", "x"], "board-sort"),
+            (["board", "panel", "add", "b", "T"], "board-panel-add"),
+            (["board", "panel", "edit", "p"], "board-panel-edit"),
+            (["board", "panel", "rm", "p"], "board-panel-rm"),
+            (["board", "panel", "order", "p", "t"], "board-panel-order"),
+        ],
+    )
+    def test_rewrite(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_boards_list_command_parses(self):
+        args = cli.build_parser().parse_args(["boards", "--json"])
+        assert args.fn is cli.cmd_boards
+
+
+class TestPanelChanges:
+    def _args(self, argv):
+        return cli.build_parser().parse_args(cli._rewrite_argv(argv))
+
+    def test_enum_flags_map_to_numbers(self, sample):
+        args = self._args(
+            [
+                "board",
+                "panel",
+                "add",
+                "KANBAN_DEFAULT",
+                "Doing",
+                "--done",
+                "undone",
+                "--scheduled",
+                "scheduled",
+                "--backlog",
+                "only",
+                "--parents-only",
+            ]
+        )
+        changes = cli._panel_changes(sample, args)
+        assert changes["taskDoneState"] == 3
+        assert changes["scheduledState"] == 2
+        assert changes["backlogState"] == 3
+        assert changes["isParentTasksOnly"] is True
+
+    def test_all_projects_flag(self, sample):
+        args = self._args(
+            ["board", "panel", "add", "b", "T", "--all-projects"]
+        )
+        assert cli._panel_changes(sample, args)["projectIds"] == [""]
+
+    def test_project_flag_resolves(self, sample):
+        args = self._args(
+            ["board", "panel", "add", "b", "T", "--project", "inbox"]
+        )
+        assert cli._panel_changes(sample, args)["projectIds"] == ["INBOX_PROJECT"]
+
+    def test_project_and_all_projects_conflict(self, sample):
+        args = self._args(
+            ["board", "panel", "add", "b", "T", "--project", "inbox", "--all-projects"]
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli._panel_changes(sample, args)
+
+    def test_today_tag_rejected(self, sample):
+        args = self._args(["board", "panel", "add", "b", "T", "--tags", "TODAY"])
+        with pytest.raises(cli.CliError, match="TODAY"):
+            cli._panel_changes(sample, args)
+
+    def test_sort_defaults_dir_asc(self, sample):
+        args = self._args(["board", "panel", "add", "b", "T", "--sort", "title"])
+        changes = cli._panel_changes(sample, args)
+        assert (changes["sortBy"], changes["sortDir"]) == ("title", "asc")
+
+    def test_dir_without_sort_rejected(self, sample):
+        args = self._args(["board", "panel", "add", "b", "T", "--dir", "desc"])
+        with pytest.raises(cli.CliError, match="--dir requires --sort"):
+            cli._panel_changes(sample, args)
+
+    def test_no_flags_means_no_changes(self, sample):
+        args = self._args(["board", "panel", "add", "b", "T"])
+        assert cli._panel_changes(sample, args) == {}

@@ -167,6 +167,62 @@ def note_card(d: dict, note: dict) -> str:
     return "\n".join(lines)
 
 
+_DONE_STATE = {1: "", 2: "done", 3: "undone"}
+_SCHEDULED_STATE = {1: "", 2: "scheduled", 3: "not-scheduled"}
+_BACKLOG_STATE = {1: "", 2: "no-backlog", 3: "only-backlog"}
+
+
+def panel_filters(d: dict, panel: dict) -> str:
+    """Compact one-line summary of a board panel's filters."""
+    tags = d["state"]["tag"]["entities"]
+    projects = d["state"]["project"]["entities"]
+
+    def tag_names(ids: list[str]) -> str:
+        return ",".join(tags.get(t, {}).get("title", t) for t in ids)
+
+    parts: list[str] = []
+    if panel.get("includedTagIds"):
+        parts.append("+" + tag_names(panel["includedTagIds"]))
+    if panel.get("excludedTagIds"):
+        parts.append("-" + tag_names(panel["excludedTagIds"]))
+    project_ids = panel.get("projectIds") or [""]
+    if project_ids != [""]:
+        parts.append(
+            "project="
+            + ",".join(projects.get(p, {}).get("title", p) for p in project_ids)
+        )
+    for key, table in (
+        ("taskDoneState", _DONE_STATE),
+        ("scheduledState", _SCHEDULED_STATE),
+        ("backlogState", _BACKLOG_STATE),
+    ):
+        label = table.get(panel.get(key), "")
+        if label:
+            parts.append(label)
+    if panel.get("isParentTasksOnly"):
+        parts.append("parents-only")
+    if panel.get("sortBy"):
+        parts.append(f"sort={panel['sortBy']}/{panel.get('sortDir', 'asc')}")
+    return " ".join(parts) or "-"
+
+
+def print_boards(d: dict, boards: list[dict]) -> None:
+    if not boards:
+        print("(none)")
+        return
+    for board in boards:
+        panels = board.get("panels") or []
+        print(
+            f"{board['id']}  {board.get('title', '')}  "
+            f"(cols: {board.get('cols', '?')}, panels: {len(panels)})"
+        )
+        for panel in panels:
+            print(
+                f"  {panel['id']}  {truncate(panel.get('title', ''), TITLE_WIDTH)}"
+                f"  {panel_filters(d, panel)}"
+            )
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 

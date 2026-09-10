@@ -4,7 +4,15 @@ import pytest
 
 from conftest import assert_doctor_clean
 from sp_cli import mutations as mut
-from sp_cli.model import make_note, make_project, make_tag, make_task, today_str
+from sp_cli.model import (
+    make_board,
+    make_note,
+    make_panel,
+    make_project,
+    make_tag,
+    make_task,
+    today_str,
+)
 from sp_cli.ops import OpBuilder
 
 CLI = "B_test01"
@@ -786,3 +794,244 @@ class TestNotes:
         assert [o["a"] for o in b.ops] == ["NA", "NU", "NM", "NU", "ND"]
         assert sample["state"]["note"]["ids"] == []
         assert_doctor_clean(sample)
+
+
+class TestBoards:
+    @staticmethod
+    def _cfgs(d):
+        return d["state"]["boards"]["boardCfgs"]
+
+    @staticmethod
+    def _board(d, board_id):
+        return next(b for b in d["state"]["boards"]["boardCfgs"] if b["id"] == board_id)
+
+    def test_add_board(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint", cols=3))
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("BA", "CRT", "BOARD", "B" * 21)
+        p = op["p"]["actionPayload"]
+        assert set(p) == {"board"}
+        assert p["board"] == {"id": "B" * 21, "title": "Sprint", "cols": 3, "panels": []}
+        assert op["p"]["entityChanges"] == []
+        # boardCfgs is a plain ARRAY, appended to (no ids/entities registry).
+        assert isinstance(self._cfgs(sample), list)
+        assert self._cfgs(sample)[-1]["id"] == "B" * 21
+        assert_doctor_clean(sample)
+
+    def test_add_duplicate_board_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError):
+            mut.board_add(sample, b, make_board("EISENHOWER_MATRIX", "dup"))
+
+    def test_update_board(self, sample, b):
+        mut.board_update(sample, b, "KANBAN_DEFAULT", {"title": "Kanban", "cols": 4})
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "BU",
+            "UPD",
+            "BOARD",
+            "KANBAN_DEFAULT",
+        )
+        assert op["p"]["actionPayload"] == {
+            "id": "KANBAN_DEFAULT",
+            "updates": {"title": "Kanban", "cols": 4},
+        }
+        board = self._board(sample, "KANBAN_DEFAULT")
+        assert (board["title"], board["cols"]) == ("Kanban", 4)
+        assert board["panels"]  # shallow merge leaves panels alone
+        assert_doctor_clean(sample)
+
+    def test_update_unknown_board_raises(self, sample, b):
+        with pytest.raises(mut.MutationError):
+            mut.board_update(sample, b, "nope", {"title": "x"})
+
+    def test_delete_board(self, sample, b):
+        mut.board_delete(sample, b, "KANBAN_DEFAULT")
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "BD",
+            "DEL",
+            "BOARD",
+            "KANBAN_DEFAULT",
+        )
+        assert op["p"]["actionPayload"] == {"id": "KANBAN_DEFAULT"}
+        assert [c["id"] for c in self._cfgs(sample)] == ["EISENHOWER_MATRIX"]
+        assert_doctor_clean(sample)
+
+    def test_boards_state_key_created_when_missing(self, sample, b):
+        del sample["state"]["boards"]
+        mut.board_add(sample, b, make_board("B" * 21, "fresh"))
+        assert sample["state"]["boards"]["boardCfgs"][0]["id"] == "B" * 21
+
+    # ------------------------------------------------------------ panels
+
+    def test_panel_add_emits_bu_with_full_panels_array(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        mut.panel_add(sample, b, "B" * 21, make_panel("P" * 21, "Doing"))
+        op = _last_op(b)
+        # Panels are ONLY editable through BU (BP is a dead reducer).
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("BU", "UPD", "BOARD", "B" * 21)
+        panels = op["p"]["actionPayload"]["updates"]["panels"]
+        assert len(panels) == 1
+        assert panels[0] == {
+            "id": "P" * 21,
+            "title": "Doing",
+            "taskIds": [],
+            "includedTagIds": [],
+            "excludedTagIds": [],
+            "taskDoneState": 1,
+            "scheduledState": 1,
+            "backlogState": 1,
+            "isParentTasksOnly": False,
+            "projectIds": [""],
+        }
+        assert self._board(sample, "B" * 21)["panels"] == panels
+        assert_doctor_clean(sample)
+
+    def test_panel_add_keeps_existing_panels(self, sample, b):
+        before = [p["id"] for p in self._board(sample, "KANBAN_DEFAULT")["panels"]]
+        mut.panel_add(sample, b, "KANBAN_DEFAULT", make_panel("P" * 21, "Extra"))
+        panels = _last_op(b)["p"]["actionPayload"]["updates"]["panels"]
+        assert [p["id"] for p in panels] == before + ["P" * 21]
+
+    def test_panel_add_enum_values_are_numbers(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        panel = make_panel(
+            "P" * 21,
+            "Filtered",
+            taskDoneState=2,
+            scheduledState=3,
+            backlogState=3,
+            isParentTasksOnly=True,
+            sortBy="dueDate",
+            sortDir="desc",
+        )
+        mut.panel_add(sample, b, "B" * 21, panel)
+        written = _last_op(b)["p"]["actionPayload"]["updates"]["panels"][0]
+        assert written["taskDoneState"] == 2
+        assert written["scheduledState"] == 3
+        assert written["backlogState"] == 3
+        assert written["isParentTasksOnly"] is True
+        assert (written["sortBy"], written["sortDir"]) == ("dueDate", "desc")
+
+    def test_panel_sanitization_on_write(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        dirty = {
+            "id": "P" * 21,
+            "title": "Dirty",
+            "projectId": "LEGACY",  # legacy key
+            "sortByDue": True,  # legacy key
+            "projectIds": ["", "INBOX_PROJECT"],  # '' is exclusive
+            "sortBy": "nonsense",
+            "sortDir": None,
+            "includedTagsMatch": None,
+            "taskDoneState": None,
+            "isParentTasksOnly": None,
+        }
+        mut.panel_add(sample, b, "B" * 21, dirty)
+        written = _last_op(b)["p"]["actionPayload"]["updates"]["panels"][0]
+        assert written["projectIds"] == [""]
+        assert "projectId" not in written and "sortByDue" not in written
+        assert "sortBy" not in written and "sortDir" not in written
+        assert "includedTagsMatch" not in written
+        assert written["taskDoneState"] == 1
+        assert written["isParentTasksOnly"] is False
+
+    def test_panel_project_ids_deduped(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        mut.panel_add(
+            sample,
+            b,
+            "B" * 21,
+            make_panel("P" * 21, "P", projectIds=["INBOX_PROJECT", "INBOX_PROJECT"]),
+        )
+        written = _last_op(b)["p"]["actionPayload"]["updates"]["panels"][0]
+        assert written["projectIds"] == ["INBOX_PROJECT"]
+
+    def test_panel_today_tag_rejected(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        with pytest.raises(mut.MutationError, match="TODAY"):
+            mut.panel_add(
+                sample, b, "B" * 21, make_panel("P" * 21, "P", includedTagIds=["TODAY"])
+            )
+
+    def test_panel_id_must_be_globally_unique(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        with pytest.raises(mut.MutationError, match="already used"):
+            mut.panel_add(sample, b, "B" * 21, make_panel("TODO", "clash"))
+
+    def test_panel_update_rewrites_panels(self, sample, b):
+        mut.panel_update(sample, b, "TODO", {"title": "To do!"})
+        op = _last_op(b)
+        assert op["a"] == "BU" and op["d"] == "KANBAN_DEFAULT"
+        panels = op["p"]["actionPayload"]["updates"]["panels"]
+        assert panels[0]["title"] == "To do!"
+        assert len(panels) == len(self._board(sample, "KANBAN_DEFAULT")["panels"])
+        assert self._board(sample, "KANBAN_DEFAULT")["panels"][0]["title"] == "To do!"
+
+    def test_panel_remove(self, sample, b):
+        before = [p["id"] for p in self._board(sample, "KANBAN_DEFAULT")["panels"]]
+        mut.panel_remove(sample, b, "TODO")
+        panels = _last_op(b)["p"]["actionPayload"]["updates"]["panels"]
+        assert [p["id"] for p in panels] == [i for i in before if i != "TODO"]
+        assert_doctor_clean(sample)
+
+    def test_panel_unknown_id_raises(self, sample, b):
+        with pytest.raises(mut.MutationError, match="panel not found"):
+            mut.panel_remove(sample, b, "ghost")
+
+    # ------------------------------------------------------------ BT / BS
+
+    def test_panel_task_order(self, sample, b, add_task_entity):
+        t1 = add_task_entity(title="one")["id"]
+        t2 = add_task_entity(title="two")["id"]
+        mut.panel_task_order(sample, b, "TODO", [t2, t1])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("BT", "UPD", "BOARD", "TODO")
+        assert op["p"]["actionPayload"] == {"panelId": "TODO", "taskIds": [t2, t1]}
+        board = self._board(sample, "KANBAN_DEFAULT")
+        assert board["panels"][0]["taskIds"] == [t2, t1]
+        # Only that panel's taskIds change.
+        assert all(p["taskIds"] == [] for p in board["panels"][1:])
+        assert_doctor_clean(sample)
+
+    def test_panel_task_order_unknown_task(self, sample, b):
+        with pytest.raises(mut.MutationError, match="task not found"):
+            mut.panel_task_order(sample, b, "TODO", ["ghost"])
+
+    def test_boards_sort(self, sample, b):
+        mut.board_add(sample, b, make_board("B" * 21, "Third"))
+        mut.boards_sort(sample, b, ["KANBAN_DEFAULT"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"]) == ("BS", "MOV", "BOARD")
+        assert op["d"] == "KANBAN_DEFAULT"
+        assert op["ds"] == ["KANBAN_DEFAULT"]
+        assert op["p"]["actionPayload"] == {"ids": ["KANBAN_DEFAULT"]}
+        # Unlisted boards keep their tail position, in their old order.
+        assert [c["id"] for c in self._cfgs(sample)] == [
+            "KANBAN_DEFAULT",
+            "EISENHOWER_MATRIX",
+            "B" * 21,
+        ]
+
+    def test_boards_sort_unknown_id(self, sample, b):
+        with pytest.raises(mut.MutationError, match="board not found"):
+            mut.boards_sort(sample, b, ["ghost"])
+
+    def test_boards_sort_duplicate_ids(self, sample, b):
+        with pytest.raises(mut.MutationError, match="duplicate"):
+            mut.boards_sort(sample, b, ["KANBAN_DEFAULT", "KANBAN_DEFAULT"])
+
+    def test_bp_is_never_emitted(self, sample, b, add_task_entity):
+        tid = add_task_entity()["id"]
+        mut.board_add(sample, b, make_board("B" * 21, "Sprint"))
+        mut.panel_add(sample, b, "B" * 21, make_panel("P" * 21, "Doing"))
+        mut.panel_update(sample, b, "P" * 21, {"title": "Doing!"})
+        mut.panel_task_order(sample, b, "P" * 21, [tid])
+        mut.panel_remove(sample, b, "P" * 21)
+        mut.board_update(sample, b, "B" * 21, {"cols": 3})
+        mut.boards_sort(sample, b, ["B" * 21])
+        mut.board_delete(sample, b, "B" * 21)
+        actions = [op["a"] for op in b.ops]
+        assert "BP" not in actions
+        assert set(actions) <= {"BA", "BU", "BD", "BT", "BS"}
+        assert all(op["e"] == "BOARD" for op in b.ops)

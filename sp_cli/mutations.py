@@ -12,6 +12,7 @@ from sp_cli.model import (
     day_of_ms,
     make_repeat_cfg,
     now_ms,
+    sanitize_panel,
     task_with_subtasks,
     today_str,
 )
@@ -713,6 +714,176 @@ def note_move(d: dict, b: OpBuilder, note_id: str, target_project_id: str) -> No
     note["projectId"] = target_project_id
     _note_unlink(state, note_id)
     target.setdefault("noteIds", []).append(note_id)
+
+
+# ---------------------------------------------------------------- boards
+
+def _board_cfgs(state: dict) -> list:
+    """state.boards is NOT an entity registry: a plain {boardCfgs: []} array."""
+    boards = state.setdefault("boards", {"boardCfgs": []})
+    if not isinstance(boards.get("boardCfgs"), list):
+        boards["boardCfgs"] = []
+    return boards["boardCfgs"]
+
+
+def _board(state: dict, board_id: str) -> dict:
+    for board in _board_cfgs(state):
+        if board.get("id") == board_id:
+            return board
+    raise MutationError(f"board not found: {board_id}")
+
+
+def find_panel(state: dict, panel_id: str) -> tuple[dict, int]:
+    """(board, index-in-board.panels) of the FIRST panel with that id —
+    the same lookup SP's reducer does."""
+    for board in _board_cfgs(state):
+        for i, panel in enumerate(board.get("panels") or []):
+            if panel.get("id") == panel_id:
+                return board, i
+    raise MutationError(f"panel not found: {panel_id}")
+
+
+def _check_panels(state: dict, board_id: str, panels: list[dict]) -> list[dict]:
+    """Sanitize + validate a whole panels array before it is written."""
+    clean = [sanitize_panel(p) for p in panels]
+    seen: set[str] = set()
+    for panel in clean:
+        if not panel["id"]:
+            raise MutationError("panel id must be a non-empty string")
+        if panel["id"] in seen:
+            raise MutationError(f"duplicate panel id: {panel['id']}")
+        seen.add(panel["id"])
+        if TODAY_TAG_ID in panel["includedTagIds"]:
+            raise MutationError("'TODAY' must never appear in panel.includedTagIds")
+    # No tag/project existence checks here: seeded boards (Eisenhower/Kanban)
+    # reference tag ids that only exist once the app creates them, and every
+    # edit rewrites the WHOLE panels array. Refs from the CLI are resolved
+    # (and thus validated) before they reach this point.
+    # Panel ids must be unique GLOBALLY (a load-time dedup pass renames repeats).
+    for other in _board_cfgs(state):
+        if other.get("id") == board_id:
+            continue
+        for panel in other.get("panels") or []:
+            if panel.get("id") in seen:
+                raise MutationError(
+                    f"panel id {panel['id']} already used on board {other.get('id')}"
+                )
+    return clean
+
+
+def board_add(d: dict, b: OpBuilder, board: dict) -> str:
+    """Create a board (already built via model.make_board)."""
+    state = _state(d)
+    cfgs = _board_cfgs(state)
+    if any(cfg.get("id") == board["id"] for cfg in cfgs):
+        raise MutationError(f"board already exists: {board['id']}")
+    board = dict(board)
+    board["panels"] = _check_panels(state, board["id"], board.get("panels") or [])
+
+    b.op("BA", "CRT", "BOARD", board["id"], {"board": copy.deepcopy(board)})
+
+    cfgs.append(board)
+    return board["id"]
+
+
+def board_update(d: dict, b: OpBuilder, board_id: str, updates: dict) -> None:
+    """Shallow merge on the board. The ONLY way to edit panels (whole array)."""
+    state = _state(d)
+    board = _board(state, board_id)
+    updates = dict(updates)
+    if "panels" in updates:
+        updates["panels"] = _check_panels(state, board_id, updates["panels"])
+    if "cols" in updates:
+        updates["cols"] = int(updates["cols"])
+
+    b.op(
+        "BU",
+        "UPD",
+        "BOARD",
+        board_id,
+        {"id": board_id, "updates": copy.deepcopy(updates)},
+    )
+
+    board.update(updates)
+
+
+def board_delete(d: dict, b: OpBuilder, board_id: str) -> None:
+    state = _state(d)
+    _board(state, board_id)
+    b.op("BD", "DEL", "BOARD", board_id, {"id": board_id})
+    cfgs = _board_cfgs(state)
+    cfgs[:] = [cfg for cfg in cfgs if cfg.get("id") != board_id]
+
+
+def panel_add(d: dict, b: OpBuilder, board_id: str, panel: dict) -> str:
+    """Append a panel — emitted as a BU rewriting the whole panels array."""
+    state = _state(d)
+    board = _board(state, board_id)
+    panels = list(board.get("panels") or []) + [panel]
+    board_update(d, b, board_id, {"panels": panels})
+    return panel["id"]
+
+
+def panel_update(d: dict, b: OpBuilder, panel_id: str, changes: dict) -> str:
+    """Patch one panel; rewrites its board's panels array via BU."""
+    state = _state(d)
+    board, index = find_panel(state, panel_id)
+    panels = [dict(p) for p in board["panels"]]
+    panels[index] = {**panels[index], **changes}
+    board_update(d, b, board["id"], {"panels": panels})
+    return board["id"]
+
+
+def panel_remove(d: dict, b: OpBuilder, panel_id: str) -> str:
+    state = _state(d)
+    board, index = find_panel(state, panel_id)
+    panels = [dict(p) for i, p in enumerate(board["panels"]) if i != index]
+    board_update(d, b, board["id"], {"panels": panels})
+    return board["id"]
+
+
+def panel_task_order(
+    d: dict, b: OpBuilder, panel_id: str, task_ids: list[str]
+) -> None:
+    """BT: manual ORDERING only — membership stays derived from the filters."""
+    state = _state(d)
+    board, index = find_panel(state, panel_id)
+    for tid in task_ids:
+        _task(state, tid)
+
+    b.op(
+        "BT",
+        "UPD",
+        "BOARD",
+        panel_id,
+        {"panelId": panel_id, "taskIds": list(task_ids)},
+    )
+
+    board["panels"][index]["taskIds"] = list(task_ids)
+
+
+def boards_sort(d: dict, b: OpBuilder, board_ids: list[str]) -> None:
+    """BS: listed boards first, in the given order; the rest keep their tail."""
+    state = _state(d)
+    for bid in board_ids:
+        _board(state, bid)
+    if len(set(board_ids)) != len(board_ids):
+        raise MutationError("board sort: duplicate ids")
+
+    b.op(
+        "BS",
+        "MOV",
+        "BOARD",
+        board_ids[0],
+        {"ids": list(board_ids)},
+        ds=list(board_ids),
+    )
+
+    cfgs = _board_cfgs(state)
+    by_id = {cfg["id"]: cfg for cfg in cfgs}
+    cfgs[:] = [by_id[bid] for bid in board_ids] + [
+        cfg for cfg in cfgs if cfg["id"] not in board_ids
+    ]
 
 
 # ---------------------------------------------------------------- archive

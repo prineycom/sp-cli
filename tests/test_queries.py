@@ -333,3 +333,49 @@ class TestNotes:
         _add_note(sample, "N" * 21, "pinned", pinned=True)
         sample["state"]["note"]["todayOrder"] = []
         assert any("not in todayOrder" in p for p in q.doctor(sample))
+
+
+class TestBoardsQueries:
+    def test_all_boards(self, sample):
+        assert [b["id"] for b in q.all_boards(sample)] == [
+            "EISENHOWER_MATRIX",
+            "KANBAN_DEFAULT",
+        ]
+
+    def test_all_boards_tolerates_missing_key(self, sample):
+        del sample["state"]["boards"]
+        assert q.all_boards(sample) == []
+
+    def test_resolve_board_by_id_prefix_and_title(self, sample):
+        assert q.resolve_board(sample, "KANBAN_DEFAULT") == "KANBAN_DEFAULT"
+        assert q.resolve_board(sample, "KANBAN") == "KANBAN_DEFAULT"
+        assert (
+            q.resolve_board(sample, "f.boards.default.kanban") == "KANBAN_DEFAULT"
+        )
+
+    def test_resolve_board_not_found(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.resolve_board(sample, "zzz")
+
+    def test_resolve_panel(self, sample):
+        assert q.resolve_panel(sample, "TODO") == "TODO"
+        assert q.resolve_panel(sample, "URGENT_AND_IMP") == "URGENT_AND_IMPORTANT"
+
+    def test_resolve_panel_scoped_to_board(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.resolve_panel(sample, "TODO", board_id="EISENHOWER_MATRIX")
+
+    def test_doctor_detects_duplicate_panel_id(self, sample):
+        cfgs = sample["state"]["boards"]["boardCfgs"]
+        cfgs[0]["panels"].append(dict(cfgs[1]["panels"][0]))
+        assert any("duplicate panel id" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_mixed_project_ids(self, sample):
+        panel = sample["state"]["boards"]["boardCfgs"][0]["panels"][0]
+        panel["projectIds"] = ["", "INBOX_PROJECT"]
+        assert any("mixes" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_today_in_panel_tags(self, sample):
+        panel = sample["state"]["boards"]["boardCfgs"][0]["panels"][0]
+        panel["includedTagIds"] = ["TODAY"]
+        assert any("'TODAY' in includedTagIds" in p for p in q.doctor(sample))

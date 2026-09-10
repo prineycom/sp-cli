@@ -55,6 +55,63 @@ def resolve_note(d: dict, ref: str) -> str:
     return matches[0]
 
 
+def all_boards(d: dict) -> list[dict]:
+    boards = d["state"].get("boards") or {}
+    cfgs = boards.get("boardCfgs")
+    return list(cfgs) if isinstance(cfgs, list) else []
+
+
+def all_panels(d: dict) -> list[tuple[dict, dict]]:
+    return [(b, p) for b in all_boards(d) for p in (b.get("panels") or [])]
+
+
+def resolve_board(d: dict, ref: str) -> str:
+    boards = all_boards(d)
+    ids = [b["id"] for b in boards]
+    if ref in ids:
+        return ref
+    by_title = [b["id"] for b in boards if (b.get("title") or "").lower() == ref.lower()]
+    if len(by_title) == 1:
+        return by_title[0]
+    if len(by_title) > 1:
+        raise AmbiguousIdError(ref, by_title)
+    matches = [bid for bid in ids if bid.startswith(ref)]
+    if not matches:
+        matches = [bid for bid in ids if bid.lstrip("-_").startswith(ref)]
+    if not matches:
+        raise NotFoundError(f"no board with id or title '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
+def resolve_panel(d: dict, ref: str, board_id: str | None = None) -> str:
+    """Panel id (exact / title / id prefix). Panel ids are globally unique."""
+    pairs = [
+        (b, p)
+        for b, p in all_panels(d)
+        if board_id is None or b["id"] == board_id
+    ]
+    ids = [p["id"] for _, p in pairs]
+    if ref in ids:
+        return ref
+    by_title = [
+        p["id"] for _, p in pairs if (p.get("title") or "").lower() == ref.lower()
+    ]
+    if len(by_title) == 1:
+        return by_title[0]
+    if len(by_title) > 1:
+        raise AmbiguousIdError(ref, by_title)
+    matches = [pid for pid in ids if pid.startswith(ref)]
+    if not matches:
+        matches = [pid for pid in ids if pid.lstrip("-_").startswith(ref)]
+    if not matches:
+        raise NotFoundError(f"no board panel with id or title '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
 def _resolve_named(d: dict, registry: str, ref: str, kind: str) -> str:
     reg = d["state"][registry]
     if ref in reg["entities"]:
@@ -378,6 +435,30 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"project {pid}: noteIds references missing note {nid}")
             elif notes[nid].get("projectId") != pid:
                 problems.append(f"project {pid}: note {nid} projectId mismatch")
+
+    board_ids: set[str] = set()
+    panel_ids: set[str] = set()
+    for board in all_boards(d):
+        bid = board.get("id")
+        if not bid:
+            problems.append("boards: board without an id")
+        elif bid in board_ids:
+            problems.append(f"boards: duplicate board id '{bid}'")
+        board_ids.add(bid)
+        for panel in board.get("panels") or []:
+            pid = panel.get("id")
+            if not pid:
+                problems.append(f"board {bid}: panel without an id")
+            elif pid in panel_ids:
+                problems.append(f"boards: duplicate panel id '{pid}'")
+            panel_ids.add(pid)
+            project_ids = panel.get("projectIds")
+            if not isinstance(project_ids, list) or not project_ids:
+                problems.append(f"panel {pid}: projectIds must be a non-empty array")
+            elif "" in project_ids and project_ids != [""]:
+                problems.append(f"panel {pid}: projectIds mixes '' with real ids")
+            if TODAY_TAG_ID in (panel.get("includedTagIds") or []):
+                problems.append(f"panel {pid}: 'TODAY' in includedTagIds")
 
     for day, ids in (state.get("planner", {}).get("days") or {}).items():
         for tid in ids:

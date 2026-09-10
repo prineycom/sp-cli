@@ -120,6 +120,36 @@ pip install requests
 ./sp note move <id> --project P
 ```
 
+### Доски (boards)
+
+```sh
+./sp boards [--json]                          # доски и их панели с фильтрами
+./sp board add "Title" [--cols N]             # печатает id (по умолчанию cols=2)
+./sp board edit <id> [--title T] [--cols N]
+./sp board rm <id> [--yes]                    # с подтверждением
+./sp board sort <id>...                       # перечисленные доски — первыми
+```
+
+Панели (id доски/панели можно указывать префиксом или названием):
+
+```sh
+./sp board panel add <board-id> "Title" [фильтры]
+./sp board panel edit <panel-id> [--title T] [фильтры]
+./sp board panel rm <panel-id>
+./sp board panel order <panel-id> <task-id>...
+```
+
+Фильтры панели: `--tags a,b`, `--exclude-tags c`, `--tags-match all|any`,
+`--exclude-tags-match all|any`, `--project P` (повторяемый) | `--all-projects`,
+`--done all|done|undone`, `--scheduled all|scheduled|not`,
+`--backlog all|no|only`, `--parents-only` | `--no-parents-only`,
+`--sort dueDate|created|title|timeEstimate [--dir asc|desc]`.
+
+Важно: `board panel order` задаёт **только порядок** задач в панели —
+состав панели всегда вычисляется из фильтров, добавить туда задачу вручную
+нельзя. Панели редактируются перезаписью всего массива панелей доски
+(SP не имеет рабочей операции правки одной панели).
+
 ### Время / worklog
 
 ```sh
@@ -145,7 +175,7 @@ pip install requests
 ## Тестирование
 
 ```sh
-python3 -m pytest tests/ -q    # 168 unit-тестов, без сети
+python3 -m pytest tests/ -q    # 216 unit-тестов, без сети
 ```
 
 Плюс интеграционный свип против тестового WebDAV-сервера (копия live-файла) и проверка, что настоящий SP подхватывает изменения синком.
@@ -156,10 +186,12 @@ python3 -m pytest tests/ -q    # 168 unit-тестов, без сети
 - [x] MVP: полный набор read/write команд (задачи, план дня, расписание, проекты, теги, время)
 - [x] Sync-слой (vectorClock, recentOps, optimistic locking + retry)
 - [x] Заметки: CRUD, закрепление на сегодня, привязка к проекту
+- [x] Доски: CRUD досок и панелей, фильтры панелей, порядок задач и досок
 - [ ] YouTrack-мост (опционально)
 
 ## Известные ограничения
 
 - Нет live-таймера (`start`/`stop`) — только пост-фактум `track`.
-- Boards не покрыты; у заметок нет переупорядочивания (`NO`) и вложений.
+- У заметок нет переупорядочивания (`NO`) и вложений.
+- У досок нет отдельной операции правки панели (`BP` — мёртвый редьюсер в SP): любая правка панели переписывает весь массив панелей доски.
 - Конфликт с одновременной записью телефона решается retry (re-read + re-apply); при исчерпании попыток команда завершается ошибкой, данные не теряются.

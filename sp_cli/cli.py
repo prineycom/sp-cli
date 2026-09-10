@@ -12,8 +12,15 @@ from sp_cli import render
 from sp_cli.config import ConfigError, init_config, load_config
 from sp_cli.ids import nanoid
 from sp_cli.model import (
+    BACKLOG_STATE,
     INBOX_PROJECT_ID,
+    PANEL_SORT_BY,
+    SCHEDULED_STATE,
+    TASK_DONE_STATE,
+    TODAY_TAG_ID,
+    make_board,
     make_note,
+    make_panel,
     make_project,
     make_tag,
     make_task,
@@ -844,6 +851,197 @@ def cmd_note_move(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- boards
+
+def _tag_list(d: dict, text: str | None) -> list[str] | None:
+    """'a,b' → resolved tag ids (empty string clears the filter)."""
+    if text is None:
+        return None
+    refs = [r.strip() for r in text.split(",") if r.strip()]
+    ids: list[str] = []
+    for ref in refs:
+        tag_id = q.resolve_tag(d, ref)
+        if tag_id not in ids:
+            ids.append(tag_id)
+    return ids
+
+
+def _panel_args(sp) -> None:
+    sp.add_argument("--tags", help="comma-separated tags the task must have")
+    sp.add_argument("--exclude-tags", help="comma-separated tags to exclude")
+    sp.add_argument("--tags-match", choices=["all", "any"])
+    sp.add_argument("--exclude-tags-match", choices=["all", "any"])
+    sp.add_argument("--project", action="append", help="limit to project (repeatable)")
+    sp.add_argument("--all-projects", action="store_true")
+    sp.add_argument("--done", choices=sorted(TASK_DONE_STATE))
+    sp.add_argument("--scheduled", choices=sorted(SCHEDULED_STATE))
+    sp.add_argument("--backlog", choices=sorted(BACKLOG_STATE))
+    sp.add_argument("--parents-only", action="store_true")
+    sp.add_argument("--no-parents-only", action="store_true")
+    sp.add_argument("--sort", choices=list(PANEL_SORT_BY))
+    sp.add_argument("--dir", choices=["asc", "desc"])
+
+
+def _panel_changes(d: dict, args) -> dict:
+    """Only the filter keys the user actually passed."""
+    if args.project and args.all_projects:
+        raise CliError("--project and --all-projects are mutually exclusive")
+    if args.parents_only and args.no_parents_only:
+        raise CliError("--parents-only and --no-parents-only are mutually exclusive")
+    changes: dict = {}
+    included = _tag_list(d, args.tags)
+    if included is not None:
+        if TODAY_TAG_ID in included:
+            raise CliError("'TODAY' cannot be used as a board panel tag filter")
+        changes["includedTagIds"] = included
+    excluded = _tag_list(d, args.exclude_tags)
+    if excluded is not None:
+        changes["excludedTagIds"] = excluded
+    if args.tags_match:
+        changes["includedTagsMatch"] = args.tags_match
+    if args.exclude_tags_match:
+        changes["excludedTagsMatch"] = args.exclude_tags_match
+    if args.all_projects:
+        changes["projectIds"] = [""]
+    elif args.project:
+        changes["projectIds"] = [q.resolve_project(d, p) for p in args.project]
+    if args.done:
+        changes["taskDoneState"] = TASK_DONE_STATE[args.done]
+    if args.scheduled:
+        changes["scheduledState"] = SCHEDULED_STATE[args.scheduled]
+    if args.backlog:
+        changes["backlogState"] = BACKLOG_STATE[args.backlog]
+    if args.parents_only:
+        changes["isParentTasksOnly"] = True
+    if args.no_parents_only:
+        changes["isParentTasksOnly"] = False
+    if args.sort:
+        changes["sortBy"] = args.sort
+        changes["sortDir"] = args.dir or "asc"
+    elif args.dir:
+        raise CliError("--dir requires --sort")
+    return changes
+
+
+def cmd_boards(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    boards = q.all_boards(d)
+    if args.json:
+        render.print_json(boards)
+    else:
+        render.print_boards(d, boards)
+    return 0
+
+
+def cmd_board_add(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    board_id = nanoid()
+    store.commit(
+        [
+            lambda dd, b: mut.board_add(
+                dd, b, make_board(board_id, args.title, cols=args.cols)
+            )
+        ],
+        initial=d,
+    )
+    print(board_id)
+    return 0
+
+
+def cmd_board_edit(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    board_id = q.resolve_board(d, args.id)
+    updates: dict = {}
+    if args.title is not None:
+        updates["title"] = args.title
+    if args.cols is not None:
+        updates["cols"] = args.cols
+    if not updates:
+        raise CliError("board edit: nothing to change")
+    store.commit(
+        [lambda dd, b: mut.board_update(dd, b, board_id, updates)], initial=d
+    )
+    print(f"updated {board_id}")
+    return 0
+
+
+def cmd_board_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    board_id = q.resolve_board(d, args.id)
+    title = next(b.get("title", "") for b in q.all_boards(d) if b["id"] == board_id)
+    if not _confirm(f"delete board '{title}'?", args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    store.commit([lambda dd, b: mut.board_delete(dd, b, board_id)], initial=d)
+    print(f"deleted {board_id}")
+    return 0
+
+
+def cmd_board_sort(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    ids = [q.resolve_board(d, ref) for ref in args.ids]
+    store.commit([lambda dd, b: mut.boards_sort(dd, b, ids)], initial=d)
+    print(f"reordered boards: {', '.join(ids)}")
+    return 0
+
+
+def cmd_board_panel_add(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    board_id = q.resolve_board(d, args.board)
+    changes = _panel_changes(d, args)
+    panel_id = nanoid()
+
+    def _add(dd, b):
+        mut.panel_add(dd, b, board_id, make_panel(panel_id, args.title, **changes))
+
+    store.commit([_add], initial=d)
+    print(panel_id)
+    return 0
+
+
+def cmd_board_panel_edit(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    panel_id = q.resolve_panel(d, args.id)
+    changes = _panel_changes(d, args)
+    if args.title is not None:
+        changes["title"] = args.title
+    if not changes:
+        raise CliError("board panel edit: nothing to change")
+    store.commit(
+        [lambda dd, b: mut.panel_update(dd, b, panel_id, changes)], initial=d
+    )
+    print(f"updated panel {panel_id}")
+    return 0
+
+
+def cmd_board_panel_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    panel_id = q.resolve_panel(d, args.id)
+    store.commit([lambda dd, b: mut.panel_remove(dd, b, panel_id)], initial=d)
+    print(f"deleted panel {panel_id}")
+    return 0
+
+
+def cmd_board_panel_order(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    panel_id = q.resolve_panel(d, args.id)
+    tids = _resolve_tasks(d, args.ids)
+    store.commit(
+        [lambda dd, b: mut.panel_task_order(dd, b, panel_id, tids)], initial=d
+    )
+    print(f"panel {panel_id}: order set for {len(tids)} task(s)")
+    return 0
+
+
 def cmd_archive(args) -> int:
     client, store = _ctx()
     d = client.get()
@@ -885,6 +1083,7 @@ def cmd_pull(args) -> int:
     print(f"projects:     {len(state['project']['ids'])}")
     print(f"tags:         {len(state['tag']['ids'])}")
     print(f"notes:        {len(q.all_notes(d))}")
+    print(f"boards:       {len(q.all_boards(d))}")
     return 0
 
 
@@ -924,10 +1123,23 @@ _SUBCOMMAND_REWRITES = {
     ("note", "edit"): "note-edit",
     ("note", "rm"): "note-rm",
     ("note", "move"): "note-move",
+    ("board", "add"): "board-add",
+    ("board", "edit"): "board-edit",
+    ("board", "rm"): "board-rm",
+    ("board", "sort"): "board-sort",
+}
+
+_SUBCOMMAND_REWRITES_3 = {
+    ("board", "panel", "add"): "board-panel-add",
+    ("board", "panel", "edit"): "board-panel-edit",
+    ("board", "panel", "rm"): "board-panel-rm",
+    ("board", "panel", "order"): "board-panel-order",
 }
 
 
 def _rewrite_argv(argv: list[str]) -> list[str]:
+    if len(argv) >= 3 and tuple(argv[:3]) in _SUBCOMMAND_REWRITES_3:
+        return [_SUBCOMMAND_REWRITES_3[tuple(argv[:3])]] + argv[3:]
     if len(argv) >= 2 and (argv[0], argv[1]) in _SUBCOMMAND_REWRITES:
         return [_SUBCOMMAND_REWRITES[(argv[0], argv[1])]] + argv[2:]
     return argv
@@ -1116,6 +1328,41 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("note-move", cmd_note_move, "move a note to another project")
     s.add_argument("id")
     s.add_argument("--project", required=True)
+
+    s = add("boards", cmd_boards, "list boards and their panels")
+    s.add_argument("--json", action="store_true")
+    s = add("board-add", cmd_board_add, "create a board")
+    s.add_argument("title")
+    s.add_argument("--cols", type=int, default=2)
+    s = add("board-edit", cmd_board_edit, "edit a board")
+    s.add_argument("id")
+    s.add_argument("--title")
+    s.add_argument("--cols", type=int)
+    s = add("board-rm", cmd_board_rm, "delete a board")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+    s = add("board-sort", cmd_board_sort, "reorder boards (listed ones first)")
+    s.add_argument("ids", nargs="+")
+
+    s = add("board-panel-add", cmd_board_panel_add, "add a panel to a board")
+    s.add_argument("board")
+    s.add_argument("title")
+    _panel_args(s)
+    s = add("board-panel-edit", cmd_board_panel_edit, "edit a board panel")
+    s.add_argument("id")
+    s.add_argument("--title")
+    _panel_args(s)
+    s = add("board-panel-rm", cmd_board_panel_rm, "remove a board panel")
+    s.add_argument("id")
+    s = add(
+        "board-panel-order",
+        cmd_board_panel_order,
+        "set the manual task ORDER of a panel (membership stays "
+        "derived from the panel's filters — listing a task here does "
+        "not add it to the panel)",
+    )
+    s.add_argument("id")
+    s.add_argument("ids", nargs="+", help="task ids in the desired order")
 
     s = add("archive", cmd_archive, "archive done tasks")
     s.add_argument("--yes", action="store_true")

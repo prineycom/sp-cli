@@ -149,6 +149,112 @@ def make_tag(tag_id: str, title: str, color: str | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------- boards
+
+# BoardPanelCfg enums are numbers in the sync file (TaskDoneState etc.).
+TASK_DONE_STATE = {"all": 1, "done": 2, "undone": 3}
+SCHEDULED_STATE = {"all": 1, "scheduled": 2, "not": 3}
+BACKLOG_STATE = {"all": 1, "no": 2, "only": 3}
+PANEL_SORT_BY = ("dueDate", "created", "title", "timeEstimate")
+PANEL_SORT_DIR = ("asc", "desc")
+PANEL_TAGS_MATCH = ("all", "any")
+
+DEFAULT_PANEL_CFG = {
+    "id": "",
+    "title": "",
+    "taskIds": [],
+    "taskDoneState": 1,
+    "excludedTagIds": [],
+    "includedTagIds": [],
+    "scheduledState": 1,
+    "backlogState": 1,
+    "isParentTasksOnly": False,
+    "projectIds": [""],
+}
+
+
+def _clean_project_ids(value) -> list[str]:
+    """'' means 'all projects' and is exclusive: mixing it with real ids
+    DROPS the real ids in SP's sanitizer, so canonicalize to exactly ['']."""
+    if not isinstance(value, list):
+        return [""]
+    ids = [str(v) for v in value]
+    if not ids or "" in ids:
+        return [""]
+    out: list[str] = []
+    for pid in ids:
+        if pid not in out:
+            out.append(pid)
+    return out
+
+
+def _clean_tag_ids(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for tid in value:
+        if tid and tid not in out:
+            out.append(str(tid))
+    return out
+
+
+def _enum_value(value, default: int) -> int:
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return default
+    return num if num in (1, 2, 3) else default
+
+
+def sanitize_panel(panel: dict) -> dict:
+    """Rebuild a BoardPanelCfg with only valid keys/values.
+
+    Drops legacy keys (projectId, sortByDue), null match/sortDir values and
+    invalid sortBy; canonicalizes projectIds. Always run before writing."""
+    out = {
+        "id": panel["id"],
+        "title": panel.get("title") or "",
+        "taskIds": [str(t) for t in (panel.get("taskIds") or [])],
+        "includedTagIds": _clean_tag_ids(panel.get("includedTagIds")),
+        "excludedTagIds": _clean_tag_ids(panel.get("excludedTagIds")),
+        "taskDoneState": _enum_value(panel.get("taskDoneState"), 1),
+        "scheduledState": _enum_value(panel.get("scheduledState"), 1),
+        "backlogState": _enum_value(panel.get("backlogState"), 1),
+        "isParentTasksOnly": bool(panel.get("isParentTasksOnly")),
+        "projectIds": _clean_project_ids(panel.get("projectIds")),
+    }
+    for key in ("includedTagsMatch", "excludedTagsMatch"):
+        if panel.get(key) in PANEL_TAGS_MATCH:
+            out[key] = panel[key]
+    if panel.get("sortBy") in PANEL_SORT_BY:
+        out["sortBy"] = panel["sortBy"]
+        if panel.get("sortDir") in PANEL_SORT_DIR:
+            out["sortDir"] = panel["sortDir"]
+    return out
+
+
+def make_panel(panel_id: str, title: str, **overrides) -> dict:
+    """A BoardPanelCfg built from DEFAULT_PANEL_CFG, sanitized."""
+    panel = copy.deepcopy(DEFAULT_PANEL_CFG)
+    panel["id"] = panel_id
+    panel["title"] = title
+    for key, value in overrides.items():
+        if value is not None:
+            panel[key] = value
+    return sanitize_panel(panel)
+
+
+def make_board(
+    board_id: str, title: str, cols: int = 2, panels: list[dict] | None = None
+) -> dict:
+    return {
+        "id": board_id,
+        "title": title,
+        "cols": int(cols),
+        "panels": [sanitize_panel(p) for p in (panels or [])],
+    }
+
+
 _QUICK_SETTING = {
     "DAILY": "DAILY",
     "WEEKLY": "WEEKLY_CURRENT_WEEKDAY",
