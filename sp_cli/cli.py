@@ -1928,7 +1928,7 @@ def cmd_archive(args) -> int:
     archived: list[str] = []
 
     def _arch(dd, b):
-        archived.extend(mut.archive_done(dd, b))
+        archived[:] = mut.archive_done(dd, b)  # a retried closure must not double-count
 
     store.commit([_arch], initial=d)
     print(f"archived {len(archived)} task(s)")
@@ -1955,7 +1955,8 @@ def cmd_restore(args) -> int:
     restored: list[str] = []
 
     def _restore(dd, b):
-        restored.extend(mut.restore_task(dd, b, tid, to_today=args.today))
+        # commit() may retry the closure on a sync race — report the LAST run.
+        restored[:] = mut.restore_task(dd, b, tid, to_today=args.today)
 
     store.commit([_restore], initial=d)
     subs = len(restored) - 1

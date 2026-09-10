@@ -3,7 +3,7 @@ import datetime
 import pytest
 
 from sp_cli import queries as q
-from sp_cli.model import make_issue_provider, make_task, today_str
+from sp_cli.model import day_of_ms, make_issue_provider, make_task, today_str
 from sp_cli.render import format_duration, parse_duration
 
 
@@ -257,11 +257,35 @@ class TestDoctor:
         sample["state"]["tag"]["entities"]["TODAY"]["taskIds"].append(t["id"])
         assert any("'TODAY' in tagIds" in p for p in q.doctor(sample))
 
-    def test_detects_due_xor_violation(self, sample, add_task_entity):
+    def test_detects_due_day_disagreeing_with_due_with_time(
+        self, sample, add_task_entity
+    ):
         t = add_task_entity(title="bad2")
         t["dueDay"] = "2030-01-01"
         t["dueWithTime"] = 1800000000000
-        assert any("both dueDay and dueWithTime" in p for p in q.doctor(sample))
+        assert any("disagrees with dueWithTime" in p for p in q.doctor(sample))
+
+    def test_due_day_matching_due_with_time_is_legal(self, sample, add_task_entity):
+        """SP's planTasksForToday sets dueDay while KEEPING a same-day
+        dueWithTime — that pair must not be flagged."""
+        t = add_task_entity(title="both, agreeing")
+        ts = 1800000000000
+        t["dueWithTime"] = ts
+        t["dueDay"] = day_of_ms(ts)
+        assert not [p for p in q.doctor(sample) if t["id"] in p]
+
+    def test_due_pair_is_judged_offset_aware(self, sample, add_task_entity):
+        """With a 04:00 start-of-next-day a 01:00 timestamp belongs to the
+        PREVIOUS day — the pair that agrees is the shifted one."""
+        sample["state"]["globalConfig"]["misc"]["startOfNextDayTime"] = "04:00"
+        t = add_task_entity(title="late night")
+        t["dueWithTime"] = int(
+            datetime.datetime(2026, 9, 9, 1, 0).timestamp() * 1000
+        )
+        t["dueDay"] = "2026-09-08"
+        assert not [p for p in q.doctor(sample) if t["id"] in p]
+        t["dueDay"] = "2026-09-09"
+        assert any("disagrees with dueWithTime" in p for p in q.doctor(sample))
 
     def test_detects_subtask_in_project(self, sample, add_task_entity):
         parent = add_task_entity(title="p")

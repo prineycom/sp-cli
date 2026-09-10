@@ -15,6 +15,7 @@ from sp_cli.model import (
     archive_task_blobs,
     archive_task_entity_maps,
     day_of_ms,
+    logical_day_of_ms,
     today_str,
 )
 
@@ -659,7 +660,16 @@ def doctor(d: dict) -> list[str]:
         if TODAY_TAG_ID in task.get("tagIds", []):
             problems.append(f"task {tid}: 'TODAY' in tagIds")
         if task.get("dueDay") is not None and task.get("dueWithTime") is not None:
-            problems.append(f"task {tid}: both dueDay and dueWithTime set")
+            # Both set is legal (SP's planTasksForToday does exactly that) as
+            # long as they agree on the logical day; only a mismatch is a bug.
+            try:
+                same_day = logical_day_of_ms(task["dueWithTime"], d) == task["dueDay"]
+            except (TypeError, ValueError, OverflowError, OSError):
+                same_day = False
+            if not same_day:
+                problems.append(
+                    f"task {tid}: dueDay {task['dueDay']} disagrees with dueWithTime"
+                )
         pid = task.get("projectId")
         if pid not in state["project"]["entities"]:
             problems.append(f"task {tid}: projectId '{pid}' does not exist")

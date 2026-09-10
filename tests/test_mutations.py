@@ -3,6 +3,7 @@ import datetime
 import pytest
 
 from conftest import assert_doctor_clean
+from sp_cli import model
 from sp_cli import mutations as mut
 from sp_cli import queries as q
 from sp_cli.model import (
@@ -449,6 +450,7 @@ class TestPlanning:
         assert op["p"]["actionPayload"] == {
             "taskIds": [t1["id"], t2["id"]],
             "today": today_str(),
+            "startOfNextDayDiffMs": 0,
         }
         for t in (t1, t2):
             task = _task(sample, t["id"])
@@ -471,10 +473,29 @@ class TestPlanning:
         t = add_task_entity(title="timed today", due_with_time=ts, remind_at=ts)
         mut.plan_today(sample, b, [t["id"]])
         task = _task(sample, t["id"])
-        assert task["dueWithTime"] == ts  # kept: already points to today
-        assert task["remindAt"] == ts
-        assert task.get("dueDay") is None  # XOR preserved: no dueDay set
+        # SP's planTasksForToday: dueDay is set UNCONDITIONALLY, remindAt is
+        # always cleared, and a same-day dueWithTime survives alongside it.
+        assert task["dueWithTime"] == ts
+        assert task["remindAt"] is None
+        assert task["dueDay"] == today_str()
         assert _today_order(sample)[0] == t["id"]
+        assert_doctor_clean(sample)
+
+    def test_plan_today_is_offset_aware(self, sample, b, add_task_entity, monkeypatch):
+        """With startOfNextDayTime=04:00 a 01:00 stamp still belongs to the
+        PREVIOUS logical day — which is 'today' — so it must be KEPT even
+        though a naive calendar comparison would call it another day."""
+        sample["state"]["globalConfig"]["misc"]["startOfNextDayTime"] = "04:00"
+        ts = int(datetime.datetime(2026, 9, 9, 1, 0).timestamp() * 1000)
+        monkeypatch.setattr(model, "now_ms", lambda: ts)
+        t = add_task_entity(title="late", due_with_time=ts)
+        mut.plan_today(sample, b, [t["id"]])
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["today"] == "2026-09-08"
+        assert payload["startOfNextDayDiffMs"] == 4 * 3600000
+        task = _task(sample, t["id"])
+        assert task["dueDay"] == "2026-09-08" and task["dueWithTime"] == ts
+        assert task["remindAt"] is None
         assert_doctor_clean(sample)
 
     def test_plan_today_without_today_tag_is_tolerated(
@@ -2213,10 +2234,14 @@ class TestRestore:
         self._archive(
             sample, "archiveOld", self._done(sub_ids[0], "sub"), under_state=True
         )
+        self._archive(
+            sample, "archiveYoung", self._done("R" * 21, "root"), under_state=True
+        )
         mut.restore_task(sample, b, "R" * 21)
         for reg in (
             sample["archiveYoung"]["task"],
             sample["archiveOld"]["task"],
+            sample["state"]["archiveYoung"]["task"],
             sample["state"]["archiveOld"]["task"],
         ):
             assert reg["ids"] == [] and reg["entities"] == {}
@@ -2251,10 +2276,45 @@ class TestRestore:
         assert _task(sample, "S" * 21)["projectId"] == "INBOX_PROJECT"
         assert_doctor_clean(sample)
 
-    def test_dangling_repeat_cfg_is_cleared(self, sample, b):
-        self._seed(sample, subs=0, repeatCfgId="C" * 21)
+    def test_missing_inbox_degrades_instead_of_raising(self, sample, b):
+        """No INBOX_PROJECT in the file: the task still comes back (holding its
+        dangling projectId, which `doctor` reports) — a broken file must not
+        make restore impossible."""
+        state = sample["state"]
+        for pid in list(state["project"]["entities"]):
+            state["project"]["entities"].pop(pid)
+            state["project"]["ids"].remove(pid)
+        self._seed(sample, subs=1, projectId="GONE" + "p" * 17)
+        assert mut.restore_task(sample, b, "R" * 21) == ["R" * 21, "S" * 21]
+        assert _task(sample, "R" * 21)["projectId"] == "GONE" + "p" * 17
+        assert any("does not exist" in p for p in q.doctor(sample))
+
+    def test_dangling_repeat_cfg_is_cleared_on_subtasks_too(self, sample, b):
+        root, sub_ids = self._seed(sample, subs=1, repeatCfgId="C" * 21)
+        sample["archiveYoung"]["task"]["entities"][sub_ids[0]]["repeatCfgId"] = (
+            "C" * 21
+        )
         mut.restore_task(sample, b, "R" * 21)
         assert "repeatCfgId" not in _task(sample, "R" * 21)
+        assert "repeatCfgId" not in _task(sample, sub_ids[0])
+
+    def test_stale_membership_is_stripped_from_every_project(self, sample, b):
+        """removeTasksFromAllProjects: root AND subtasks leave every project's
+        taskIds/backlogTaskIds before the root is re-appended."""
+        other = make_project("O" * 21, "other")
+        other["isEnableBacklog"] = True
+        mut.project_add(sample, b, other)
+        root, sub_ids = self._seed(sample, subs=1)
+        other["taskIds"].append("R" * 21)
+        other["backlogTaskIds"].append(sub_ids[0])
+        inbox = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        inbox["backlogTaskIds"].append("R" * 21)
+        mut.restore_task(sample, b, "R" * 21)
+        assert other["taskIds"] == [] and other["backlogTaskIds"] == []
+        assert inbox["backlogTaskIds"] == []
+        assert inbox["taskIds"].count("R" * 21) == 1
+        assert sub_ids[0] not in inbox["taskIds"]
+        assert_doctor_clean(sample)
 
     def test_live_repeat_cfg_is_kept(self, sample, b):
         reg = sample["state"].setdefault(
@@ -2306,9 +2366,48 @@ class TestRestore:
         )
         self._seed(sample, subs=0, dueWithTime=ts)
         mut.restore_task(sample, b, "R" * 21, to_today=True)
+        # SP sets dueDay unconditionally and keeps a same-day dueWithTime —
+        # both in the pre-materialized payload and in state.
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["task"]["dueWithTime"] == ts
+        assert payload["task"]["dueDay"] == today_str()
+        assert "remindAt" not in payload["task"]
         task = _task(sample, "R" * 21)
-        # XOR: dueWithTime survives, dueDay stays unset
-        assert task["dueWithTime"] == ts and "dueDay" not in task
+        assert task["dueWithTime"] == ts and task["dueDay"] == today_str()
+        assert_doctor_clean(sample)
+
+    def test_restore_to_today_is_offset_aware(self, sample, b, monkeypatch):
+        """01:00 with startOfNextDayTime=04:00 is still the previous logical
+        day — i.e. today — so the time survives and the diff is emitted."""
+        sample["state"]["globalConfig"]["misc"]["startOfNextDayTime"] = "04:00"
+        ts = int(datetime.datetime(2026, 9, 9, 1, 0).timestamp() * 1000)
+        monkeypatch.setattr(model, "now_ms", lambda: ts)
+        self._seed(sample, subs=0, dueWithTime=ts)
+        mut.restore_task(sample, b, "R" * 21, to_today=True)
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["restoreToToday"] == {
+            "today": "2026-09-08",
+            "startOfNextDayDiffMs": 4 * 3600000,
+        }
+        assert payload["task"]["dueWithTime"] == ts
+        assert payload["task"]["dueDay"] == "2026-09-08"
+        task = _task(sample, "R" * 21)
+        assert task["dueWithTime"] == ts and task["dueDay"] == "2026-09-08"
+        assert_doctor_clean(sample)
+
+    def test_restore_to_today_clears_a_due_with_time_of_another_day(
+        self, sample, b, monkeypatch
+    ):
+        sample["state"]["globalConfig"]["misc"]["startOfNextDayTime"] = "04:00"
+        now = int(datetime.datetime(2026, 9, 9, 12, 0).timestamp() * 1000)
+        monkeypatch.setattr(model, "now_ms", lambda: now)
+        # 03:00 on the 9th belongs to the 8th — NOT today (the 9th).
+        stale = int(datetime.datetime(2026, 9, 9, 3, 0).timestamp() * 1000)
+        self._seed(sample, subs=0, dueWithTime=stale)
+        mut.restore_task(sample, b, "R" * 21, to_today=True)
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert "dueWithTime" not in payload["task"]
+        assert payload["task"]["dueDay"] == "2026-09-09"
         assert_doctor_clean(sample)
 
     def test_restore_to_today_purges_planner_days(self, sample, b):
@@ -2332,11 +2431,19 @@ class TestRestore:
             mut.restore_task(sample, b, "R" * 21)
         assert len(b.ops) == n_ops
 
-    def test_active_subtask_is_refused(self, sample, b, add_task_entity):
-        root, sub_ids = self._seed(sample)
-        add_task_entity(task_id=sub_ids[0], title="live sub")
-        with pytest.raises(mut.MutationError, match="already active"):
-            mut.restore_task(sample, b, "R" * 21)
+    def test_active_subtask_is_adopted_not_refused(self, sample, b, add_task_entity):
+        root, sub_ids = self._seed(sample, subs=2)
+        live = add_task_entity(task_id=sub_ids[0], title="live sub")
+        restored = mut.restore_task(sample, b, "R" * 21)
+        # kept in subTaskIds (so the link survives) but NOT re-added from the
+        # archive: it is re-pointed at the restored root instead.
+        assert restored == ["R" * 21] + sub_ids
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["task"]["subTaskIds"] == sub_ids
+        assert [s["id"] for s in payload["subTasks"]] == [sub_ids[1]]
+        assert live["parentId"] == "R" * 21
+        assert live["projectId"] == "INBOX_PROJECT"
+        assert_doctor_clean(sample)
 
     def test_unknown_id_is_refused(self, sample, b):
         with pytest.raises(mut.MutationError, match="not in the archive"):

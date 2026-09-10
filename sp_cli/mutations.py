@@ -17,11 +17,13 @@ from sp_cli.model import (
     archive_task_blobs,
     archive_task_entity_maps,
     day_of_ms,
+    logical_day_of_ms,
     logical_today_str,
     make_metric,
     make_repeat_cfg,
     now_ms,
     sanitize_panel,
+    start_of_next_day_diff_ms,
     task_with_subtasks,
     today_str,
 )
@@ -138,6 +140,40 @@ def _clear_due_with_time(task: dict, changes: dict | None = None) -> None:
         changes["remindAt"] = None
 
 
+def _should_clear_due_time_for_today(
+    due_with_time: int | None, today: str, d: dict | None
+) -> bool:
+    """SP's `shouldClearDueTimeForToday` (util/is-today.util.ts): when a task is
+    (re)planned onto `today`, its `dueWithTime` is kept only if that timestamp
+    falls on the SAME logical day (offset-aware); a missing time is 'nothing to
+    clear', a corrupt one is cleared instead of blowing up."""
+    if due_with_time is None:
+        return False
+    try:
+        ts = int(due_with_time)
+    except (TypeError, ValueError):
+        return True
+    if ts <= 0:
+        return True
+    try:
+        return logical_day_of_ms(ts, d) != today
+    except (OverflowError, OSError, ValueError):
+        return True
+
+
+def _plan_for_today(task: dict, today: str, d: dict | None) -> None:
+    """SP's planTasksForToday update, per task: `dueDay` is set to today
+    UNCONDITIONALLY, `remindAt` is ALWAYS cleared, and `dueWithTime` survives
+    when it already points at today — so a task may legitimately carry BOTH
+    dueDay=today and a same-day dueWithTime."""
+    task["dueDay"] = today
+    task["remindAt"] = None
+    if _should_clear_due_time_for_today(task.get("dueWithTime"), today, d):
+        task["dueWithTime"] = None
+    else:
+        task.setdefault("dueWithTime", None)
+
+
 # ---------------------------------------------------------------- tasks
 
 def add_task(d: dict, b: OpBuilder, task: dict, to_backlog: bool = False) -> str:
@@ -149,6 +185,9 @@ def add_task(d: dict, b: OpBuilder, task: dict, to_backlog: bool = False) -> str
     state = _state(d)
     if TODAY_TAG_ID in task.get("tagIds", []):
         raise MutationError("'TODAY' must never appear in task.tagIds")
+    # A CLI-level rule, not a data invariant: SP itself may hold both (planning
+    # onto today keeps a same-day time), but asking for both at CREATION time is
+    # an ambiguous request, so it is refused here.
     if task.get("dueDay") is not None and task.get("dueWithTime") is not None:
         raise MutationError("dueDay and dueWithTime are mutually exclusive")
     project = _project(state, task["projectId"])
@@ -196,7 +235,8 @@ def update_task(d: dict, b: OpBuilder, task_id: str, changes: dict) -> None:
     if "tagIds" in changes and TODAY_TAG_ID in changes["tagIds"]:
         raise MutationError("'TODAY' must never appear in task.tagIds")
 
-    # XOR invariant: setting one due mechanism clears the other, explicitly.
+    # An explicit due change replaces the other mechanism (CLI intent) — the
+    # dueDay+same-day-dueWithTime pair is only ever produced by planning paths.
     if changes.get("dueDay") is not None:
         changes.setdefault("dueWithTime", None)
         changes.setdefault("remindAt", None)
@@ -465,7 +505,8 @@ def project_set_backlog(
 
 def plan_today(d: dict, b: OpBuilder, task_ids: list[str]) -> None:
     state = _state(d)
-    today = today_str()
+    today = logical_today_str(d)
+    offset = start_of_next_day_diff_ms(d)
     for tid in task_ids:
         _task(state, tid)
 
@@ -474,22 +515,16 @@ def plan_today(d: dict, b: OpBuilder, task_ids: list[str]) -> None:
         "UPD",
         "TASK",
         task_ids[0],
-        {"taskIds": list(task_ids), "today": today},
+        {
+            "taskIds": list(task_ids),
+            "today": today,
+            "startOfNextDayDiffMs": offset,
+        },
         ds=list(task_ids),
     )
 
     for tid in task_ids:
-        task = _task(state, tid)
-        if (
-            task.get("dueWithTime") is not None
-            and day_of_ms(task["dueWithTime"]) == today
-        ):
-            # Already scheduled today: SP keeps dueWithTime/remindAt and does
-            # NOT set dueDay (XOR) — membership already holds; ordering only.
-            pass
-        else:
-            task["dueDay"] = today
-            _clear_due_with_time(task)
+        _plan_for_today(_task(state, tid), today, d)
     _today_prepend(state, task_ids)
     _planner_purge(state, task_ids)
 
@@ -1879,20 +1914,18 @@ def _archive_remove(d: dict, task_ids: list[str]) -> None:
             _list_remove(reg.setdefault("ids", []), tid)
 
 
-def _materialize_restore_today(root: dict, subs: list[dict], today: str) -> None:
+def _materialize_restore_today(
+    root: dict, subs: list[dict], today: str, d: dict | None
+) -> None:
     """The `restoreToToday` transform SP's action creator applies BEFORE the
-    op leaves the device — so the payload must already carry it."""
+    op leaves the device — so the payload must already carry it.
+
+    Same rule as plan_today: dueDay=today always, remindAt gone, dueWithTime
+    kept when it already falls on today's logical day."""
     root.pop("remindAt", None)
-    if (
-        root.get("dueWithTime") is not None
-        and day_of_ms(root["dueWithTime"]) == today
-    ):
-        # Already scheduled for today: keep dueWithTime and leave dueDay
-        # unset — the two are mutually exclusive (same rule as plan_today).
-        pass
-    else:
+    root["dueDay"] = today
+    if _should_clear_due_time_for_today(root.get("dueWithTime"), today, d):
         root.pop("dueWithTime", None)
-        root["dueDay"] = today
     for sub in subs:
         for field in ("dueDay", "dueWithTime", "remindAt"):
             sub.pop(field, None)
@@ -1907,11 +1940,15 @@ def _normalize_restored(state: dict, root: dict, subs: list[dict]) -> None:
     cfgs = (state.get("taskRepeatCfg") or {}).get("entities") or {}
 
     if root.get("projectId") not in projects:
-        root["projectId"] = INBOX_PROJECT_ID
+        # No Inbox in this file? Degrade instead of exploding: the task comes
+        # back holding its (dangling) projectId and `doctor` flags it.
+        if INBOX_PROJECT_ID in projects:
+            root["projectId"] = INBOX_PROJECT_ID
     root["isDone"] = False
     root.pop("doneOn", None)
-    if root.get("repeatCfgId") and root["repeatCfgId"] not in cfgs:
-        root.pop("repeatCfgId", None)
+    for entity in [root] + subs:
+        if entity.get("repeatCfgId") and entity["repeatCfgId"] not in cfgs:
+            entity.pop("repeatCfgId", None)
     for entity in [root] + subs:
         # TODAY is never a stored tag, and a tag deleted while the task sat
         # in the archive would leave a dangling reference.
@@ -1953,39 +1990,57 @@ def restore_task(
     root = copy.deepcopy(archived)
     root.pop("subTasks", None)
     subs: list[dict] = []
+    adopted: list[str] = []
+    sub_ids: list[str] = []
     for sid in list(root.get("subTaskIds") or []):
         if sid in state["task"]["entities"]:
-            raise MutationError(f"subtask {sid} is already active")
+            # Already live (a partial restore, or an out-of-band edit): keep
+            # the link and adopt it rather than refusing the whole restore.
+            adopted.append(sid)
+            sub_ids.append(sid)
+            continue
         sub = _archive_find(d, sid)
         if sub is None:
             continue  # gone from the archive: prune the dangling reference
         sub = copy.deepcopy(sub)
         sub.pop("subTasks", None)
         subs.append(sub)
+        sub_ids.append(sid)
     # The reducer reads task.subTaskIds to clean the archive — keep it exact.
-    root["subTaskIds"] = [s["id"] for s in subs]
+    root["subTaskIds"] = sub_ids
 
     today = logical_today_str(d)
     if to_today:
-        _materialize_restore_today(root, subs, today)
+        _materialize_restore_today(root, subs, today, d)
 
     payload = {"task": copy.deepcopy(root), "subTasks": copy.deepcopy(subs)}
     if to_today:
-        payload["restoreToToday"] = {"today": today, "startOfNextDayDiffMs": 0}
+        payload["restoreToToday"] = {
+            "today": today,
+            "startOfNextDayDiffMs": start_of_next_day_diff_ms(d),
+        }
     b.op("HR", "UPD", "TASK", task_id, payload)
 
     _normalize_restored(state, root, subs)
-    project = _project(state, root["projectId"])
-    all_ids = [task_id] + list(root["subTaskIds"])
+    project = state["project"]["entities"].get(root.get("projectId"))
+    all_ids = [task_id] + list(sub_ids)
 
     _archive_remove(d, all_ids)
     _reg_add(state["task"], root)
     for sub in subs:
         _reg_add(state["task"], sub)
+    for sid in adopted:
+        live = state["task"]["entities"][sid]
+        live["parentId"] = root["id"]
+        live["projectId"] = root["projectId"]
 
-    if task_id not in project.setdefault("taskIds", []):
-        project["taskIds"].append(task_id)
-    _list_remove(project.setdefault("backlogTaskIds", []), task_id)
+    # removeTasksFromAllProjects: no stale membership may survive anywhere.
+    for other in state["project"]["entities"].values():
+        for key in ("taskIds", "backlogTaskIds"):
+            for tid in all_ids:
+                _list_remove(other.get(key) or [], tid)
+    if project is not None:
+        project.setdefault("taskIds", []).append(task_id)
     for entity in [root] + subs:
         for tag_id in entity["tagIds"]:
             tag = _tag(state, tag_id)
