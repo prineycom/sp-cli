@@ -106,6 +106,27 @@ class TestTimeStage:
         res = parse("call 12", d)
         assert res.time_estimate_ms is None and res.clean_title == "call 12"
 
+    def test_trailing_slash_is_spent_time_only(self, d):
+        # SP decides on the separator being inside the matched span, not on a
+        # second cluster existing: '30m/' is spent time and no estimate.
+        res = parse("x 30m/", d)
+        assert res.time_spent_ms == _ms(m=30)
+        assert res.time_estimate_ms is None
+        assert res.clean_title == "x"
+
+    def test_leading_slash_matches_nothing(self, d):
+        # The pre-cluster is mandatory in SP's regex, so '/1h' cannot match at
+        # all (the char before '1h' is '/', neither whitespace nor start).
+        res = parse("x /1h", d)
+        assert res.time_estimate_ms is None and res.time_spent_ms is None
+        assert res.clean_title == "x /1h"
+
+    def test_gate_off(self, d):
+        # SP wraps parseTimeSpentTracked in the isEnableDue gate.
+        d["state"]["globalConfig"]["shortSyntax"]["isEnableDue"] = False
+        res = parse("x 30m", d)
+        assert res.time_estimate_ms is None and res.clean_title == "x 30m"
+
 
 class TestProjectStage:
     @pytest.mark.parametrize(
@@ -130,6 +151,37 @@ class TestProjectStage:
         assert res.project_id == project_id
         assert res.clean_title == clean
 
+    @pytest.mark.parametrize(
+        "title,project_id,clean",
+        [
+            # A partial title may only shorten its LAST word, so a longer word
+            # never matches a shorter project: '+Workshop' is not project
+            # 'Work' and must not leave 'shop' behind in the title.
+            ("Buy +Workshop stuff", None, "Buy +Workshop stuff"),
+            # ... but a single typed word is still matched against the
+            # squashed title, so '+Workin' does reach 'Work in progress'.
+            ("Buy +Workin progress", "P_WIP", "Buy progress"),
+            ("Buy +Wor", "P_WORK", "Buy"),
+            ("Buy +Work in progres", "P_WORK", "Buy in progres"),
+            ("Buy +Some Pr", "P_SOME", "Buy"),
+            ("Buy +SomePr", "P_SOME", "Buy"),
+        ],
+    )
+    def test_word_boundaries(self, d, title, project_id, clean):
+        res = parse(title, d)
+        assert res.project_id == project_id
+        assert res.clean_title == clean
+
+    def test_a_full_title_beats_a_partial_one(self, d):
+        # '+Work in progres' above resolves to 'Work' because the fully typed
+        # pass runs first over every word count. Without a project literally
+        # called 'Work', the same input shortens the last word instead.
+        state = d["state"]["project"]
+        state["ids"].remove("P_WORK")
+        del state["entities"]["P_WORK"]
+        res = parse("Buy +Work in progres", d)
+        assert res.project_id == "P_WIP" and res.clean_title == "Buy"
+
     def test_gate_off(self, d):
         d["state"]["globalConfig"]["shortSyntax"]["isEnableProject"] = False
         res = parse("Buy +Work", d)
@@ -150,6 +202,11 @@ class TestTagStage:
             ("#123 hi", [], [], "#123 hi"),
             ("#123 hi #home", ["T_HOME"], [], "#123 hi"),
             ("a #1st", [], ["1st"], "a"),
+            # Numeric-only is an issue reference only at index 0 of the title;
+            # anywhere else it is an ordinary tag (SP's tagStartIndex > 0).
+            ("Fix bug #123", [], ["123"], "Fix bug"),
+            ("  #123 hi", [], [], "#123 hi"),
+            ("a #42 #123", [], ["42", "123"], "a"),
             # TODAY is not a user tag: left untouched in the title
             ("a #today", [], [], "a #today"),
         ],
@@ -296,10 +353,95 @@ class TestRepeatStage:
         assert res.due_day is None and res.due_with_time is None
 
     @pytest.mark.parametrize(
-        "title", ["a @every 0 days", "a @every 1000 days", "a @every 40th", "a @everyday"]
+        "title",
+        [
+            "a @every 0 days",
+            "a @every 1000 days",
+            "a @every 40th",
+            "a @everyday",
+            # SP excludes weekday/workday from the *interval* units: "every 2
+            # weekdays" means every other workday, which a weekly cycle cannot
+            # express, so it stays a plain (unparseable) date.
+            "a @every 2 weekdays",
+            "a @every 3 workdays",
+        ],
     )
     def test_not_a_repeat(self, d, title):
         assert parse(title, d).repeat is None
+
+    @pytest.mark.parametrize(
+        "title,expected",
+        [
+            (
+                "a @every 2 fridays",  # weekly interval naming its own weekday
+                {
+                    "repeat_cycle": "WEEKLY",
+                    "repeat_every": 2,
+                    "days": ["friday"],
+                    "start_date": "2026-09-11",
+                },
+            ),
+            (
+                "a @every 2 weeks",  # weekday flags pinned to today's weekday
+                {
+                    "repeat_cycle": "WEEKLY",
+                    "repeat_every": 2,
+                    "days": ["thursday"],
+                },
+            ),
+            (
+                "a @every 1 friday",  # interval 1 == the weekly preset
+                {
+                    "repeat_cycle": "WEEKLY",
+                    "repeat_every": 1,
+                    "days": ["friday"],
+                    "start_date": "2026-09-11",
+                },
+            ),
+        ],
+    )
+    def test_weekday_intervals(self, d, title, expected):
+        res = parse(title, d)
+        assert res.repeat is not None, title
+        for key, value in expected.items():
+            assert res.repeat[key] == value, key
+        assert res.clean_title == "a"
+
+    @pytest.mark.parametrize(
+        "title,start_date,hour",
+        [
+            # NOW is Thursday 2026-09-10, 12:00.
+            ("a @every monday 9:00", "2026-09-14", 9),
+            ("a @every monday 9am", "2026-09-14", 9),
+            ("a @weekly 18:00", "2026-09-10", 18),  # still ahead today
+            ("a @weekly 9:00", "2026-09-17", 9),  # passed → a whole week on
+            ("a @daily 18:00", "2026-09-10", 18),
+            ("a @daily 9:00", "2026-09-11", 9),  # passed → tomorrow
+            ("a @every 15th 8:00", "2026-09-15", 8),
+            ("a @monthly 8:00", "2026-10-10", 8),  # the 10th at 08:00 passed
+        ],
+    )
+    def test_time_after_the_phrase_is_absorbed(self, d, title, start_date, hour):
+        res = parse(title, d)
+        assert res.clean_title == "a"
+        assert res.repeat["start_date"] == start_date
+        assert res.repeat["start_time"] == f"{hour:02d}:00"
+        assert res.due_with_time == _at(dt.date.fromisoformat(start_date), hour)
+        assert res.due_day is None
+
+    def test_workday_repeat_skips_the_weekend(self, d):
+        friday = dt.datetime(2026, 9, 11, 13, 0)
+        res = parse("a @every weekday 9:00", d, now=friday)
+        # 09:00 has passed → tomorrow (Saturday) → rolled onto Monday, the
+        # first day the schedule actually has an occurrence.
+        assert res.repeat["start_date"] == "2026-09-14"
+        assert res.due_with_time == _at(dt.date(2026, 9, 14), 9)
+
+    def test_a_non_time_remainder_stays_in_the_title(self, d):
+        res = parse("a @every monday and friday", d)
+        assert res.repeat["days"] == ["monday"]
+        assert res.clean_title == "a and friday"
+        assert res.due_with_time is None
 
     def test_rest_of_the_segment_stays_in_the_title(self, d):
         res = parse("a @every monday morning", d)
@@ -364,9 +506,15 @@ class TestCombined:
         res = parse("a   #home    b", d)
         assert res.clean_title == "a b"
 
-    def test_title_made_empty_falls_back_to_the_original(self, d):
-        res = parse("#home", d)
-        assert res.clean_title == "#home"
+    @pytest.mark.parametrize("title", ["#home", "@daily", "+Work", "30m"])
+    def test_an_empty_residual_title_refuses_the_whole_parse(self, d, title):
+        res = parse(title, d)
+        assert res.refused and not res.touched
+        assert res.clean_title == title
+        # No side effects either: nothing may be tagged, scheduled or created.
+        assert res.tag_ids == [] and res.new_tag_titles == []
+        assert res.project_id is None and res.repeat is None
+        assert res.due_day is None and res.time_estimate_ms is None
 
     def test_parse_never_mutates_the_state(self, d):
         import copy

@@ -511,18 +511,21 @@ def make_repeat_cfg(
     start_time: str | None = None,
     remind_at: str | None = None,
     default_estimate: int | None = None,
+    tag_ids: list[str] | None = None,
 ) -> dict:
     """TaskRepeatCfg with SP defaults. repeat_cycle: DAILY|WEEKLY|MONTHLY|YEARLY.
 
     days: weekday keys ('monday'...) — overrides the default mon-fri pattern.
     remind_at: TaskReminderOptionId string (e.g. 'AtStart'), not a timestamp.
+    tag_ids: tags every generated task inherits (SP's add bar seeds these from
+    the task it creates the recurrence for).
     """
     cadence = repeat_cadence_fields(repeat_cycle, repeat_every, days)
     cfg = {
         "id": cfg_id,
         "projectId": project_id,
         "title": title,
-        "tagIds": [],
+        "tagIds": list(tag_ids or []),
         "order": 0,
         "isPaused": False,
         "startDate": start_date or today_str(),

@@ -230,6 +230,12 @@ def cmd_add(args) -> int:
         )
         if parsed.touched:
             print("parsed: " + " ".join(parsed.summary), file=sys.stderr)
+        elif parsed.refused:
+            print(
+                "not parsed: the title would have been empty — "
+                "adding it verbatim",
+                file=sys.stderr,
+            )
 
     if args.parent:
         parent_id = q.resolve_task(d, args.parent)
@@ -282,17 +288,32 @@ def cmd_add(args) -> int:
                 "--backlog is incompatible with --due / --at: a backlog task "
                 "is explicitly not scheduled"
             )
-        # A backlog task is explicitly unscheduled — a parsed `@due` is dropped
-        # rather than fought over (only the explicit flags are an error).
-        if parsed and not args.backlog and not due_day and at_ts is None:
+        at_from_parse = False
+        if parsed and not due_day and at_ts is None:
+            if args.backlog and (parsed.due_day or parsed.due_with_time is not None):
+                raise CliError(
+                    "--backlog is incompatible with a parsed @due: a backlog "
+                    "task is explicitly not scheduled (drop the token or "
+                    "pass --no-parse)"
+                )
             due_day = parsed.due_day
             at_ts = parsed.due_with_time
+            at_from_parse = at_ts is not None
         spent_ms = parsed.time_spent_ms if parsed else None
         deadline_day = parsed.deadline_day if parsed else None
         deadline_ts = parsed.deadline_with_time if parsed else None
         repeat = parsed.repeat if parsed else None
+        # A recurring task is created as its own first occurrence: SP's add bar
+        # writes dueDay = the cfg's start day (or dueWithTime when the syntax
+        # carried a time), so the task shows up on that day instead of sitting
+        # in the inbox until the repeat engine runs.
+        if repeat and not args.backlog and due_day is None and at_ts is None:
+            due_day = repeat.get("start_date")
 
         def _add(dd, b):
+            first_due = due_day
+            if repeat and first_due is None and at_ts is None and not args.backlog:
+                first_due = logical_today_str(dd)
             task = make_task(
                 task_id,
                 title,
@@ -300,12 +321,21 @@ def cmd_add(args) -> int:
                 time_estimate=est,
                 tag_ids=tag_ids,
                 notes=args.notes,
-                due_day=due_day,
+                due_day=first_due,
             )
             mut.add_task(dd, b, task, to_backlog=bool(args.backlog))
             if at_ts is not None:
-                offset = render.parse_offset(args.remind) if args.remind else 0
-                mut.schedule_task(dd, b, task_id, at_ts, remind_at=at_ts - offset)
+                # An explicit `--at` keeps its at-start reminder default; a time
+                # that only came out of short syntax schedules without one —
+                # SP's parser returns `remindAt: null`, and a reminder nobody
+                # asked for is a notification on every device.
+                if args.remind:
+                    remind_at = at_ts - render.parse_offset(args.remind)
+                elif at_from_parse:
+                    remind_at = None
+                else:
+                    remind_at = at_ts
+                mut.schedule_task(dd, b, task_id, at_ts, remind_at=remind_at)
             if deadline_day is not None or deadline_ts is not None:
                 mut.set_deadline(
                     dd,
@@ -317,7 +347,7 @@ def cmd_add(args) -> int:
             if spent_ms:
                 mut.track_time(dd, b, task_id, logical_today_str(dd), spent_ms)
             if repeat:
-                mut.repeat_add(dd, b, task_id, nanoid(), **repeat)
+                mut.repeat_add(dd, b, task_id, nanoid(), tag_ids=tag_ids, **repeat)
 
         muts.append(_add)
 
@@ -2790,7 +2820,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--create-tags", action="store_true")
     s.add_argument("--due", help="YYYY-MM-DD | today | tomorrow | +N")
     s.add_argument("--at", help="'YYYY-MM-DD HH:MM' schedule with time")
-    s.add_argument("--remind", help="offset before --at, e.g. 10m (default 0m)")
+    s.add_argument(
+        "--remind",
+        help="offset before the scheduled time, e.g. 10m (default 0m). "
+        "--at reminds at start by default; a time parsed from the title "
+        "(@tomorrow 9:00) never reminds unless this flag is given",
+    )
     s.add_argument("--est", help="e.g. 30m, 1.5h")
     s.add_argument("--notes")
     s.add_argument("--parent", help="create as subtask of this task")

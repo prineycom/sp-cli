@@ -1452,6 +1452,7 @@ def repeat_add(
     start_date: str | None = None,
     start_time: str | None = None,
     remind_at: str | None = None,
+    tag_ids: list[str] | None = None,
 ) -> str:
     state = _state(d)
     task = _task(state, task_id)
@@ -1466,6 +1467,13 @@ def repeat_add(
         start_time=start_time,
         remind_at=remind_at,
         default_estimate=task.get("timeEstimate") or None,
+        # The recurrence inherits the task's tags, the way the add bar passes
+        # its parsed tagIds into the cfg it creates.
+        tag_ids=[
+            t
+            for t in (task.get("tagIds") if tag_ids is None else tag_ids) or []
+            if t != TODAY_TAG_ID
+        ],
     )
 
     payload = {"taskId": task_id, "taskRepeatCfg": copy.deepcopy(cfg)}

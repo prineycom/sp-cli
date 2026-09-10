@@ -42,6 +42,8 @@ class ParseResult:
     deadline_with_time: int | None = None
     repeat: dict | None = None
     summary: list[str] = field(default_factory=list)
+    #: the parse was thrown away because it would have left an empty title
+    refused: bool = False
 
     @property
     def touched(self) -> bool:
@@ -247,6 +249,25 @@ def _consume_when(
     return None
 
 
+def _consume_clock(text: str) -> tuple[tuple[int, int], int] | None:
+    """Leading time-of-day in `text` → ((hour, minute), consumed chars).
+
+    Only a time is accepted, and only directly after whatever came before —
+    the adjacency rule SP applies to the chrono remainder of a recurrence
+    phrase ('@every friday 3pm' absorbs the time, 'Standup @every monday and
+    friday' must not swallow the words in between).
+    """
+    stripped = text.lstrip()
+    lead = len(text) - len(stripped)
+    tokens = list(re.finditer(r"\S+", stripped))
+    for k in range(min(2, len(tokens)), 0, -1):
+        end = tokens[k - 1].end()
+        got = parse_time_text(stripped[:end])
+        if got is not None:
+            return got, lead + end
+    return None
+
+
 # ---------------------------------------------------------------- repeat
 
 _WEEKDAY_KEYS = [
@@ -267,17 +288,24 @@ _UNIT_CYCLE = {
     "year": "YEARLY",
 }
 
+# SP's WEEKDAY_UNIT_SOURCE, verbatim: full names before abbreviations, because
+# alternation is leftmost-first and a leading `fri` would leave the "day" of
+# "friday" behind and fail the phrase-end lookahead.
 _WEEKDAY_ALT = (
-    "monday|mondays|mon|tuesday|tuesdays|tues|tue|wednesday|wednesdays|wed|"
-    "thursday|thursdays|thurs|thur|thu|friday|fridays|fri|saturday|saturdays|"
-    "sat|sunday|sundays|sun"
+    "mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|saturdays?|sundays?"
+    "|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun"
 )
-_UNIT_ALT = "days?|weeks?|months?|years?|weekdays?|workdays?"
+_SINGLE_UNIT_ALT = "days?|weeks?|months?|years?|weekdays?|workdays?"
+# `weekday(s)`/`workday(s)` are deliberately absent from the *interval* units:
+# "every 2 weekdays" means every other workday, which a weekly cycle cannot
+# express (five weekday flags plus an interval means every other *week*, all
+# five days), so it stays a plain date rather than becoming a wrong schedule.
+_INTERVAL_UNIT_ALT = f"days?|weeks?|months?|years?|{_WEEKDAY_ALT}"
 
 _REPEAT_RE = re.compile(
     r"^(?:(daily|weekly|monthly|yearly|annually)"
-    rf"|every\s+({_UNIT_ALT}|{_WEEKDAY_ALT}|\d{{1,2}}(?:st|nd|rd|th))"
-    rf"|every\s+([1-9]\d{{0,2}})\s+({_UNIT_ALT}))"
+    rf"|every\s+({_SINGLE_UNIT_ALT}|{_WEEKDAY_ALT}|\d{{1,2}}(?:st|nd|rd|th))"
+    rf"|every\s+([1-9]\d{{0,2}})\s+({_INTERVAL_UNIT_ALT}))"
     r"(?=[\s.,;:!?]|$)",
     re.IGNORECASE,
 )
@@ -363,19 +391,84 @@ def parse_repeat(text: str, today: datetime.date) -> tuple[dict, int] | None:
                 today, _WEEKDAY_KEYS.index(key)
             ).isoformat()
     else:
-        unit = interval_unit.lower().rstrip("s")
+        unit = interval_unit.lower()
         # An interval of 1 collapses onto the plain preset (SP never stores a
-        # CUSTOM cadence that a quick setting already expresses).
+        # CUSTOM cadence that a quick setting already expresses) — which the
+        # field-level spec below expresses by itself.
         spec["repeat_every"] = int(interval)
-        if unit in ("weekday", "workday"):
+        key = _weekday_key(unit)
+        if key is not None:
+            # "@every 2 fridays" — a weekly interval that names its own weekday
+            # instead of taking today's.
             spec["repeat_cycle"] = "WEEKLY"
-            spec["days"] = list(_WORKDAYS)
+            spec["days"] = [key]
+            spec["start_date"] = _next_weekday(
+                today, _WEEKDAY_KEYS.index(key)
+            ).isoformat()
         else:
-            spec["repeat_cycle"] = _UNIT_CYCLE[unit]
-            if spec["repeat_cycle"] == "WEEKLY" and spec["repeat_every"] == 1:
+            spec["repeat_cycle"] = _UNIT_CYCLE[unit.rstrip("s")]
+            # A WEEKLY interval always pins the weekday flags to its first
+            # occurrence (SP's getIntervalRepeatUpdates): the flags are an
+            # independent filter, and the cfg default is mon-fri.
+            if spec["repeat_cycle"] == "WEEKLY":
                 spec["days"] = weekly_current()
     spec["label"] = m.group(0).strip()
     return spec, lead + m.end()
+
+
+def _skip_weekend(day: datetime.date) -> datetime.date:
+    while day.weekday() >= 5:
+        day += datetime.timedelta(days=1)
+    return day
+
+
+def _roll_one_period(day: datetime.date, spec: dict) -> datetime.date:
+    """Advance a first occurrence whose time of day has already passed.
+
+    SP's applyRepeatSyntax roll-forward: an anchored cycle advances a whole
+    period (so '@every friday 3pm' typed on a Friday afternoon lands on the
+    next Friday), an unanchored one (DAILY, mon-fri) just moves to the next
+    day, the way chrono's forwardDate already would.
+    """
+    cycle = spec["repeat_cycle"]
+    days = spec.get("days") or []
+    if cycle == "WEEKLY" and len(days) == 1:
+        return day + datetime.timedelta(days=7)
+    if cycle == "MONTHLY":
+        nxt = _day_of_month_start(day.day, day + datetime.timedelta(days=1))
+        return datetime.date.fromisoformat(nxt) if nxt else day
+    if cycle == "YEARLY":
+        try:
+            return day.replace(year=day.year + 1)
+        except ValueError:  # Feb 29
+            return day.replace(year=day.year + 1, day=28)
+    return day + datetime.timedelta(days=1)
+
+
+def anchor_first_occurrence(
+    spec: dict, clock: tuple[int, int], now: datetime.datetime
+) -> datetime.datetime:
+    """First occurrence of `spec` at `clock`, today or later.
+
+    Mutates nothing; the caller writes the result back into the spec's
+    `start_date` / `start_time`.
+    """
+    today = now.date()
+    day = (
+        datetime.date.fromisoformat(spec["start_date"])
+        if spec.get("start_date")
+        else today
+    )
+    when = datetime.datetime.combine(day, datetime.time(clock[0], clock[1]))
+    if when <= now:
+        when = datetime.datetime.combine(
+            _roll_one_period(when.date(), spec), when.time()
+        )
+    if sorted(spec.get("days") or []) == sorted(_WORKDAYS):
+        # A mon-fri schedule has no weekend occurrence: the roll above (or a
+        # weekend `start_date`) would advertise one the task never gets.
+        when = datetime.datetime.combine(_skip_weekend(when.date()), when.time())
+    return when
 
 
 # ---------------------------------------------------------------- projects/tags
@@ -404,27 +497,70 @@ def _visible_projects(d: dict) -> list[dict]:
     return out
 
 
-def match_project(text: str, d: dict) -> tuple[dict, int] | None:
-    """Longest-prefix project match on `text` → (project, matched chars).
-
-    A full title beats a partial one because the longest match wins; a
-    single word may also match a title with its spaces squashed out
-    ('+SomePro' → 'Some Pro').
-    """
-    low = text.lower()
-    single_word = " " not in low.strip()
-    best: tuple[dict, int] | None = None
+def _matchable_projects(d: dict) -> list[dict]:
+    """Visible projects as SP's `MatchableProject`, shortest title first."""
+    out = []
     for project in _visible_projects(d):
-        title = (project.get("title") or "").lower()
+        title = (project.get("title") or "").strip()
         if not title:
             continue
-        candidates = [title]
-        if single_word and " " in title:
-            candidates.append(title.replace(" ", ""))
-        for cand in candidates:
-            if low.startswith(cand) and (best is None or len(cand) > best[1]):
-                best = (project, len(cand))
-    return best
+        out.append(
+            {
+                "project": project,
+                "words": title.lower().split(),
+                "squashed": title.replace(" ", "").lower(),
+                "length": len(project["title"]),
+            }
+        )
+    out.sort(key=lambda m: m["length"])
+    return out
+
+
+def _is_fully_typed(m: dict, typed: list[str]) -> bool:
+    return m["words"] == typed
+
+
+def _is_partially_typed(m: dict, typed: list[str]) -> bool:
+    """A partial title may only shorten its LAST word.
+
+    Otherwise task content would get pulled into the project title
+    ('+Home work on taxes' must not match a project 'Homework', '+Workshop'
+    must not match 'Work'). A single word may also be typed without any
+    whitespace at all ('+SomePro' → 'Some Pro').
+    """
+    if len(typed) == 1:
+        return m["squashed"].startswith(typed[0])
+    if len(typed) > len(m["words"]):
+        return False
+    last = len(typed) - 1
+    return all(
+        m["words"][i].startswith(word) if i == last else m["words"][i] == word
+        for i, word in enumerate(typed)
+    )
+
+
+def match_project(text: str, d: dict) -> tuple[dict, int] | None:
+    """Word-boundary project match on `text` → (project, matched chars).
+
+    `text` is everything the `+` token swallowed, so it usually carries task
+    words after the project title: walk its word prefixes from the longest
+    down and consume only the words that belong to a title. A fully typed
+    title always wins over a partial one (SP's two passes), and among equal
+    word counts the shortest project title does.
+    """
+    projects = _matchable_projects(d)
+    if not projects:
+        return None
+    max_words = max(len(m["words"]) for m in projects)
+    word_ends = [w.end() for w in re.finditer(r"\S+", text)]
+    for is_match in (_is_fully_typed, _is_partially_typed):
+        for count in range(min(len(word_ends), max_words), 0, -1):
+            typed_title = text[: word_ends[count - 1]]
+            typed = typed_title.lower().split()
+            for m in projects:
+                if is_match(m, typed):
+                    return m["project"], len(typed_title)
+    return None
 
 
 def _tag_index(d: dict) -> dict[str, str]:
@@ -490,19 +626,26 @@ def parse(
     res = ParseResult(clean_title=title)
     text = title
 
-    # --- time -----------------------------------------------------------
-    m = _TIME_RE.search(text)
-    if m:
-        pre, post = m.group(1), m.group(2)
-        if post is not None:
-            res.time_spent_ms = _sum_clusters(pre)
-            res.time_estimate_ms = _sum_clusters(post)
-            res.summary.append(f"spent={pre.strip()} est={post.strip()}")
-        else:
-            res.time_estimate_ms = _sum_clusters(pre)
-            res.summary.append(f"est={pre.strip()}")
-        start = m.start() + (1 if m.group(0)[:1].isspace() else 0)
-        text = _cut(text, [(start, m.end())])
+    # --- time (SP wraps parseTimeSpentTracked in the isEnableDue gate) ---
+    if gates["isEnableDue"]:
+        m = _TIME_RE.search(text)
+        if m:
+            pre, post = m.group(1), m.group(2)
+            # The `/` decides, not the presence of a second cluster: '30m/' is
+            # half an hour spent and no estimate at all (SP tests matchSpan
+            # for the separator). A leading '/1h' cannot match the regex at
+            # all — the pre-cluster is mandatory — and stays in the title.
+            spent, estimate = (pre, post) if "/" in m.group(0) else (None, pre)
+            parts = []
+            if spent is not None:
+                res.time_spent_ms = _sum_clusters(spent)
+                parts.append(f"spent={spent.strip()}")
+            if estimate is not None:
+                res.time_estimate_ms = _sum_clusters(estimate)
+                parts.append(f"est={estimate.strip()}")
+            res.summary.append(" ".join(parts))
+            start = m.start() + (1 if m.group(0)[:1].isspace() else 0)
+            text = _cut(text, [(start, m.end())])
 
     # --- due (repeat is anchored at the start of the due text) -----------
     if gates["isEnableDue"]:
@@ -514,8 +657,20 @@ def parse(
             rep = parse_repeat(body, today)
             if rep is not None:
                 spec, used = rep
+                label = spec.pop("label")
+                # '@every monday 9:00' — absorb the adjacent time remainder
+                # into the schedule instead of leaving it in the title.
+                clock = _consume_clock(body[used:])
+                if clock is not None:
+                    (hour, minute), clock_used = clock
+                    when = anchor_first_occurrence(spec, (hour, minute), now)
+                    spec["start_date"] = when.date().isoformat()
+                    spec["start_time"] = f"{hour:02d}:{minute:02d}"
+                    res.due_with_time = int(when.timestamp() * 1000)
+                    used += clock_used
+                    label += f" {spec['start_time']}"
                 res.repeat = spec
-                res.summary.append(f"repeat={spec.pop('label')}")
+                res.summary.append(f"repeat={label}")
                 text = _cut(text, [(dm.start(), body_at + used)])
                 break
             got = _consume_when(body, now)
@@ -558,16 +713,15 @@ def parse(
         index = _tag_index(d)
         spans: list[tuple[int, int]] = []
         seen: set[str] = set()
-        position = 0
+        # SP rejects a numeric-only tag only at index 0 of the *trimmed* title
+        # ('#123 fix' is an issue reference, 'Fix bug #123' is a tag).
+        title_start = len(text) - len(text.lstrip())
         for tm in _TAG_RE.finditer(text):
             if not _preceded_by_space(text, tm.start()):
                 continue
             name = tm.group(0)[1:]
-            # A leading purely numeric '#123' is an issue reference, not a tag.
-            if position == 0 and re.fullmatch(r"\d+", name):
-                position += 1
+            if tm.start() == title_start and re.fullmatch(r"\d+", name):
                 continue
-            position += 1
             key = name.lower()
             if key == "today":  # reserved: TODAY is not a user tag
                 continue
@@ -587,7 +741,14 @@ def parse(
             text = _cut(text, spans)
 
     clean = _collapse(text)
-    res.clean_title = clean if clean else _collapse(title)
+    if not clean:
+        # Everything was syntax. A task with no title is worse than an
+        # unparsed one, so the whole parse is thrown away — no project, no
+        # tags, no schedule, no new tags created (SP keeps the title because
+        # its add bar can show the parse and let the user fix it; the CLI has
+        # one shot and prefers the literal title).
+        return ParseResult(clean_title=_collapse(title), refused=True)
+    res.clean_title = clean
     return res
 
 

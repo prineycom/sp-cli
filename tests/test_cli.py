@@ -2774,16 +2774,78 @@ class TestAddShortSyntax:
         cfg = _payload(fake_ctx.ops, "RA")["taskRepeatCfg"]
         assert (cfg["quickSetting"], cfg["repeatCycle"]) == ("DAILY", "DAILY")
 
-    def test_backlog_drops_a_parsed_due(self, fake_ctx, sample):
+    def test_backlog_refuses_a_parsed_due(self, fake_ctx, sample):
+        # Same error as the explicit --due/--at: a backlog task is by
+        # definition unscheduled, so a schedule in the title is a conflict,
+        # not something to silently drop.
         _seed_shortsyntax_world(sample)
-        assert cli.cmd_add(
-            _args(["add", "later +Work @tomorrow", "--backlog"])
-        ) == 0
+        with pytest.raises(cli.CliError, match="backlog is incompatible"):
+            cli.cmd_add(_args(["add", "later +Work @tomorrow", "--backlog"]))
+
+    def test_backlog_still_takes_the_rest_of_the_parse(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "later +Work #home", "--backlog"])) == 0
         task = _payload(fake_ctx.ops, "HA")["task"]
-        assert task.get("dueDay") is None
+        assert task.get("dueDay") is None and task["title"] == "later"
         assert sample["state"]["project"]["entities"]["P_WORK"]["backlogTaskIds"] == [
             task["id"]
         ]
+
+    def test_parsed_time_schedules_without_a_reminder(self, fake_ctx, sample):
+        # SP's parser returns `remindAt: null` — a time in the title asks for a
+        # schedule, not for a notification on every device.
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x @tomorrow 9:00"])) == 0
+        assert "remindAt" not in _payload(fake_ctx.ops, "HS")
+
+    def test_parsed_time_plus_remind_flag_does_remind(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x @tomorrow 9:00", "--remind", "10m"])) == 0
+        hs = _payload(fake_ctx.ops, "HS")
+        assert hs["remindAt"] == hs["dueWithTime"] - 600_000
+
+    def test_explicit_at_keeps_its_at_start_reminder(self, fake_ctx, sample):
+        # Batch-1 behaviour is unchanged: only the short-syntax path is silent.
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x", "--at", "2030-01-01 09:00"])) == 0
+        hs = _payload(fake_ctx.ops, "HS")
+        assert hs["remindAt"] == hs["dueWithTime"]
+
+    def test_repeat_task_is_its_own_first_occurrence(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "standup @every monday #home"])) == 0
+        cfg = _payload(fake_ctx.ops, "RA")["taskRepeatCfg"]
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task["dueDay"] == cfg["startDate"]
+        assert cfg["tagIds"] == ["T_HOME"] == task["tagIds"]
+
+    def test_daily_repeat_starts_today(self, fake_ctx, sample):
+        assert cli.cmd_add(_args(["add", "pills @daily"])) == 0
+        assert _payload(fake_ctx.ops, "HA")["task"]["dueDay"] == model.logical_today_str(
+            sample
+        )
+
+    def test_timed_repeat_schedules_the_first_occurrence(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "standup @every monday 9:00"])) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["HA", "HS", "RA"]
+        cfg = _payload(fake_ctx.ops, "RA")["taskRepeatCfg"]
+        assert cfg["startTime"] == "09:00"
+        assert "remindAt" not in cfg
+        hs = _payload(fake_ctx.ops, "HS")
+        expected = dt.datetime.combine(
+            dt.date.fromisoformat(cfg["startDate"]), dt.time(9, 0)
+        )
+        assert hs["dueWithTime"] == int(expected.timestamp() * 1000)
+        assert _payload(fake_ctx.ops, "HA")["task"]["title"] == "standup"
+
+    def test_a_title_of_pure_syntax_is_added_verbatim(self, fake_ctx, sample, capsys):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "#home"])) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["HA"]  # no GA, no HS
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task["title"] == "#home" and task["tagIds"] == []
+        assert "not parsed:" in capsys.readouterr().err
 
     def test_subtask_is_never_parsed(self, fake_ctx, sample, add_task_entity):
         parent = add_task_entity(title="parent")
