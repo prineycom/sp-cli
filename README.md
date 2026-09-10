@@ -64,7 +64,14 @@ pip install requests
          [--due today|tomorrow|+N|YYYY-MM-DD] [--at "YYYY-MM-DD HH:MM"] \
          [--remind 10m] [--est 30m] [--notes "..."] [--parent ID] [--backlog] \
          [--no-parse] [--parse-deadline]
-./sp edit <id> [--title T] [--notes N] [--append-notes N] [--est 1h] [--due DAY]  # --due "" очищает
+./sp edit <id...> [--title T] [--notes N] [--append-notes N] [--est 1h] [--due DAY]
+                               # несколько id — один синк; --due "" очищает; --title только с одним id
+./sp bulk [<id...>] [--project P] [--tag T] [--overdue] [--search TEXT] [--done] [--all] \
+          [--due DAY|--clear-due] [--tag-add T ...] [--tag-rm T ...] [--est 1h] \
+          [--move-project P] [--complete|--reopen] [--dry-run] [--yes]
+                               # массовая правка: выбор = явные id ∪ фильтры (как в list),
+                               # всё пишется одним батчем; --dry-run только показывает выборку,
+                               # при >10 задачах спрашивает подтверждение (--yes отключает)
 ./sp complete <id...>          # отметить сделанным
 ./sp reopen <id...>            # вернуть в работу
 ./sp delete <id...> [--yes]    # с подтверждением

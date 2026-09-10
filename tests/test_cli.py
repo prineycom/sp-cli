@@ -2801,3 +2801,267 @@ class TestAddShortSyntax:
         from conftest import assert_doctor_clean
 
         assert_doctor_clean(sample)
+
+
+# ---------------------------------------------------------------- bulk edits
+
+def _actions(ops):
+    return [op["a"] for op in ops]
+
+
+class TestMultiIdEdit:
+    def test_two_ids_emit_two_hu_in_one_batch(self, fake_ctx, sample, add_task_entity):
+        a = add_task_entity(title="a")
+        b = add_task_entity(title="b")
+        rc = cli.cmd_edit(_args(["edit", a["id"], b["id"], "--est", "30m"]))
+        assert rc == 0
+        assert _actions(fake_ctx.ops) == ["HU", "HU"]
+        assert fake_ctx.commits == 1  # one batch, one syncVersion increment
+        assert [op["d"] for op in fake_ctx.ops] == [a["id"], b["id"]]
+        for op in fake_ctx.ops:
+            assert op["p"]["actionPayload"]["task"]["changes"]["timeEstimate"] == 1_800_000
+
+    def test_clock_counter_is_cumulative_and_sync_version_bumps_once(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        from sp_cli.ops import finalize
+
+        ids = [add_task_entity(title=f"t{i}")["id"] for i in range(3)]
+        assert cli.cmd_edit(_args(["edit", *ids, "--due", "2030-01-01"])) == 0
+        assert [op["v"]["B_test01"] for op in fake_ctx.ops] == [1, 2, 3]
+        before = sample["syncVersion"]
+        finalize(sample, fake_ctx.ops, "B_test01")
+        assert sample["syncVersion"] == before + 1
+        assert {op["sv"] for op in fake_ctx.ops} == {before + 1}
+
+    def test_title_with_many_ids_is_rejected(self, fake_ctx, add_task_entity):
+        a, b = add_task_entity(title="a"), add_task_entity(title="b")
+        with pytest.raises(cli.CliError, match="--title"):
+            cli.cmd_edit(_args(["edit", a["id"], b["id"], "--title", "x"]))
+        assert fake_ctx.ops == []
+
+    def test_duplicate_ids_are_edited_once(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        assert cli.cmd_edit(_args(["edit", a["id"], a["id"], "--est", "1h"])) == 0
+        assert _actions(fake_ctx.ops) == ["HU"]
+
+    def test_single_id_still_works(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a", notes="old")
+        assert cli.cmd_edit(_args(["edit", a["id"], "--append-notes", "new"])) == 0
+        changes = _payload(fake_ctx.ops, "HU")["task"]["changes"]
+        assert changes["notes"] == "old\nnew"
+
+
+class TestBulkSelector:
+    def test_no_selector_is_an_error(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="no selector"):
+            cli.cmd_bulk(_args(["bulk", "--est", "1h"]))
+
+    def test_no_action_is_an_error(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(cli.CliError, match="nothing to do"):
+            cli.cmd_bulk(_args(["bulk", a["id"]]))
+
+    def test_due_and_clear_due_conflict(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_bulk(_args(["bulk", a["id"], "--due", "today", "--clear-due"]))
+
+    def test_complete_and_reopen_conflict(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_bulk(_args(["bulk", a["id"], "--complete", "--reopen"]))
+
+    def test_project_and_overdue_combine_like_list(self, fake_ctx, sample, add_task_entity):
+        _seed_shortsyntax_world(sample)
+        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        late = add_task_entity(project_id="P_WORK", title="late", due_day=yesterday)
+        add_task_entity(project_id="P_WORK", title="on time")
+        add_task_entity(title="inbox late", due_day=yesterday)
+        assert cli.cmd_bulk(
+            _args(["bulk", "--project", "Work", "--overdue", "--est", "1h"])
+        ) == 0
+        assert [op["d"] for op in fake_ctx.ops] == [late["id"]]
+
+    def test_explicit_ids_union_with_filters_without_duplicates(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        _seed_shortsyntax_world(sample)
+        a = add_task_entity(project_id="P_WORK", title="a")
+        other = add_task_entity(title="other")
+        assert cli.cmd_bulk(
+            _args(["bulk", a["id"], other["id"], "--project", "Work", "--est", "1h"])
+        ) == 0
+        assert [op["d"] for op in fake_ctx.ops] == [a["id"], other["id"]]
+
+    def test_done_selector_finds_done_tasks(self, fake_ctx, sample, add_task_entity):
+        done = add_task_entity(title="done one")
+        done["isDone"] = True
+        done["doneOn"] = model.now_ms()
+        add_task_entity(title="open one")
+        assert cli.cmd_bulk(_args(["bulk", "--done", "--reopen"])) == 0
+        assert [op["d"] for op in fake_ctx.ops] == [done["id"]]
+        assert _payload(fake_ctx.ops, "HU")["task"]["changes"]["isDone"] is False
+
+    def test_no_match_returns_1_and_writes_nothing(self, fake_ctx, capsys):
+        assert cli.cmd_bulk(_args(["bulk", "--search", "zzz-nope", "--est", "1h"])) == 1
+        assert fake_ctx.ops == []
+        assert "no tasks matched" in capsys.readouterr().err
+
+    def test_selection_is_recomputed_inside_the_commit(self, sample, monkeypatch, add_task_entity):
+        """412 retry: the closure must re-run the selector on the fresh file."""
+        _seed_shortsyntax_world(sample)
+        add_task_entity(project_id="P_WORK", title="first")
+
+        def _mutate(d):
+            add_task_entity(d=d, project_id="P_WORK", title="appeared later")
+
+        ctx = _RetryCtx(sample, _mutate)
+        monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+        assert cli.cmd_bulk(_args(["bulk", "--project", "Work", "--est", "1h"])) == 0
+        assert len(ctx.ops) == 2  # the task that appeared underneath is included
+
+
+class TestBulkActions:
+    def test_dry_run_writes_nothing_and_lists_tasks(self, fake_ctx, add_task_entity, capsys):
+        a = add_task_entity(title="dry me")
+        assert cli.cmd_bulk(_args(["bulk", a["id"], "--complete", "--dry-run"])) == 0
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        out = capsys.readouterr().out
+        assert "dry me" in out and "dry run" in out
+
+    def test_dry_run_without_an_action_is_allowed(self, fake_ctx, add_task_entity):
+        add_task_entity(title="x")
+        assert cli.cmd_bulk(_args(["bulk", "--search", "x", "--dry-run"])) == 0
+        assert fake_ctx.ops == []
+
+    def test_due_est_and_complete_share_one_hu_per_task(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        b = add_task_entity(title="b")
+        assert cli.cmd_bulk(
+            _args(["bulk", a["id"], b["id"], "--due", "2030-05-05", "--est", "2h",
+                   "--complete"])
+        ) == 0
+        assert _actions(fake_ctx.ops) == ["HU", "HU"]
+        changes = fake_ctx.ops[0]["p"]["actionPayload"]["task"]["changes"]
+        assert changes["dueDay"] == "2030-05-05"
+        assert changes["timeEstimate"] == 7_200_000
+        assert changes["isDone"] is True and changes["doneOn"] > 0
+
+    def test_clear_due_nulls_the_scheduling_fields(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a", due_day="2030-01-01")
+        assert cli.cmd_bulk(_args(["bulk", a["id"], "--clear-due"])) == 0
+        changes = _payload(fake_ctx.ops, "HU")["task"]["changes"]
+        assert changes == {"dueDay": None, "dueWithTime": None, "remindAt": None}
+
+    def test_complete_skips_already_done_tasks(self, fake_ctx, add_task_entity):
+        done = add_task_entity(title="done")
+        done["isDone"] = True
+        open_ = add_task_entity(title="open")
+        assert cli.cmd_bulk(
+            _args(["bulk", done["id"], open_["id"], "--complete"])
+        ) == 0
+        assert [op["d"] for op in fake_ctx.ops] == [open_["id"]]
+
+    def test_tag_add_emits_hgt_and_is_idempotent(self, fake_ctx, sample, add_task_entity):
+        _seed_shortsyntax_world(sample)
+        a = add_task_entity(title="a")
+        b = add_task_entity(title="b", tag_ids=["T_HOME"])
+        sample["state"]["tag"]["entities"]["T_HOME"]["taskIds"].append(b["id"])
+        assert cli.cmd_bulk(
+            _args(["bulk", a["id"], b["id"], "--tag-add", "home"])
+        ) == 0
+        assert _actions(fake_ctx.ops) == ["HGT"]
+        op = fake_ctx.ops[0]
+        assert op["p"]["actionPayload"] == {"tagId": "T_HOME", "taskId": a["id"]}
+        assert op["ds"] == [a["id"], "T_HOME"]
+
+    def test_tag_rm_rewrites_tag_ids_with_hu(self, fake_ctx, sample, add_task_entity):
+        _seed_shortsyntax_world(sample)
+        a = add_task_entity(title="a", tag_ids=["T_HOME"])
+        sample["state"]["tag"]["entities"]["T_HOME"]["taskIds"].append(a["id"])
+        assert cli.cmd_bulk(_args(["bulk", a["id"], "--tag-rm", "home"])) == 0
+        assert _payload(fake_ctx.ops, "HU")["task"]["changes"]["tagIds"] == []
+
+    def test_move_project_emits_hmp_and_skips_no_ops(
+        self, fake_ctx, sample, add_task_entity, capsys
+    ):
+        _seed_shortsyntax_world(sample)
+        moving = add_task_entity(title="moving")
+        already = add_task_entity(project_id="P_WORK", title="already there")
+        parent = add_task_entity(title="parent")
+        sub = add_task_entity(title="sub", parent_id=parent["id"])
+        parent["subTaskIds"] = [sub["id"]]
+        assert cli.cmd_bulk(
+            _args(["bulk", moving["id"], already["id"], sub["id"],
+                   "--move-project", "Work"])
+        ) == 0
+        assert _actions(fake_ctx.ops) == ["HMP"]
+        assert fake_ctx.ops[0]["d"] == moving["id"]
+        assert "subtask" in capsys.readouterr().err
+
+    def test_confirmation_over_ten_tasks(self, fake_ctx, monkeypatch, add_task_entity, capsys):
+        for i in range(11):
+            add_task_entity(title=f"bulky {i}")
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+        assert cli.cmd_bulk(_args(["bulk", "--search", "bulky", "--est", "1h"])) == 1
+        assert fake_ctx.ops == []
+        monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+        assert cli.cmd_bulk(_args(["bulk", "--search", "bulky", "--est", "1h"])) == 0
+        assert len(fake_ctx.ops) == 11
+
+    def test_yes_skips_the_prompt(self, fake_ctx, monkeypatch, add_task_entity):
+        for i in range(11):
+            add_task_entity(title=f"bulky {i}")
+
+        def _boom(_prompt):
+            raise AssertionError("must not prompt with --yes")
+
+        monkeypatch.setattr("builtins.input", _boom)
+        assert cli.cmd_bulk(
+            _args(["bulk", "--search", "bulky", "--est", "1h", "--yes"])
+        ) == 0
+        assert len(fake_ctx.ops) == 11
+
+    def test_ten_tasks_do_not_prompt(self, fake_ctx, monkeypatch, add_task_entity):
+        for i in range(10):
+            add_task_entity(title=f"bulky {i}")
+
+        def _boom(_prompt):
+            raise AssertionError("must not prompt at 10")
+
+        monkeypatch.setattr("builtins.input", _boom)
+        assert cli.cmd_bulk(_args(["bulk", "--search", "bulky", "--est", "1h"])) == 0
+
+
+class TestBulkNeverEmitsMultiEntityOps:
+    def test_every_bulk_action_stays_on_per_task_ops(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        """Contract (research §10): N × HU in one batch, never HUM/TU — a
+        multi-entity op blocks conflict resolution on the receiving device."""
+        _seed_shortsyntax_world(sample)
+        a = add_task_entity(title="a", due_day="2030-01-01")
+        b = add_task_entity(title="b")
+        assert cli.cmd_bulk(
+            _args(["bulk", a["id"], b["id"], "--due", "2031-02-02", "--est", "1h",
+                   "--tag-add", "home", "--complete", "--move-project", "Work"])
+        ) == 0
+        assert cli.cmd_edit(_args(["edit", a["id"], b["id"], "--est", "2h"])) == 0
+        actions = set(_actions(fake_ctx.ops))
+        assert actions <= {"HU", "HGT", "HMP"}
+        assert "HUM" not in actions and "TU" not in actions
+        assert fake_ctx.commits == 2  # one batch per command
+
+    def test_state_stays_consistent_after_a_bulk(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        from conftest import assert_doctor_clean
+
+        _seed_shortsyntax_world(sample)
+        add_task_entity(title="a")
+        add_task_entity(title="b")
+        assert cli.cmd_bulk(
+            _args(["bulk", "--project", "inbox", "--tag-add", "home", "--complete"])
+        ) == 0
+        assert_doctor_clean(sample)

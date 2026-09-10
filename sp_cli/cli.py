@@ -326,13 +326,25 @@ def cmd_add(args) -> int:
     return 0
 
 
+def _dedupe(ids: list[str]) -> list[str]:
+    """Order-preserving dedupe (the same task must never be edited twice in
+    one batch — two HUs for one id would be a pointless self-conflict)."""
+    out: list[str] = []
+    for i in ids:
+        if i not in out:
+            out.append(i)
+    return out
+
+
 def cmd_edit(args) -> int:
     client, store = _ctx()
     d = client.get()
-    tid = q.resolve_task(d, args.id)
+    if args.title is not None and len(args.ids) > 1:
+        raise CliError("edit: --title takes exactly one task id")
+    tids = _dedupe(_resolve_tasks(d, args.ids))
     est = render.parse_duration(args.est) if args.est else None
 
-    def _edit(dd, b):
+    def _edit(dd, b, tid):
         changes: dict = {}
         if args.title is not None:
             changes["title"] = args.title
@@ -354,8 +366,140 @@ def cmd_edit(args) -> int:
             raise CliError("edit: nothing to change")
         mut.update_task(dd, b, tid, changes)
 
-    store.commit([_edit], initial=d)
-    print(f"updated {render.short_id(tid)}")
+    # One commit for every id: N × HU in a single batch (one syncVersion
+    # increment) — never the multi-entity updateMany, which sync conflict
+    # resolution cannot decompose.
+    store.commit(
+        [(lambda dd, b, _t=tid: _edit(dd, b, _t)) for tid in tids], initial=d
+    )
+    print(f"updated {', '.join(render.short_id(t) for t in tids)}")
+    return 0
+
+
+# --- bulk -----------------------------------------------------------------
+
+def _bulk_select(d: dict, args) -> list[str]:
+    """Task ids the bulk selector matches: explicit ids ∪ filter matches.
+
+    Filters combine exactly like `sp list` (AND between them); explicit ids
+    come first so the printed order is predictable.
+    """
+    ids = _resolve_tasks(d, args.ids)
+    if _bulk_has_filter(args):
+        ids += [
+            t["id"]
+            for t in q.list_tasks(
+                d,
+                project=args.project,
+                tag=args.tag,
+                overdue=args.overdue,
+                search=args.search,
+                only_done=args.done,
+                include_done=args.all,
+            )
+        ]
+    return _dedupe(ids)
+
+
+def _bulk_has_filter(args) -> bool:
+    return bool(args.project or args.tag or args.overdue or args.search or args.done)
+
+
+def cmd_bulk(args) -> int:
+    if not args.ids and not _bulk_has_filter(args):
+        raise CliError(
+            "bulk: no selector (pass task ids and/or "
+            "--project/--tag/--overdue/--search/--done)"
+        )
+    if args.due is not None and args.clear_due:
+        raise CliError("bulk: --due and --clear-due are mutually exclusive")
+    if args.complete and args.reopen:
+        raise CliError("bulk: --complete and --reopen are mutually exclusive")
+    has_action = any(
+        (
+            args.due is not None,
+            args.clear_due,
+            args.tag_add,
+            args.tag_rm,
+            args.est is not None,
+            args.move_project,
+            args.complete,
+            args.reopen,
+        )
+    )
+    if not has_action and not args.dry_run:
+        raise CliError("bulk: nothing to do (pass an action or --dry-run)")
+
+    client, store = _ctx()
+    d = client.get()
+    est = render.parse_duration(args.est) if args.est else None
+
+    selected = _bulk_select(d, args)
+    if not selected:
+        print("bulk: no tasks matched", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        entities = d["state"]["task"]["entities"]
+        render.print_tasks(d, [entities[t] for t in selected])
+        print(f"(dry run: {len(selected)} task(s), nothing written)")
+        return 0
+    if len(selected) > 10 and not _confirm(
+        f"apply to {len(selected)} task(s)?", args.yes
+    ):
+        print("aborted", file=sys.stderr)
+        return 1
+
+    skipped: list[str] = []
+
+    def _apply(dd, b):
+        # Selection is recomputed here, not reused from the snapshot above: on
+        # a 412 retry the closure runs against a freshly downloaded file.
+        state = dd["state"]
+        entities = state["task"]["entities"]
+        tids = _bulk_select(dd, args)
+        due_day = _parse_day(args.due, dd) if args.due else None
+        add_ids = [q.resolve_tag(dd, ref) for ref in (args.tag_add or [])]
+        rm_ids = [q.resolve_tag(dd, ref) for ref in (args.tag_rm or [])]
+        target_project = (
+            q.resolve_project(dd, args.move_project) if args.move_project else None
+        )
+        skipped.clear()
+        for tid in tids:
+            task = entities[tid]
+            changes: dict = {}
+            if due_day is not None:
+                changes["dueDay"] = due_day
+            if args.clear_due:
+                changes["dueDay"] = None
+                changes["dueWithTime"] = None
+                changes["remindAt"] = None
+            if est is not None:
+                changes["timeEstimate"] = est
+            # Already-done / already-open tasks are left alone: a no-op HU
+            # would only rewrite doneOn.
+            if args.complete and not task.get("isDone"):
+                changes["isDone"] = True
+                changes["doneOn"] = now_ms()
+            if args.reopen and task.get("isDone"):
+                changes["isDone"] = False
+                changes["doneOn"] = None
+            if changes:
+                mut.update_task(dd, b, tid, changes)
+            if add_ids or rm_ids:
+                mut.tag_task(dd, b, tid, add=add_ids, remove=rm_ids)
+            if target_project is not None:
+                if task.get("parentId"):
+                    skipped.append(tid)  # a subtask follows its parent
+                elif task.get("projectId") != target_project:
+                    mut.move_to_project(dd, b, tid, target_project)
+
+    store.commit([_apply], initial=d)
+    for tid in skipped:
+        print(
+            f"skipped {render.short_id(tid)}: subtask, move its parent",
+            file=sys.stderr,
+        )
+    print(f"bulk: {len(selected)} task(s)")
     return 0
 
 
@@ -2666,13 +2810,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="parse '!<date>' as a deadline even when shortSyntax.isEnableDeadline is off",
     )
 
-    s = add("edit", cmd_edit, "edit a task")
-    s.add_argument("id")
-    s.add_argument("--title")
+    s = add("edit", cmd_edit, "edit one or more tasks")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--title", help="only with a single id")
     s.add_argument("--notes")
     s.add_argument("--append-notes")
     s.add_argument("--est")
     s.add_argument("--due", help="YYYY-MM-DD; empty string clears")
+
+    s = add("bulk", cmd_bulk, "apply one change to many tasks")
+    s.add_argument("ids", nargs="*")
+    s.add_argument("--project", help="selector: tasks of this project")
+    s.add_argument("--tag", help="selector: tasks with this tag")
+    s.add_argument("--overdue", action="store_true", help="selector")
+    s.add_argument("--search", help="selector: title/notes substring")
+    s.add_argument("--done", action="store_true", help="selector: only done tasks")
+    s.add_argument("--all", action="store_true", help="selector: include done tasks")
+    s.add_argument("--due", help="YYYY-MM-DD | today | tomorrow | +N")
+    s.add_argument("--clear-due", action="store_true")
+    s.add_argument("--tag-add", action="append", metavar="TAG")
+    s.add_argument("--tag-rm", action="append", metavar="TAG")
+    s.add_argument("--est", help="e.g. 30m, 1.5h")
+    s.add_argument("--move-project", metavar="PROJECT")
+    s.add_argument("--complete", action="store_true")
+    s.add_argument("--reopen", action="store_true")
+    s.add_argument("--dry-run", action="store_true", help="print the selection only")
+    s.add_argument("--yes", action="store_true", help="skip the >10 tasks prompt")
 
     s = add("complete", cmd_complete, "mark done")
     s.add_argument("ids", nargs="+")
