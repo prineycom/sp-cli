@@ -113,6 +113,8 @@ pip install requests
 
 ```sh
 ./sp notes [--project P] [--today] [--json]   # --today — закреплённые на сегодня
+                                              # `./sp note` без подкоманды = ./sp notes
+                                              # --project: порядок как в приложении (project.noteIds)
 ./sp note add "Текст" [--project P] [--pin]   # печатает id
 ./sp note show <id> [--json]
 ./sp note edit <id> [--content T | --append T] [--pin|--unpin] [--color '#a05db1']

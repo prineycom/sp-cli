@@ -707,7 +707,29 @@ class TestNotes:
 
     def test_update_pin_twice_does_not_duplicate(self, sample, b):
         mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        n_ops = len(b.ops)
         mut.note_update(sample, b, "1" * 21, {"isPinnedToToday": True})
+        # A no-op pin must not reach the wire at all: SP's reducer prepends
+        # without dedupe, so the phone would end up with the id twice.
+        assert len(b.ops) == n_ops
+        assert self._note_reg(sample)["todayOrder"] == ["1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_update_no_op_unpin_emits_nothing(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a"))
+        n_ops = len(b.ops)
+        mut.note_update(sample, b, "1" * 21, {"isPinnedToToday": False})
+        assert len(b.ops) == n_ops
+        assert self._note_reg(sample)["todayOrder"] == []
+
+    def test_update_drops_redundant_pin_but_keeps_other_changes(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_update(
+            sample, b, "1" * 21, {"isPinnedToToday": True, "content": "b"}
+        )
+        changes = _last_op(b)["p"]["actionPayload"]["note"]["changes"]
+        assert "isPinnedToToday" not in changes
+        assert changes["content"] == "b"
         assert self._note_reg(sample)["todayOrder"] == ["1" * 21]
         assert_doctor_clean(sample)
 
@@ -748,6 +770,26 @@ class TestNotes:
         assert p["projectId"] == "INBOX_PROJECT"
         assert p["isPinnedToToday"] is True
         assert_doctor_clean(sample)
+
+    def test_delete_coerces_dangling_project_id_to_null(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "x", project_id="INBOX_PROJECT"))
+        # Simulate a note whose project vanished (SP's ND replay would
+        # dereference the missing project unguarded).
+        sample["state"]["note"]["entities"]["N" * 21]["projectId"] = "GONE"
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["noteIds"] = []
+        mut.note_delete(sample, b, "N" * 21)
+        assert _last_op(b)["p"]["actionPayload"]["projectId"] is None
+        assert sample["state"]["note"]["ids"] == []
+
+    def test_move_with_dangling_source_project_refuses(self, sample, b):
+        other = make_project("P" * 21, "Other")
+        mut.project_add(sample, b, other)
+        mut.note_add(sample, b, make_note("N" * 21, "x"))
+        sample["state"]["note"]["entities"]["N" * 21]["projectId"] = "GONE"
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError, match="doctor"):
+            mut.note_move(sample, b, "N" * 21, "P" * 21)
+        assert len(b.ops) == n_ops
 
     def test_move_payload_carries_old_project(self, sample, b):
         other = make_project("P" * 21, "Other")

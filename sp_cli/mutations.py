@@ -652,6 +652,16 @@ def note_update(d: dict, b: OpBuilder, note_id: str, changes: dict) -> None:
     reg = _note_reg(state)
     note = _note(state, note_id)
     changes = dict(changes)
+    # SP's reducer prepends [id, ...todayOrder] with NO dedupe, so re-pinning an
+    # already pinned note duplicates the id on the phone while our snapshot has
+    # it once. A pin flag equal to the current value carries no information —
+    # drop it (and its todayOrder churn) entirely.
+    if "isPinnedToToday" in changes and bool(changes["isPinnedToToday"]) == bool(
+        note.get("isPinnedToToday")
+    ):
+        del changes["isPinnedToToday"]
+    if not changes:
+        return  # nothing left to say: no op, no state change
     changes["modified"] = now_ms()
 
     b.op(
@@ -676,6 +686,12 @@ def note_delete(d: dict, b: OpBuilder, note_id: str) -> None:
     state = _state(d)
     reg = _note_reg(state)
     note = _note(state, note_id)
+    # SP's project reducer dereferences payload.projectId unguarded on replay,
+    # so a dangling projectId would crash the app. Coerce it to null: the note
+    # is not really in any project anyway.
+    project_id = note.get("projectId")
+    if project_id is not None and project_id not in state["project"]["entities"]:
+        project_id = None
     # Payload carries the pre-delete linkage for the cross-slice reducers.
     b.op(
         "ND",
@@ -684,7 +700,7 @@ def note_delete(d: dict, b: OpBuilder, note_id: str) -> None:
         note_id,
         {
             "id": note_id,
-            "projectId": note.get("projectId"),
+            "projectId": project_id,
             "isPinnedToToday": bool(note.get("isPinnedToToday")),
         },
     )
@@ -701,6 +717,14 @@ def note_move(d: dict, b: OpBuilder, note_id: str, target_project_id: str) -> No
     target = _project(state, target_project_id)
     if note.get("projectId") == target_project_id:
         raise MutationError(f"note is already in project {target_project_id}")
+    source_id = note.get("projectId")
+    if source_id is not None and source_id not in state["project"]["entities"]:
+        # NM replay dereferences the SOURCE project unguarded — refuse rather
+        # than ship an op that crashes the app.
+        raise MutationError(
+            f"note {note_id}: source project '{source_id}' does not exist; "
+            "run `sp doctor` and fix the note's project first"
+        )
 
     # The payload note keeps the OLD projectId — that is the source list.
     b.op(

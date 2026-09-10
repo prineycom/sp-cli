@@ -246,6 +246,13 @@ def list_notes(
     if project is not None:
         pid = resolve_project(d, project)
         notes = [n for n in notes if n.get("projectId") == pid]
+        if not today:
+            # The app shows a project's notes in project.noteIds order; any
+            # note missing from that list keeps its note.ids position at the end.
+            proj = (d["state"]["project"]["entities"].get(pid) or {})
+            order = proj.get("noteIds") or []
+            rank = {nid: i for i, nid in enumerate(order)}
+            notes.sort(key=lambda n: rank.get(n["id"], len(order)))
     return notes
 
 
@@ -430,7 +437,10 @@ def doctor(d: dict) -> list[str]:
             problems.append(f"note {nid}: in todayOrder but not pinned")
 
     for pid, project in state["project"]["entities"].items():
-        for nid in project.get("noteIds", []):
+        note_id_list = project.get("noteIds", [])
+        if len(set(note_id_list)) != len(note_id_list):
+            problems.append(f"project {pid}: noteIds has duplicate ids")
+        for nid in note_id_list:
             if nid not in note_ids:
                 problems.append(f"project {pid}: noteIds references missing note {nid}")
             elif notes[nid].get("projectId") != pid:

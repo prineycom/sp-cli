@@ -1,6 +1,7 @@
 import pytest
 
 from sp_cli import cli
+from sp_cli import queries as q
 from sp_cli.model import make_tag
 
 
@@ -85,6 +86,161 @@ class TestNoteEditFlagRejection:
         )
         with pytest.raises(cli.CliError, match="mutually exclusive"):
             cli.cmd_note_edit(args)
+
+
+class TestNoteAliasAndColor:
+    def test_bare_note_is_notes(self):
+        assert cli._rewrite_argv(["note"]) == ["notes"]
+
+    def test_bare_note_with_flags_is_notes(self):
+        assert cli._rewrite_argv(["note", "--today", "--json"]) == [
+            "notes",
+            "--today",
+            "--json",
+        ]
+
+    @pytest.mark.parametrize("color", ["a05db1", "#a05db", "#a05db1x", "red", "#GGGGGG"])
+    def test_bad_color_exits_2(self, color):
+        # Validation runs before any config/network access.
+        assert cli.main(["note", "edit", "abc", "--color", color]) == 2
+
+    def test_good_color_passes_validation(self, fake_ctx, sample):
+        note = _seed_note(sample, "N" * 21, "hello")
+        args = _args(["note", "edit", note["id"], "--color", "#A05db1"])
+        assert cli.cmd_note_edit(args) == 0
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["note"]["changes"]
+        assert changes["backgroundColor"] == "#A05db1"
+
+
+def _args(argv):
+    return cli.build_parser().parse_args(cli._rewrite_argv(argv))
+
+
+def _seed_note(d, note_id, content, project_id=None, pinned=False):
+    from sp_cli.model import make_note
+
+    note = make_note(note_id, content, project_id=project_id, is_pinned_to_today=pinned)
+    reg = d["state"]["note"]
+    reg["ids"].insert(0, note_id)
+    reg["entities"][note_id] = note
+    if pinned:
+        reg["todayOrder"].insert(0, note_id)
+    if project_id:
+        d["state"]["project"]["entities"][project_id]["noteIds"].insert(0, note_id)
+    return note
+
+
+class _FakeCtx:
+    """Stand-in for cli._ctx(): no config, no network; records emitted ops."""
+
+    def __init__(self, d):
+        self.d = d
+        self.ops = []
+        self.commits = 0
+
+    # client side
+    def get(self):
+        return self.d
+
+    # store side
+    def commit(self, mutations, initial=None):
+        from sp_cli.ops import OpBuilder
+
+        d = initial if initial is not None else self.d
+        b = OpBuilder(d, "B_test01")
+        for fn in mutations:
+            fn(d, b)
+        if b.ops:
+            self.commits += 1
+            self.ops.extend(b.ops)
+        return d
+
+
+@pytest.fixture
+def fake_ctx(sample, monkeypatch):
+    ctx = _FakeCtx(sample)
+    monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+    return ctx
+
+
+class TestNoteCommands:
+    def test_add_prints_id_and_emits_na(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_note_add(_args(["note", "add", "hello", "--pin"]))
+        assert rc == 0
+        printed = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "NA"
+        assert op["d"] == printed
+        assert sample["state"]["note"]["todayOrder"] == [printed]
+
+    def test_add_with_project(self, fake_ctx, sample):
+        assert cli.cmd_note_add(_args(["note", "add", "x", "--project", "inbox"])) == 0
+        note = fake_ctx.ops[-1]["p"]["actionPayload"]["note"]
+        assert note["projectId"] == "INBOX_PROJECT"
+
+    def test_edit_append_joins_with_newline(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "line1")
+        assert cli.cmd_note_edit(_args(["note", "edit", "N" * 21, "--append", "line2"])) == 0
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["note"]["changes"]
+        assert changes["content"] == "line1\nline2"
+
+    def test_edit_append_on_empty_note_has_no_leading_newline(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "")
+        cli.cmd_note_edit(_args(["note", "edit", "N" * 21, "--append", "first"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["note"]["changes"]
+        assert changes["content"] == "first"
+
+    def test_edit_nothing_to_change_raises(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "x")
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_note_edit(_args(["note", "edit", "N" * 21]))
+
+    def test_edit_redundant_pin_writes_nothing(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "x", pinned=True)
+        assert cli.cmd_note_edit(_args(["note", "edit", "N" * 21, "--pin"])) == 0
+        assert fake_ctx.ops == []
+        assert sample["state"]["note"]["todayOrder"] == ["N" * 21]
+
+    def test_rm_abort_writes_nothing(self, fake_ctx, sample, monkeypatch, capsys):
+        _seed_note(sample, "N" * 21, "keep me")
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        rc = cli.cmd_note_rm(_args(["note", "rm", "N" * 21]))
+        assert rc == 1
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        assert "aborted" in capsys.readouterr().err
+        assert sample["state"]["note"]["ids"] == ["N" * 21]
+
+    def test_rm_yes_deletes(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "bye", project_id="INBOX_PROJECT")
+        assert cli.cmd_note_rm(_args(["note", "rm", "N" * 21, "--yes"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "ND"
+        assert sample["state"]["note"]["ids"] == []
+
+    def test_rm_confirmed_interactively_deletes(self, fake_ctx, sample, monkeypatch):
+        _seed_note(sample, "N" * 21, "bye")
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        assert cli.cmd_note_rm(_args(["note", "rm", "N" * 21])) == 0
+        assert fake_ctx.ops[-1]["a"] == "ND"
+
+    def test_rm_unknown_id_raises(self, fake_ctx, sample):
+        with pytest.raises(q.NotFoundError):
+            cli.cmd_note_rm(_args(["note", "rm", "zzzz", "--yes"]))
+
+    def test_move_emits_nm(self, fake_ctx, sample):
+        from sp_cli.model import make_project
+
+        proj = make_project("P" * 21, "Other")
+        sample["state"]["project"]["ids"].append(proj["id"])
+        sample["state"]["project"]["entities"][proj["id"]] = proj
+        _seed_note(sample, "N" * 21, "x", project_id="INBOX_PROJECT")
+        assert cli.cmd_note_move(_args(["note", "move", "N" * 21, "--project", "Other"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "NM"
+        assert op["p"]["actionPayload"]["targetProjectId"] == "P" * 21
+
+    def test_move_to_same_project_is_exit_2(self, fake_ctx, sample):
+        _seed_note(sample, "N" * 21, "x", project_id="INBOX_PROJECT")
+        assert cli.main(["note", "move", "N" * 21, "--project", "inbox"]) == 2
 
 
 class TestBoardArgvRewrites:

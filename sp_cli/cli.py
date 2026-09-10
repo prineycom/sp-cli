@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import re
 import sys
 
 from sp_cli import mutations as mut
@@ -36,6 +37,9 @@ class CliError(Exception):
 
 
 # ---------------------------------------------------------------- helpers
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
 
 def _ctx() -> tuple[SyncFileClient, SyncStore]:
     cfg = load_config()
@@ -798,6 +802,10 @@ def cmd_note_edit(args) -> int:
         raise CliError("note edit: --pin and --unpin are mutually exclusive")
     if args.content is not None and args.append is not None:
         raise CliError("note edit: --content and --append are mutually exclusive")
+    if args.color is not None and not _HEX_COLOR_RE.match(args.color):
+        raise CliError(
+            f"note edit: --color must be a hex color like '#a05db1' (got {args.color!r})"
+        )
     client, store = _ctx()
     d = client.get()
     nid = q.resolve_note(d, args.id)
@@ -1142,6 +1150,9 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
         return [_SUBCOMMAND_REWRITES_3[tuple(argv[:3])]] + argv[3:]
     if len(argv) >= 2 and (argv[0], argv[1]) in _SUBCOMMAND_REWRITES:
         return [_SUBCOMMAND_REWRITES[(argv[0], argv[1])]] + argv[2:]
+    # bare `sp note [--flags]` == `sp notes`
+    if argv[:1] == ["note"] and (len(argv) == 1 or argv[1].startswith("-")):
+        return ["notes"] + argv[1:]
     return argv
 
 

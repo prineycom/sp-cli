@@ -317,6 +317,34 @@ class TestNotes:
         _add_note(sample, "2" * 21, "loose")
         assert [n["id"] for n in q.list_notes(sample, project="inbox")] == ["1" * 21]
 
+    def test_list_notes_by_project_uses_project_note_ids_order(self, sample):
+        _add_note(sample, "1" * 21, "a", project_id="INBOX_PROJECT")
+        _add_note(sample, "2" * 21, "b", project_id="INBOX_PROJECT")
+        inbox = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        # The app's manual order differs from note.ids order.
+        inbox["noteIds"] = ["1" * 21, "2" * 21]
+        assert [n["id"] for n in q.list_notes(sample, project="inbox")] == [
+            "1" * 21,
+            "2" * 21,
+        ]
+
+    def test_list_notes_by_project_appends_notes_missing_from_note_ids(self, sample):
+        _add_note(sample, "1" * 21, "a", project_id="INBOX_PROJECT")
+        _add_note(sample, "2" * 21, "b", project_id="INBOX_PROJECT")
+        inbox = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        inbox["noteIds"] = ["2" * 21]  # "1" missing from the app's list
+        assert [n["id"] for n in q.list_notes(sample, project="inbox")] == [
+            "2" * 21,
+            "1" * 21,
+        ]
+
+    def test_doctor_detects_duplicate_project_note_ids(self, sample):
+        _add_note(sample, "N" * 21, "a", project_id="INBOX_PROJECT")
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["noteIds"].append(
+            "N" * 21
+        )
+        assert any("noteIds has duplicate ids" in p for p in q.doctor(sample))
+
     def test_doctor_detects_dangling_today_order(self, sample):
         sample["state"]["note"]["todayOrder"].append("ghost")
         assert any("todayOrder" in p and "ghost" in p for p in q.doctor(sample))
