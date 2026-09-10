@@ -15,6 +15,7 @@ CLI (Python 3.11+, stdlib + `requests`) для управления Super Produc
 - `sp_cli/ops.py` — operation log: recentOps, vectorClock, action-коды SP
 - `sp_cli/mutations.py` — чистые мутации state (create/update/delete/plan/...)
 - `sp_cli/cli.py` — argparse-команды
+- `sp_cli/mcp_server.py` — MCP stdio-сервер: инструменты `sp_*` генерируются интроспекцией `build_parser()`, выполнение через `cli.main(argv)` in-process (обёртка `./sp-mcp`, skill — `integrations/skill/`)
 
 ## Критичные инварианты
 

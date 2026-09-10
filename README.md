@@ -21,6 +21,14 @@ CLI (Python) → WebDAV (GET/PUT /superproductivity/sync-data.json) → теле
 - [docs/sp-plugin-contracts.md](docs/sp-plugin-contracts.md) — ранний research по контрактам плагина (research-доки выше новее и точнее)
 - [docs/sample-sync-data.json](docs/sample-sync-data.json) — образец реального sync-файла
 
+## Интеграция с агентами (MCP + skill)
+
+Весь функционал CLI доступен агентам (Claude Code, Codex, Cursor, ...) как MCP-инструменты: сервер `./sp-mcp` (stdio, чистый stdlib) генерирует инструменты `sp_*` интроспекцией argparse-парсера — покрытие всегда 1:1 с командами. В комплекте skill с рабочими приёмами для агента. Подключение и детали: [integrations/README.md](integrations/README.md).
+
+```bash
+claude mcp add superproductivity -- /path/to/sp-cli/sp-mcp
+```
+
 ## Установка / требования
 
 - Python 3.11+
@@ -547,7 +555,7 @@ env `SP_CLI_TIMER`), а по сети уходит только натиканн
 ## Тестирование
 
 ```sh
-python3 -m pytest tests/ -q    # 604 unit-теста, без сети
+python3 -m pytest tests/ -q    # 1101 тест: юниты без сети + MCP e2e на loopback
 ```
 
 Плюс интеграционный свип против тестового WebDAV-сервера (копия live-файла) и проверка, что настоящий SP подхватывает изменения синком.

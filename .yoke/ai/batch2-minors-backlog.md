@@ -45,3 +45,10 @@
 6. XA payload не проверен точным dict; нет assert entityChanges==[].
 7. _attachment_list мутирует state на read-путях.
 8. attach T --title -x криво риврайтится (узко).
+
+## Из ревью b3-mcp-agents (2026-09-10)
+
+- `_ctx()` в cli.py создаёт `requests.Session` на каждый вызов и никогда не
+  закрывает — для one-shot CLI неважно, но долгоживущий MCP-сервер оставляет
+  сокеты до GC. Фикс: context-manager вокруг `_ctx` или `session.close()` в
+  конце команды.
