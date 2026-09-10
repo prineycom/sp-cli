@@ -1770,3 +1770,90 @@ class TestArchivedCommands:
         with pytest.raises(q.NotFoundError):
             cli.cmd_restore(_args(["restore", t["id"]]))
         assert fake_ctx.ops == []
+
+
+class TestHardDeleteCommands:
+    @staticmethod
+    def _seed_project(sample):
+        from sp_cli.model import make_project, make_task
+
+        proj = make_project("P" * 21, "Doomed")
+        sample["state"]["project"]["ids"].append(proj["id"])
+        sample["state"]["project"]["entities"][proj["id"]] = proj
+        task = make_task("T" * 21, "doomed task", proj["id"])
+        sample["state"]["task"]["ids"].append(task["id"])
+        sample["state"]["task"]["entities"][task["id"]] = task
+        proj["taskIds"].append(task["id"])
+        return proj
+
+    def test_project_rm_yes_emits_hpd(self, fake_ctx, sample, capsys):
+        self._seed_project(sample)
+        assert cli.cmd_project_rm(_args(["project", "rm", "Doomed", "--yes"])) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["d"]) == ("HPD", "P" * 21)
+        assert op["p"]["actionPayload"]["projectDeleteWins"] is True
+        assert "P" * 21 not in sample["state"]["project"]["entities"]
+        assert "T" * 21 not in sample["state"]["task"]["entities"]
+
+    def test_project_rm_prompt_warns_tasks_are_not_archived(
+        self, fake_ctx, sample, monkeypatch
+    ):
+        self._seed_project(sample)
+        seen = []
+        monkeypatch.setattr("builtins.input", lambda p: seen.append(p) or "n")
+        assert cli.cmd_project_rm(_args(["project", "rm", "Doomed"])) == 1
+        assert "NOT archived" in seen[0]
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+
+    def test_project_rm_inbox_is_refused(self, fake_ctx, sample):
+        with pytest.raises(cli.CliError, match="Inbox"):
+            cli.cmd_project_rm(_args(["project", "rm", "inbox", "--yes"]))
+        assert fake_ctx.ops == []
+
+    def test_tag_rm_yes_emits_gd(self, fake_ctx, sample):
+        tag = make_tag("G" * 21, "doomed")
+        sample["state"]["tag"]["ids"].append(tag["id"])
+        sample["state"]["tag"]["entities"][tag["id"]] = tag
+        assert cli.cmd_tag_rm(_args(["tag", "rm", "doomed", "--yes"])) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["GD"]
+        assert fake_ctx.ops[-1]["p"]["actionPayload"] == {"id": "G" * 21}
+        assert "G" * 21 not in sample["state"]["tag"]["entities"]
+
+    def test_tag_rm_system_tag_is_refused(self, fake_ctx, sample):
+        with pytest.raises(cli.CliError, match="built-in"):
+            cli.cmd_tag_rm(_args(["tag", "rm", "TODAY", "--yes"]))
+        assert fake_ctx.ops == []
+
+    def test_tag_rm_abort_writes_nothing(self, fake_ctx, sample, monkeypatch):
+        tag = make_tag("G" * 21, "doomed")
+        sample["state"]["tag"]["ids"].append(tag["id"])
+        sample["state"]["tag"]["entities"][tag["id"]] = tag
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert cli.cmd_tag_rm(_args(["tag", "rm", "doomed"])) == 1
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        assert "G" * 21 in sample["state"]["tag"]["entities"]
+
+    def test_repeat_rm_yes_emits_hrc(self, fake_ctx, sample):
+        sample["state"]["taskRepeatCfg"] = {
+            "ids": ["R" * 21],
+            "entities": {
+                "R" * 21: {"id": "R" * 21, "title": "daily", "projectId": None,
+                           "tagIds": []}
+            },
+        }
+        assert cli.cmd_repeat_rm(_args(["repeat", "rm", "daily", "--yes"])) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"], op["d"]) == ("HRC", "TASK_REPEAT_CFG", "R" * 21)
+        assert op["p"]["actionPayload"] == {"taskRepeatCfgId": "R" * 21}
+        assert sample["state"]["taskRepeatCfg"]["ids"] == []
+
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["project", "rm", "x"], "project-rm"),
+            (["tag", "rm", "x"], "tag-rm"),
+            (["repeat", "rm", "x"], "repeat-rm"),
+        ],
+    )
+    def test_subcommand_rewrites(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected

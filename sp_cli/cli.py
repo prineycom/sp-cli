@@ -940,6 +940,46 @@ def cmd_project_archive(args) -> int:
     return 0
 
 
+def cmd_project_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    pid = q.resolve_project(d, args.id)
+    if pid == INBOX_PROJECT_ID:
+        raise CliError("the Inbox project cannot be deleted")
+    project = d["state"]["project"]["entities"][pid]
+    tasks = [t for t in q.all_tasks(d) if t.get("projectId") == pid]
+    notes = [
+        n
+        for n in q.all_notes(d)
+        if n.get("projectId") == pid or n["id"] in project.get("noteIds", [])
+    ]
+    archived = [
+        tid
+        for tid in q.archived_task_ids(d)
+        if (q.archived_task(d, tid) or {}).get("projectId") == pid
+    ]
+    what = (
+        f"DELETE project '{project.get('title', pid)}' with "
+        f"{len(tasks)} task(s), {len(archived)} archived task(s) and "
+        f"{len(notes)} note(s)? Tasks are deleted, NOT archived"
+    )
+    if not _confirm(what, args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    result: list[tuple[list, list]] = []
+
+    def _rm(dd, b):
+        result.append(mut.project_delete(dd, b, pid))
+
+    store.commit([_rm], initial=d)
+    deleted_tasks, deleted_notes = result[0]
+    print(
+        f"deleted {pid} ({len(deleted_tasks)} task(s), "
+        f"{len(deleted_notes)} note(s))"
+    )
+    return 0
+
+
 def cmd_tags(args) -> int:
     client, _ = _ctx()
     d = client.get()
@@ -987,6 +1027,52 @@ def cmd_tag_edit(args) -> int:
 
     store.commit([_edit], initial=d)
     print(f"updated {tag_id}")
+    return 0
+
+
+def cmd_tag_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tag_id = q.resolve_tag(d, args.id)
+    if tag_id in mut.SYSTEM_TAG_IDS:
+        raise CliError(f"'{tag_id}' is a built-in tag and cannot be deleted")
+    tag = d["state"]["tag"]["entities"][tag_id]
+    tagged = [t for t in q.all_tasks(d) if tag_id in (t.get("tagIds") or [])]
+    what = (
+        f"delete tag '{tag.get('title', tag_id)}' and remove it from "
+        f"{len(tagged)} task(s)?"
+    )
+    if not _confirm(what, args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    orphaned: list[list[str]] = []
+
+    def _rm(dd, b):
+        orphaned.append(mut.tag_delete(dd, b, tag_id))
+
+    store.commit([_rm], initial=d)
+    extra = f", deleted {len(orphaned[0])} orphaned task(s)" if orphaned[0] else ""
+    print(f"deleted {tag_id}{extra}")
+    return 0
+
+
+def cmd_repeat_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cfg_id = q.resolve_repeat_cfg(d, args.id)
+    cfg = d["state"]["taskRepeatCfg"]["entities"][cfg_id]
+    linked = [
+        t for t in q.all_tasks(d) if t.get("repeatCfgId") == cfg_id
+    ]
+    what = (
+        f"delete repeat config '{cfg.get('title', cfg_id)}' and unlink "
+        f"{len(linked)} task(s)? (existing tasks are kept)"
+    )
+    if not _confirm(what, args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    store.commit([lambda dd, b: mut.repeat_delete(dd, b, cfg_id)], initial=d)
+    print(f"deleted {cfg_id}")
     return 0
 
 
@@ -1930,8 +2016,11 @@ _SUBCOMMAND_REWRITES = {
     ("project", "add"): "project-add",
     ("project", "edit"): "project-edit",
     ("project", "archive"): "project-archive",
+    ("project", "rm"): "project-rm",
     ("tag", "new"): "tag-new",
     ("tag", "edit"): "tag-edit",
+    ("tag", "rm"): "tag-rm",
+    ("repeat", "rm"): "repeat-rm",
     ("backlog", "add"): "backlog-add",
     ("backlog", "rm"): "backlog-rm",
     ("backlog", "clear"): "backlog-clear",
@@ -2205,6 +2294,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--start-date")
 
+    s = add("repeat-rm", cmd_repeat_rm, "delete a repeat config (tasks are kept)")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+
     s = add("repeats", cmd_repeats, "list repeat configs")
     s.add_argument("--json", action="store_true")
 
@@ -2227,6 +2320,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s = add("project-archive", cmd_project_archive, "archive a project")
     s.add_argument("id")
+    s = add(
+        "project-rm",
+        cmd_project_rm,
+        "DELETE a project with all its tasks and notes (not archived)",
+    )
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
 
     s = add("tags", cmd_tags, "list tags")
     s.add_argument("--json", action="store_true")
@@ -2237,6 +2337,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s.add_argument("--title")
     s.add_argument("--color")
+    s = add("tag-rm", cmd_tag_rm, "delete a tag (removed from every task)")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
 
     s = add("notes", cmd_notes, "list notes")
     s.add_argument("--project")

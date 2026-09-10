@@ -178,6 +178,31 @@ def resolve_tag(d: dict, ref: str) -> str:
     return _resolve_named(d, "tag", ref, "tag")
 
 
+def all_repeat_cfgs(d: dict) -> list[dict]:
+    reg = d["state"].get("taskRepeatCfg") or {}
+    entities = reg.get("entities") or {}
+    return [entities[cid] for cid in reg.get("ids", []) if cid in entities]
+
+
+def resolve_repeat_cfg(d: dict, ref: str) -> str:
+    """By exact id, then by title, then by id prefix (ids are nanoids)."""
+    cfgs = all_repeat_cfgs(d)
+    ids = [c["id"] for c in cfgs]
+    if ref in ids:
+        return ref
+    by_title = [c["id"] for c in cfgs if (c.get("title") or "").lower() == ref.lower()]
+    if len(by_title) == 1:
+        return by_title[0]
+    if len(by_title) > 1:
+        raise AmbiguousIdError(ref, by_title)
+    matches = _prefix_matches(ids, ref)
+    if not matches:
+        raise NotFoundError(f"no repeat config with id or title '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
 # ---------------------------------------------------------------- membership
 
 def is_today_member(task: dict, today: str | None = None) -> bool:

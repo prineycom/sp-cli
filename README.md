@@ -139,6 +139,8 @@ restoreToToday?}`): задача возвращается вместе со вс
              [--start-time HH:MM] [--start-date YYYY-MM-DD] \
              [--remind AtStart|m5|m10|m15|m30|h1]
 ./sp repeats [--json]          # список repeat-конфигов
+./sp repeat rm <cfg-id|title> [--yes]   # удалить repeat-конфиг; сами задачи остаются,
+                                        # ссылка repeatCfgId снимается (живые + архив)
 ```
 
 ### Проекты и теги
@@ -149,10 +151,21 @@ restoreToToday?}`): задача возвращается вместе со вс
 ./sp project edit <id> [--title T] [--color C] [--hide] \
                        [--enable-backlog|--disable-backlog]
 ./sp project archive <id>
+./sp project rm <id> [--yes]   # ПОЛНОЕ удаление проекта
 ./sp tags [--json]
 ./sp tag new "Title" [--color C]
 ./sp tag edit <id> [--title T] [--color C]
+./sp tag rm <id> [--yes]       # удалить тег; он снимается со всех задач
 ```
+
+⚠️ `project rm` удаляет проект целиком: все его задачи (включая сабтаски и бэклог),
+заметки, секции и уже заархивированные задачи проекта — **БЕЗ архивации**,
+восстановить их нельзя. Нужен мягкий вариант — `project archive`.
+Inbox удалить нельзя.
+
+`tag rm` тег только снимается с задач, сами задачи остаются (кроме задачи вообще без
+тегов, проекта и родителя — правило SP удаляет её вместе с сабтасками).
+Системные теги (`TODAY`, `EM_URGENT`, `EM_IMPORTANT`, `KANBAN_IN_PROGRESS`) удалить нельзя.
 
 ### Заметки
 

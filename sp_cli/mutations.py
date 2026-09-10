@@ -800,6 +800,266 @@ def tag_task(
         update_task(d, b, task_id, {"tagIds": new_tags})
 
 
+# ----------------------------------------------------------- full deletes
+
+# Tags SP creates itself and relies on; deleting one breaks the app's own
+# views (Today list, Eisenhower board, Kanban board).
+SYSTEM_TAG_IDS = (
+    TODAY_TAG_ID,
+    "EM_URGENT",
+    "EM_IMPORTANT",
+    "KANBAN_IN_PROGRESS",
+)
+
+
+def _prune_menu_nodes(nodes: list, kind: str, entity_id: str) -> list:
+    """Drop every `{k: kind, id: entity_id}` node, recursing into folders."""
+    out: list = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            out.append(node)
+            continue
+        if node.get("k") == "f":
+            children = node.get("children")
+            node["children"] = _prune_menu_nodes(
+                children if isinstance(children, list) else [], kind, entity_id
+            )
+            out.append(node)
+            continue
+        if node.get("k") == kind and node.get("id") == entity_id:
+            continue
+        out.append(node)
+    return out
+
+
+def _menu_tree_prune(state: dict, kind: str, entity_id: str) -> None:
+    """Prune the sidebar tree ('p' = projectTree, 't' = tagTree)."""
+    tree = state.get("menuTree")
+    if not isinstance(tree, dict):
+        return
+    key = "projectTree" if kind == "p" else "tagTree"
+    nodes = tree.get(key)
+    if isinstance(nodes, list):
+        tree[key] = _prune_menu_nodes(nodes, kind, entity_id)
+
+
+def _time_tracking_maps(d: dict) -> list[dict]:
+    """Every timeTracking map in the file: live plus both archive blobs
+    (top-level and under `state`, exactly like archive_task_blobs)."""
+    state = d["state"] if isinstance(d.get("state"), dict) else {}
+    maps: list[dict] = []
+    for holder in (state, d):
+        tt = holder.get("timeTracking")
+        if isinstance(tt, dict) and not any(tt is m for m in maps):
+            maps.append(tt)
+    for _key, blob in _archive_blobs(d):
+        tt = blob.get("timeTracking")
+        if isinstance(tt, dict) and not any(tt is m for m in maps):
+            maps.append(tt)
+    return maps
+
+
+def _archive_blobs(d: dict) -> list[tuple[str, dict]]:
+    """The archiveYoung/archiveOld containers themselves (not their task
+    registries) — top-level and under `state`, both kept."""
+    state = d["state"] if isinstance(d.get("state"), dict) else {}
+    out: list[tuple[str, dict]] = []
+    for key in ("archiveYoung", "archiveOld"):
+        for blob in (d.get(key), state.get(key)):
+            if isinstance(blob, dict):
+                out.append((key, blob))
+    return out
+
+
+def project_delete(d: dict, b: OpBuilder, project_id: str) -> tuple[list, list]:
+    """HPD: delete a project outright — tasks and notes go with it, NOT to
+    the archive. Returns (deleted task ids, deleted note ids).
+
+    The payload carries `projectDeleteWins: True` as a TOP-LEVEL key: without
+    it a concurrent project update from another device resurrects the project
+    during conflict resolution.
+
+    allTaskIds is taskIds + backlogTaskIds + their subTaskIds, as SP builds
+    it, plus any live task that claims the project only via `projectId` —
+    including those keeps the receivers' cascade identical to ours instead of
+    stranding a task whose project no longer exists. Same for noteIds.
+    """
+    state = _state(d)
+    project = _project(state, project_id)
+    if project_id == INBOX_PROJECT_ID:
+        raise MutationError("the Inbox project cannot be deleted")
+
+    tasks = state["task"]["entities"]
+    all_task_ids: list[str] = []
+
+    def _push(tid: str) -> None:
+        if tid not in all_task_ids:
+            all_task_ids.append(tid)
+
+    for tid in list(project.get("taskIds", [])) + list(
+        project.get("backlogTaskIds", [])
+    ):
+        _push(tid)
+        for sid in (tasks.get(tid) or {}).get("subTaskIds", []):
+            _push(sid)
+    for tid in list(state["task"]["ids"]):
+        task = tasks.get(tid) or {}
+        if task.get("projectId") != project_id:
+            continue
+        _push(tid)
+        for sid in task.get("subTaskIds", []):
+            _push(sid)
+
+    note_reg = _note_reg(state)
+    note_ids = list(project.get("noteIds", []))
+    for nid in note_reg["ids"]:
+        note = note_reg["entities"].get(nid) or {}
+        if note.get("projectId") == project_id and nid not in note_ids:
+            note_ids.append(nid)
+
+    b.op(
+        "HPD",
+        "DEL",
+        "PROJECT",
+        project_id,
+        {
+            "projectId": project_id,
+            "noteIds": list(note_ids),
+            "allTaskIds": list(all_task_ids),
+            "projectDeleteWins": True,
+        },
+    )
+
+    # tasks: registry + every list that could reference them
+    for tid in all_task_ids:
+        _reg_remove(state["task"], tid)
+    for proj in state["project"]["entities"].values():
+        for tid in all_task_ids:
+            _list_remove(proj.setdefault("taskIds", []), tid)
+            _list_remove(proj.setdefault("backlogTaskIds", []), tid)
+    for tag in state["tag"]["entities"].values():
+        for tid in all_task_ids:
+            _list_remove(tag.setdefault("taskIds", []), tid)
+    _planner_purge(state, all_task_ids)
+
+    # notes
+    for nid in note_ids:
+        _reg_remove(note_reg, nid)
+        _list_remove(note_reg["todayOrder"], nid)
+
+    # sections of the project
+    sections = state.get("section")
+    if isinstance(sections, dict) and isinstance(sections.get("entities"), dict):
+        sections.setdefault("ids", [])
+        for sid, section in list(sections["entities"].items()):
+            if isinstance(section, dict) and section.get("projectId") == project_id:
+                _reg_remove(sections, sid)
+
+    _menu_tree_prune(state, "p", project_id)
+
+    for provider in ((state.get("issueProvider") or {}).get("entities") or {}).values():
+        if provider.get("defaultProjectId") == project_id:
+            provider["defaultProjectId"] = None
+
+    # archived tasks of the project (the archive handler does this on devices)
+    for _key, reg in archive_task_blobs(d):
+        for tid, task in list(reg["entities"].items()):
+            if task.get("projectId") == project_id:
+                reg["entities"].pop(tid, None)
+                _list_remove(reg.setdefault("ids", []), tid)
+
+    _reg_remove(state["project"], project_id)
+    return all_task_ids, note_ids
+
+
+def tag_delete(d: dict, b: OpBuilder, tag_id: str) -> list[str]:
+    """GD: delete a tag. ONE op — the whole cascade is re-derived on every
+    receiver, so companion ops would double-apply. Returns the ids of the
+    tasks the orphan rule hard-deleted along with it.
+
+    Cascade order is SP's: strip the tag off tasks; hard-delete a task left
+    with no tags, no project and no parent (with its subtasks); filter repeat
+    cfgs (dropping one left with neither tags nor project); drop the tag's
+    time-tracking bucket; filter issue-provider defaults; remove the entity;
+    prune the sidebar tree; strip the tag out of the archives too.
+    """
+    state = _state(d)
+    _tag(state, tag_id)
+    if tag_id in SYSTEM_TAG_IDS:
+        raise MutationError(f"'{tag_id}' is a built-in tag and cannot be deleted")
+
+    b.op("GD", "DEL", "TAG", tag_id, {"id": tag_id})
+
+    orphans: list[str] = []
+    for tid in list(state["task"]["ids"]):
+        task = state["task"]["entities"].get(tid)
+        if task is None or tag_id not in task.get("tagIds", []):
+            continue
+        task["tagIds"] = [t for t in task["tagIds"] if t != tag_id]
+        if not task["tagIds"] and not task.get("projectId") and not task.get("parentId"):
+            orphans.append(tid)
+    for tid in orphans:
+        _cascade_remove_task(state, tid)
+
+    cfg_reg = state.get("taskRepeatCfg")
+    if isinstance(cfg_reg, dict) and isinstance(cfg_reg.get("entities"), dict):
+        for cid, cfg in list(cfg_reg["entities"].items()):
+            if tag_id not in (cfg.get("tagIds") or []):
+                continue
+            cfg["tagIds"] = [t for t in cfg["tagIds"] if t != tag_id]
+            if not cfg["tagIds"] and not cfg.get("projectId"):
+                _reg_remove(cfg_reg, cid)
+
+    for tt in _time_tracking_maps(d):
+        by_tag = tt.get("tag")
+        if isinstance(by_tag, dict):
+            by_tag.pop(tag_id, None)
+
+    for provider in ((state.get("issueProvider") or {}).get("entities") or {}).values():
+        defaults = provider.get("defaultTagIds")
+        if isinstance(defaults, list) and tag_id in defaults:
+            provider["defaultTagIds"] = [t for t in defaults if t != tag_id]
+
+    _reg_remove(state["tag"], tag_id)
+    _menu_tree_prune(state, "t", tag_id)
+
+    for entities in archive_task_entity_maps(d):
+        for task in entities.values():
+            if tag_id in (task.get("tagIds") or []):
+                task["tagIds"] = [t for t in task["tagIds"] if t != tag_id]
+
+    return orphans
+
+
+def repeat_delete(d: dict, b: OpBuilder, cfg_id: str) -> None:
+    """HRC: delete a repeat config and unlink every task pointing at it.
+
+    Payload key is `taskRepeatCfgId`, not `id`. RD/RDM only drop the entity
+    and would leave every generated task holding a dangling repeatCfgId.
+    """
+    state = _state(d)
+    reg = state.get("taskRepeatCfg")
+    if not isinstance(reg, dict) or cfg_id not in (reg.get("entities") or {}):
+        raise MutationError(f"repeat config not found: {cfg_id}")
+
+    b.op(
+        "HRC",
+        "DEL",
+        "TASK_REPEAT_CFG",
+        cfg_id,
+        {"taskRepeatCfgId": cfg_id},
+    )
+
+    for task in state["task"]["entities"].values():
+        if task.get("repeatCfgId") == cfg_id:
+            task.pop("repeatCfgId", None)
+    for entities in archive_task_entity_maps(d):
+        for task in entities.values():
+            if task.get("repeatCfgId") == cfg_id:
+                task.pop("repeatCfgId", None)
+    _reg_remove(reg, cfg_id)
+
+
 # ---------------------------------------------------------------- notes
 
 def _note_reg(state: dict) -> dict:

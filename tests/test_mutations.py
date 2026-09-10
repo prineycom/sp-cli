@@ -2351,3 +2351,289 @@ class TestRestore:
         self._seed(sample, subs=1)
         mut.restore_task(sample, b, "R" * 21)
         assert [op["a"] for op in b.ops] == ["HR"]
+
+
+class TestProjectDelete:
+    @staticmethod
+    def _seed(sample, b):
+        """A project with a task + subtask, a backlog task, a note, a section,
+        a menu-tree node (inside a folder), an archived task and a provider
+        default pointing at it."""
+        state = sample["state"]
+        proj = make_project("P" * 21, "Doomed")
+        proj["isEnableBacklog"] = True
+        mut.project_add(sample, b, proj)
+
+        root = make_task("T" * 21, "root", "P" * 21)
+        mut.add_task(sample, b, root)
+        mut.add_subtask(sample, b, "T" * 21, make_task("S" * 21, "sub", "P" * 21))
+        backlog = make_task("B" * 21, "backlog one", "P" * 21)
+        mut.add_task(sample, b, backlog, to_backlog=True)
+        mut.tag_add(sample, b, make_tag("G" * 21, "kept tag"))
+        mut.add_tag_to_task(sample, b, "T" * 21, "G" * 21)
+        mut.plan_for_day(sample, b, "T" * 21, today_str())
+        mut.note_add(sample, b, make_note("N" * 21, "note", project_id="P" * 21))
+
+        state["section"] = {
+            "ids": ["SEC1", "SEC2"],
+            "entities": {
+                "SEC1": {"id": "SEC1", "projectId": "P" * 21},
+                "SEC2": {"id": "SEC2", "projectId": "INBOX_PROJECT"},
+            },
+        }
+        state["menuTree"] = {
+            "projectTree": [
+                {"id": "INBOX_PROJECT", "k": "p"},
+                {
+                    "k": "f",
+                    "name": "folder",
+                    "children": [{"id": "P" * 21, "k": "p"}],
+                },
+            ],
+            "tagTree": [],
+        }
+        state["archiveYoung"]["task"] = {
+            "ids": ["A" * 21, "K" * 21],
+            "entities": {
+                "A" * 21: make_task("A" * 21, "archived", "P" * 21),
+                "K" * 21: make_task("K" * 21, "kept", "INBOX_PROJECT"),
+            },
+        }
+        provider = make_issue_provider("I" * 21, "ICAL", defaultProjectId="P" * 21)
+        mut.provider_add(sample, b, provider)
+        return proj
+
+    def test_payload_and_cascade(self, sample, b):
+        self._seed(sample, b)
+        n_ops = len(b.ops)
+        task_ids, note_ids = mut.project_delete(sample, b, "P" * 21)
+
+        assert [o["a"] for o in b.ops[n_ops:]] == ["HPD"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "HPD", "DEL", "PROJECT", "P" * 21,
+        )
+        p = op["p"]["actionPayload"]
+        assert p["projectId"] == "P" * 21
+        # the marker is a TOP-LEVEL payload key
+        assert p["projectDeleteWins"] is True
+        assert p["noteIds"] == ["N" * 21]
+        assert set(p["allTaskIds"]) == {"T" * 21, "S" * 21, "B" * 21}
+        assert set(task_ids) == {"T" * 21, "S" * 21, "B" * 21}
+        assert note_ids == ["N" * 21]
+
+        state = sample["state"]
+        assert "P" * 21 not in state["project"]["entities"]
+        assert "P" * 21 not in state["project"]["ids"]
+        for tid in ("T" * 21, "S" * 21, "B" * 21):
+            assert tid not in state["task"]["entities"]
+            assert tid not in state["task"]["ids"]
+        assert state["tag"]["entities"]["G" * 21]["taskIds"] == []
+        assert _today_order(sample) == []
+        assert state["planner"]["days"] == {}
+        assert state["note"]["ids"] == []
+        assert state["section"]["ids"] == ["SEC2"]
+        assert state["menuTree"]["projectTree"][1]["children"] == []
+        assert state["issueProvider"]["entities"]["I" * 21]["defaultProjectId"] is None
+        arch = state["archiveYoung"]["task"]
+        assert arch["ids"] == ["K" * 21]
+        assert "A" * 21 not in arch["entities"]
+        assert_doctor_clean(sample)
+
+    def test_subtasks_are_in_all_task_ids(self, sample, b):
+        self._seed(sample, b)
+        mut.project_delete(sample, b, "P" * 21)
+        assert "S" * 21 in _last_op(b)["p"]["actionPayload"]["allTaskIds"]
+
+    def test_task_linked_only_by_project_id_is_included(self, sample, b):
+        self._seed(sample, b)
+        stray = make_task("X" * 21, "stray", "P" * 21)
+        sample["state"]["task"]["ids"].append("X" * 21)
+        sample["state"]["task"]["entities"]["X" * 21] = stray
+        mut.project_delete(sample, b, "P" * 21)
+        assert "X" * 21 in _last_op(b)["p"]["actionPayload"]["allTaskIds"]
+        assert "X" * 21 not in sample["state"]["task"]["entities"]
+        assert_doctor_clean(sample)
+
+    def test_inbox_is_refused(self, sample, b):
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError, match="Inbox"):
+            mut.project_delete(sample, b, "INBOX_PROJECT")
+        assert len(b.ops) == n_ops
+
+    def test_unknown_project_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="project not found"):
+            mut.project_delete(sample, b, "Z" * 21)
+
+
+class TestTagDelete:
+    @staticmethod
+    def _seed(sample, b):
+        state = sample["state"]
+        mut.tag_add(sample, b, make_tag("G" * 21, "doomed"))
+        mut.tag_add(sample, b, make_tag("H" * 21, "kept"))
+        task = make_task("T" * 21, "tagged", "INBOX_PROJECT")
+        mut.add_task(sample, b, task)
+        mut.add_tag_to_task(sample, b, "T" * 21, "G" * 21)
+        mut.add_tag_to_task(sample, b, "T" * 21, "H" * 21)
+
+        state["taskRepeatCfg"] = {
+            "ids": ["C1", "C2"],
+            "entities": {
+                # no project: dropped once its last tag goes
+                "C1": {"id": "C1", "title": "c1", "projectId": None,
+                       "tagIds": ["G" * 21]},
+                # has a project: survives, just loses the tag
+                "C2": {"id": "C2", "title": "c2", "projectId": "INBOX_PROJECT",
+                       "tagIds": ["G" * 21, "H" * 21]},
+            },
+        }
+        state["timeTracking"] = {
+            "project": {},
+            "tag": {"G" * 21: {"2026-01-01": {"s": 1}}, "H" * 21: {}},
+        }
+        state["archiveYoung"]["task"] = {
+            "ids": ["A" * 21],
+            "entities": {
+                "A" * 21: make_task(
+                    "A" * 21, "archived", "INBOX_PROJECT",
+                    tag_ids=["G" * 21, "H" * 21],
+                )
+            },
+        }
+        state["archiveYoung"]["timeTracking"] = {
+            "project": {},
+            "tag": {"G" * 21: {"2025-01-01": {"s": 2}}},
+        }
+        state["menuTree"] = {
+            "projectTree": [],
+            "tagTree": [
+                {"k": "f", "name": "grp", "children": [{"id": "G" * 21, "k": "t"}]},
+                {"id": "H" * 21, "k": "t"},
+            ],
+        }
+        mut.provider_add(
+            sample, b,
+            make_issue_provider("I" * 21, "ICAL", defaultTagIds=["G" * 21, "H" * 21]),
+        )
+
+    def test_single_op_and_full_cascade(self, sample, b):
+        self._seed(sample, b)
+        n_ops = len(b.ops)
+        orphans = mut.tag_delete(sample, b, "G" * 21)
+
+        # exactly one op: the cascade is derived on every receiver
+        assert [o["a"] for o in b.ops[n_ops:]] == ["GD"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("GD", "DEL", "TAG", "G" * 21)
+        assert op["p"]["actionPayload"] == {"id": "G" * 21}
+        assert "ds" not in op
+        assert orphans == []
+
+        state = sample["state"]
+        assert "G" * 21 not in state["tag"]["entities"]
+        assert "G" * 21 not in state["tag"]["ids"]
+        assert _task(sample, "T" * 21)["tagIds"] == ["H" * 21]
+        assert "C1" not in state["taskRepeatCfg"]["entities"]
+        assert state["taskRepeatCfg"]["entities"]["C2"]["tagIds"] == ["H" * 21]
+        assert "G" * 21 not in state["timeTracking"]["tag"]
+        assert "G" * 21 not in state["archiveYoung"]["timeTracking"]["tag"]
+        assert state["archiveYoung"]["task"]["entities"]["A" * 21]["tagIds"] == [
+            "H" * 21
+        ]
+        assert state["issueProvider"]["entities"]["I" * 21]["defaultTagIds"] == [
+            "H" * 21
+        ]
+        assert state["menuTree"]["tagTree"][0]["children"] == []
+        assert state["menuTree"]["tagTree"][1]["id"] == "H" * 21
+        assert_doctor_clean(sample)
+
+    @pytest.mark.parametrize(
+        "tag_id", ["TODAY", "EM_URGENT", "EM_IMPORTANT", "KANBAN_IN_PROGRESS"]
+    )
+    def test_system_tags_are_refused(self, sample, b, tag_id):
+        if tag_id not in sample["state"]["tag"]["entities"]:
+            mut.tag_add(sample, b, make_tag(tag_id, tag_id.lower()))
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError, match="built-in"):
+            mut.tag_delete(sample, b, tag_id)
+        assert len(b.ops) == n_ops
+
+    def test_orphan_rule_hard_deletes_task_with_subtasks(self, sample, b):
+        """A task left with no tags, no project and no parent goes, with its
+        subtasks. Our own data always carries a projectId — this is the
+        synthetic case SP's cascade covers."""
+        self._seed(sample, b)
+        state = sample["state"]
+        orphan = make_task("O" * 21, "orphan", "INBOX_PROJECT", tag_ids=["G" * 21])
+        orphan["projectId"] = None
+        orphan["subTaskIds"] = ["U" * 21]
+        sub = make_task("U" * 21, "orphan sub", "INBOX_PROJECT", parent_id="O" * 21)
+        sub["projectId"] = None
+        for t in (orphan, sub):
+            state["task"]["ids"].append(t["id"])
+            state["task"]["entities"][t["id"]] = t
+        state["tag"]["entities"]["G" * 21]["taskIds"].append("O" * 21)
+
+        orphans = mut.tag_delete(sample, b, "G" * 21)
+        assert orphans == ["O" * 21]
+        assert "O" * 21 not in state["task"]["entities"]
+        assert "U" * 21 not in state["task"]["entities"]
+
+    def test_task_keeping_its_project_survives(self, sample, b):
+        self._seed(sample, b)
+        # the seeded task has a project: only the tag goes
+        assert mut.tag_delete(sample, b, "H" * 21) == []
+        assert "T" * 21 in sample["state"]["task"]["entities"]
+
+    def test_unknown_tag_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="tag not found"):
+            mut.tag_delete(sample, b, "Z" * 21)
+
+
+class TestRepeatDelete:
+    @staticmethod
+    def _seed(sample, b):
+        t = make_task("T" * 21, "repeating", "INBOX_PROJECT")
+        mut.add_task(sample, b, t)
+        mut.repeat_add(sample, b, "T" * 21, "R" * 21, repeat_cycle="DAILY")
+        sample["state"]["archiveYoung"]["task"] = {
+            "ids": ["A" * 21, "K" * 21],
+            "entities": {
+                "A" * 21: {
+                    **make_task("A" * 21, "archived instance", "INBOX_PROJECT"),
+                    "repeatCfgId": "R" * 21,
+                },
+                "K" * 21: {
+                    **make_task("K" * 21, "other", "INBOX_PROJECT"),
+                    "repeatCfgId": "OTHER",
+                },
+            },
+        }
+
+    def test_hrc_payload_key_and_refs_cleared(self, sample, b):
+        self._seed(sample, b)
+        n_ops = len(b.ops)
+        mut.repeat_delete(sample, b, "R" * 21)
+
+        assert [o["a"] for o in b.ops[n_ops:]] == ["HRC"]
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "HRC", "DEL", "TASK_REPEAT_CFG", "R" * 21,
+        )
+        # the payload key is taskRepeatCfgId, NOT id
+        assert op["p"]["actionPayload"] == {"taskRepeatCfgId": "R" * 21}
+
+        state = sample["state"]
+        assert "R" * 21 not in state["taskRepeatCfg"]["entities"]
+        assert "R" * 21 not in state["taskRepeatCfg"]["ids"]
+        assert "repeatCfgId" not in _task(sample, "T" * 21)
+        arch = state["archiveYoung"]["task"]["entities"]
+        assert "repeatCfgId" not in arch["A" * 21]
+        assert arch["K" * 21]["repeatCfgId"] == "OTHER"
+        assert "T" * 21 in state["task"]["entities"]  # the task itself is kept
+        assert_doctor_clean(sample)
+
+    def test_unknown_cfg_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="repeat config not found"):
+            mut.repeat_delete(sample, b, "Z" * 21)
