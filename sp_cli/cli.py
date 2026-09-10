@@ -10,6 +10,7 @@ import sys
 from sp_cli import mutations as mut
 from sp_cli import queries as q
 from sp_cli import render
+from sp_cli import timer
 from sp_cli.config import ConfigError, init_config, load_config
 from sp_cli.ids import nanoid
 from sp_cli.model import (
@@ -36,6 +37,7 @@ from sp_cli.model import (
     today_str,
 )
 from sp_cli.store import SyncStore
+from sp_cli.timer import TimerError
 from sp_cli.webdav import ConflictError, SyncFileClient, WebDavError
 
 
@@ -548,6 +550,113 @@ def cmd_track(args) -> int:
     date = _parse_day(args.date) if args.date else today_str()
     store.commit([lambda dd, b: mut.track_time(dd, b, tid, date, ms)], initial=d)
     print(f"tracked {render.format_duration(ms)} on {render.short_id(tid)} ({date})")
+    return 0
+
+
+def cmd_untrack(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    ms = render.parse_duration(args.duration)
+    date = _parse_day(args.date) if args.date else today_str()
+    store.commit([lambda dd, b: mut.untrack_time(dd, b, tid, date, ms)], initial=d)
+    print(f"untracked {render.format_duration(ms)} on {render.short_id(tid)} ({date})")
+    return 0
+
+
+# ---------------------------------------------------------------- live timer
+
+def _print_timer(running: dict) -> None:
+    elapsed = max(now_ms() - int(running["started_at"]), 0)
+    print(
+        f"{render.short_id(running['task_id'])} {running.get('title', '')}  "
+        f"{render.format_duration(elapsed)} "
+        f"(since {render.format_ts(running['started_at'])})"
+    )
+
+
+def _stop_timer(store, running: dict, initial: dict | None = None) -> int:
+    """Write the accrued time (one KT op per day, single batch), clear the
+    timer file, print the summary. Returns the tracked ms."""
+    tid = running["task_id"]
+    started = int(running["started_at"])
+    elapsed = now_ms() - started
+    if elapsed < timer.MIN_TRACK_MS:
+        print(
+            f"warning: elapsed {max(elapsed, 0) // 1000}s is under 1m; tracking 1m",
+            file=sys.stderr,
+        )
+        elapsed = timer.MIN_TRACK_MS
+    segments = timer.split_by_day(started, started + elapsed)
+    store.commit(
+        [
+            (lambda dd, b, day=day, ms=ms: mut.track_time(dd, b, tid, day, ms))
+            for day, ms in segments
+        ],
+        initial=initial,
+    )
+    timer.clear_timer()
+    total = sum(ms for _, ms in segments)
+    print(
+        f"stopped {render.short_id(tid)} {running.get('title', '')}: "
+        f"{render.format_duration(total)}"
+    )
+    if len(segments) > 1:
+        for day, ms in segments:
+            print(f"  {day}  {render.format_duration(ms)}")
+    return total
+
+
+def cmd_start(args) -> int:
+    running = timer.read_timer()
+    if not args.id:
+        if not running:
+            raise CliError("start: task id required (no timer running)")
+        _print_timer(running)
+        return 0
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    task = d["state"]["task"]["entities"][tid]
+    if task.get("isDone"):
+        raise CliError(f"task {render.short_id(tid)} is done; reopen it first")
+    if running:
+        if running["task_id"] == tid:
+            _print_timer(running)
+            return 0
+        _stop_timer(store, running, initial=d)
+    timer.write_timer(tid, task.get("title", ""), now_ms())
+    print(f"started {render.short_id(tid)} {task.get('title', '')}")
+    return 0
+
+
+def cmd_stop(args) -> int:
+    running = timer.read_timer()
+    if not running:
+        raise CliError("no timer running")
+    if args.discard:
+        timer.clear_timer()
+        print(f"discarded timer on {render.short_id(running['task_id'])}")
+        return 0
+    _, store = _ctx()
+    _stop_timer(store, running)
+    return 0
+
+
+def cmd_current(args) -> int:
+    running = timer.read_timer()
+    if not running:
+        if args.json:
+            render.print_json(None)
+        else:
+            print("no timer")
+        return 1
+    if args.json:
+        render.print_json(
+            {**running, "elapsed": max(now_ms() - int(running["started_at"]), 0)}
+        )
+        return 0
+    _print_timer(running)
     return 0
 
 
@@ -1855,6 +1964,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("duration", help="e.g. 30m, 1.5h")
     s.add_argument("--date", help="YYYY-MM-DD (default today)")
 
+    s = add("untrack", cmd_untrack, "remove tracked time (correction)")
+    s.add_argument("id")
+    s.add_argument("duration", help="e.g. 30m, 1.5h")
+    s.add_argument("--date", help="YYYY-MM-DD (default today)")
+
+    s = add("start", cmd_start, "start the local timer on a task")
+    s.add_argument("id", nargs="?", help="omit to show the running timer")
+    s = add("stop", cmd_stop, "stop the timer and track the elapsed time")
+    s.add_argument("--discard", action="store_true", help="drop it without tracking")
+    s = add("current", cmd_current, "show the running timer")
+    s.add_argument("--json", action="store_true")
+
     s = add("worklog", cmd_worklog, "time aggregation")
     s.add_argument("--from", dest="from")
     s.add_argument("--to")
@@ -2099,6 +2220,7 @@ def main(argv: list[str] | None = None) -> int:
         mut.MutationError,
         q.QueryError,
         render.RenderError,
+        TimerError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

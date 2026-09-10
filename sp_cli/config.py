@@ -11,7 +11,9 @@ from sp_cli.ids import new_client_id
 
 DEFAULT_CONFIG_PATH = "~/.config/sp-cli/config.toml"
 DEFAULT_FOLDER = "superproductivity"
-DEFAULT_BACKUP_DIR = "~/.local/share/sp-cli/backups"
+DEFAULT_DATA_DIR = "~/.local/share/sp-cli"
+DEFAULT_BACKUP_DIR = f"{DEFAULT_DATA_DIR}/backups"
+DEFAULT_TIMER_PATH = f"{DEFAULT_DATA_DIR}/timer.json"
 
 
 class ConfigError(Exception):
@@ -31,6 +33,13 @@ class Config:
 def config_path() -> Path:
     return Path(
         os.environ.get("SP_CLI_CONFIG") or os.path.expanduser(DEFAULT_CONFIG_PATH)
+    )
+
+
+def timer_path() -> Path:
+    """Local live-timer state file (never synced). Override via SP_CLI_TIMER."""
+    return Path(
+        os.environ.get("SP_CLI_TIMER") or os.path.expanduser(DEFAULT_TIMER_PATH)
     )
 
 

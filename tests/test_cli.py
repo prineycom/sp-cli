@@ -4,6 +4,7 @@ import pytest
 
 from sp_cli import cli
 from sp_cli import queries as q
+from sp_cli import timer
 from sp_cli.model import make_tag, today_str
 
 
@@ -1109,3 +1110,209 @@ class TestProviderCommands:
     def test_providers_empty(self, fake_ctx, capsys):
         assert cli.cmd_providers(_args(["providers"])) == 0
         assert capsys.readouterr().out.strip() == "(none)"
+
+
+# ---------------------------------------------------------------- live timer
+
+@pytest.fixture
+def timer_file(tmp_path, monkeypatch):
+    """Redirect the local timer file into tmp_path."""
+    path = tmp_path / "timer.json"
+    monkeypatch.setenv("SP_CLI_TIMER", str(path))
+    return path
+
+
+def _ms(y, mo, d, h, mi):
+    import datetime
+
+    return int(datetime.datetime(y, mo, d, h, mi).timestamp() * 1000)
+
+
+class TestTimerFile:
+    def test_write_read_clear_roundtrip(self, timer_file):
+        timer.write_timer("A" * 21, "hi", 1700000000000)
+        assert timer.read_timer() == {
+            "task_id": "A" * 21,
+            "title": "hi",
+            "started_at": 1700000000000,
+        }
+        assert timer.clear_timer() is True
+        assert timer.read_timer() is None
+        assert timer.clear_timer() is False
+
+    def test_write_is_atomic_and_leaves_no_tmp(self, timer_file):
+        timer.write_timer("A" * 21, "one", 1)
+        timer.write_timer("B" * 21, "two", 2)
+        assert timer.read_timer()["task_id"] == "B" * 21
+        assert [p.name for p in timer_file.parent.iterdir()] == ["timer.json"]
+
+    def test_corrupt_file_raises(self, timer_file):
+        timer_file.write_text("{not json", encoding="utf-8")
+        with pytest.raises(timer.TimerError):
+            timer.read_timer()
+
+    def test_wrong_shape_raises(self, timer_file):
+        timer_file.write_text('{"task_id": 3}', encoding="utf-8")
+        with pytest.raises(timer.TimerError):
+            timer.read_timer()
+
+
+class TestSplitByDay:
+    def test_single_day(self):
+        start = _ms(2026, 9, 9, 10, 0)
+        end = _ms(2026, 9, 9, 10, 30)
+        assert timer.split_by_day(start, end) == [("2026-09-09", 1800000)]
+
+    def test_across_midnight(self):
+        start = _ms(2026, 9, 8, 23, 50)
+        end = _ms(2026, 9, 9, 0, 20)
+        assert timer.split_by_day(start, end) == [
+            ("2026-09-08", 600000),
+            ("2026-09-09", 1200000),
+        ]
+
+    def test_three_days(self):
+        start = _ms(2026, 9, 8, 23, 0)
+        end = _ms(2026, 9, 10, 1, 0)
+        days = [d for d, _ in timer.split_by_day(start, end)]
+        assert days == ["2026-09-08", "2026-09-09", "2026-09-10"]
+
+    def test_empty_interval(self):
+        start = _ms(2026, 9, 9, 10, 0)
+        assert timer.split_by_day(start, start) == []
+
+
+class TestTimerCommands:
+    def _task(self, add_task_entity, **kw):
+        return add_task_entity(task_id="T" * 21, title="timed", **kw)
+
+    def test_start_writes_file_without_ops(self, fake_ctx, add_task_entity, timer_file):
+        t = self._task(add_task_entity)
+        assert cli.cmd_start(_args(["start", t["id"]])) == 0
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        running = timer.read_timer()
+        assert running["task_id"] == t["id"] and running["title"] == "timed"
+
+    def test_start_rejects_done_task(self, fake_ctx, add_task_entity, timer_file):
+        t = self._task(add_task_entity)
+        t["isDone"] = True
+        with pytest.raises(cli.CliError, match="done"):
+            cli.cmd_start(_args(["start", t["id"]]))
+        assert timer.read_timer() is None
+
+    def test_bare_start_shows_running(self, fake_ctx, timer_file, capsys):
+        timer.write_timer("T" * 21, "timed", cli.now_ms() - 3600000)
+        assert cli.cmd_start(_args(["start"])) == 0
+        assert "1h" in capsys.readouterr().out
+
+    def test_bare_start_without_timer_errors(self, fake_ctx, timer_file):
+        with pytest.raises(cli.CliError):
+            cli.cmd_start(_args(["start"]))
+
+    def test_start_same_task_keeps_timer(self, fake_ctx, add_task_entity, timer_file):
+        t = self._task(add_task_entity)
+        started = cli.now_ms() - 600000
+        timer.write_timer(t["id"], "timed", started)
+        assert cli.cmd_start(_args(["start", t["id"]])) == 0
+        assert fake_ctx.ops == []
+        assert timer.read_timer()["started_at"] == started
+
+    def test_start_auto_stops_previous(
+        self, fake_ctx, add_task_entity, timer_file, monkeypatch
+    ):
+        old = add_task_entity(task_id="O" * 21, title="old")
+        new = self._task(add_task_entity)
+        now = _ms(2026, 9, 9, 12, 0)
+        monkeypatch.setattr(cli, "now_ms", lambda: now)
+        timer.write_timer(old["id"], "old", now - 1800000)
+        assert cli.cmd_start(_args(["start", new["id"]])) == 0
+        assert len(fake_ctx.ops) == 1
+        op = fake_ctx.ops[0]
+        assert op["a"] == "KT"
+        assert op["p"]["actionPayload"] == {
+            "taskId": old["id"],
+            "date": "2026-09-09",
+            "duration": 1800000,
+        }
+        assert timer.read_timer()["task_id"] == new["id"]
+
+    def test_stop_emits_kt_and_clears_file(
+        self, fake_ctx, sample, add_task_entity, timer_file, monkeypatch, capsys
+    ):
+        t = self._task(add_task_entity)
+        now = _ms(2026, 9, 9, 15, 0)
+        monkeypatch.setattr(cli, "now_ms", lambda: now)
+        timer.write_timer(t["id"], "timed", now - 3600000)
+        assert cli.cmd_stop(_args(["stop"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "KT"
+        assert op["p"]["actionPayload"]["duration"] == 3600000
+        assert op["p"]["entityChanges"][0]["entityId"] == t["id"]
+        assert sample["state"]["task"]["entities"][t["id"]]["timeSpent"] == 3600000
+        assert timer.read_timer() is None
+        assert "1h" in capsys.readouterr().out
+
+    def test_stop_without_timer_errors(self, fake_ctx, timer_file):
+        with pytest.raises(cli.CliError, match="no timer"):
+            cli.cmd_stop(_args(["stop"]))
+
+    def test_stop_discard_writes_nothing(self, fake_ctx, timer_file):
+        timer.write_timer("T" * 21, "timed", cli.now_ms() - 600000)
+        assert cli.cmd_stop(_args(["stop", "--discard"])) == 0
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        assert timer.read_timer() is None
+
+    def test_stop_under_a_minute_tracks_one_minute(
+        self, fake_ctx, add_task_entity, timer_file, capsys
+    ):
+        t = self._task(add_task_entity)
+        timer.write_timer(t["id"], "timed", cli.now_ms() - 5000)
+        assert cli.cmd_stop(_args(["stop"])) == 0
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["duration"] == 60000
+        assert "under 1m" in capsys.readouterr().err
+
+    def test_stop_across_midnight_two_ops_one_batch(
+        self, fake_ctx, add_task_entity, timer_file, monkeypatch
+    ):
+        t = self._task(add_task_entity)
+        now = _ms(2026, 9, 9, 0, 20)
+        monkeypatch.setattr(cli, "now_ms", lambda: now)
+        timer.write_timer(t["id"], "timed", _ms(2026, 9, 8, 23, 50))
+        assert cli.cmd_stop(_args(["stop"])) == 0
+        assert fake_ctx.commits == 1
+        assert [op["a"] for op in fake_ctx.ops] == ["KT", "KT"]
+        assert [op["p"]["actionPayload"] for op in fake_ctx.ops] == [
+            {"taskId": t["id"], "date": "2026-09-08", "duration": 600000},
+            {"taskId": t["id"], "date": "2026-09-09", "duration": 1200000},
+        ]
+
+    def test_current_without_timer(self, timer_file, capsys):
+        assert cli.cmd_current(_args(["current"])) == 1
+        assert capsys.readouterr().out.strip() == "no timer"
+
+    def test_current_running(self, timer_file, capsys):
+        timer.write_timer("T" * 21, "timed", cli.now_ms() - 1800000)
+        assert cli.cmd_current(_args(["current"])) == 0
+        assert "30m" in capsys.readouterr().out
+
+    def test_current_json(self, timer_file, capsys):
+        started = cli.now_ms() - 60000
+        timer.write_timer("T" * 21, "timed", started)
+        assert cli.cmd_current(_args(["current", "--json"])) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["task_id"] == "T" * 21 and data["started_at"] == started
+        assert data["elapsed"] >= 60000
+
+
+class TestUntrackCommand:
+    def test_untrack_emits_tr(self, fake_ctx, add_task_entity, capsys):
+        t = add_task_entity(task_id="U" * 21, title="over")
+        assert cli.cmd_untrack(_args(["untrack", t["id"], "10m"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "TR"
+        assert op["p"]["actionPayload"] == {
+            "id": t["id"],
+            "date": today_str(),
+            "duration": 600000,
+        }
+        assert "untracked" in capsys.readouterr().out

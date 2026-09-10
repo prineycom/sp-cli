@@ -462,6 +462,42 @@ class TestTrackTime:
             mut.track_time(sample, b, t["id"], "2026-09-09", -5)
 
 
+class TestUntrackTime:
+    def test_untrack_op_shape_uses_id_key(self, sample, b, add_task_entity):
+        t = add_task_entity(title="untracked")
+        mut.track_time(sample, b, t["id"], "2026-09-09", 1800000)
+        mut.untrack_time(sample, b, t["id"], "2026-09-09", 600000)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("TR", "UPD", "TASK", t["id"])
+        assert op["p"]["actionPayload"] == {
+            "id": t["id"],
+            "date": "2026-09-09",
+            "duration": 600000,
+        }
+        task = _task(sample, t["id"])
+        assert task["timeSpentOnDay"]["2026-09-09"] == 1200000
+        assert task["timeSpent"] == 1200000
+        assert_doctor_clean(sample)
+
+    def test_untrack_clamps_at_zero(self, sample, b, add_task_entity):
+        t = add_task_entity(title="clamp")
+        mut.track_time(sample, b, t["id"], "2026-09-08", 600000)
+        mut.track_time(sample, b, t["id"], "2026-09-09", 600000)
+        mut.untrack_time(sample, b, t["id"], "2026-09-09", 99_000_000)
+        task = _task(sample, t["id"])
+        assert task["timeSpentOnDay"]["2026-09-09"] == 0
+        assert task["timeSpent"] == 600000
+
+    def test_untrack_rejects_negative(self, sample, b, add_task_entity):
+        t = add_task_entity(title="neg2")
+        with pytest.raises(mut.MutationError):
+            mut.untrack_time(sample, b, t["id"], "2026-09-09", -5)
+
+    def test_untrack_unknown_task_raises(self, sample, b):
+        with pytest.raises(mut.MutationError):
+            mut.untrack_time(sample, b, "Z" * 21, "2026-09-09", 5)
+
+
 class TestRepeat:
     def test_repeat_add(self, sample, b, add_task_entity):
         t = add_task_entity(title="daily thing")

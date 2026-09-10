@@ -483,6 +483,21 @@ def track_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) ->
     task["timeSpent"] = sum(int(v) for v in tsod.values())
 
 
+def untrack_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) -> None:
+    """Remove tracked time (correction). TR payload key is `id`, not `taskId`;
+    the reducer clamps at zero (max(x - duration, 0))."""
+    state = _state(d)
+    task = _task(state, task_id)
+    if not isinstance(duration, int) or duration < 0:
+        raise MutationError("untrack: duration must be a non-negative integer (ms)")
+
+    b.op("TR", "UPD", "TASK", task_id, {"id": task_id, "date": date, "duration": duration})
+
+    tsod = task.setdefault("timeSpentOnDay", {})
+    tsod[date] = max(int(tsod.get(date, 0)) - duration, 0)
+    task["timeSpent"] = sum(int(v) for v in tsod.values())
+
+
 # ---------------------------------------------------------------- repeat
 
 def repeat_add(
