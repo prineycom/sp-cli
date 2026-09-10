@@ -13,6 +13,7 @@ from sp_cli.model import (
     ISSUE_TASK_FIELDS,
     METRIC_DEAD_FIELDS,
     METRIC_FIELDS,
+    MONTHLY_ANCHOR_FIELDS,
     TODAY_TAG_ID,
     archive_task_blobs,
     archive_task_entity_maps,
@@ -1683,7 +1684,15 @@ def tag_delete(d: dict, b: OpBuilder, tag_id: str) -> list[str]:
     return orphans
 
 
-CLEARABLE_REPEAT_CFG_FIELDS = ("startTime", "remindAt", "defaultEstimate", "notes")
+CLEARABLE_REPEAT_CFG_FIELDS = (
+    "startTime",
+    "remindAt",
+    "defaultEstimate",
+    "notes",
+    # SP's MONTHLY_ANCHOR_RESET: absence is what these three mean, so a cadence
+    # change has to unset them rather than write a falsy value.
+    *MONTHLY_ANCHOR_FIELDS,
+)
 MAX_CLEARED_FIELDS = 32  # SP's applyClearedFields caps the wire list at 32
 
 

@@ -171,7 +171,8 @@ restoreToToday?}`): задача возвращается вместе со вс
 ./sp repeat edit <cfg-id|title> [--title T] [--every day|week|month|year] [--interval N] \
              [--days mon,thu] [--start-time HH:MM] [--start-date YYYY-MM-DD] \
              [--remind AtStart|m5|m10|m15|m30|h1] [--est 30m] [--notes N] \
-             [--pause|--resume] [--clear startTime,remindAt,defaultEstimate,notes]
+             [--pause|--resume] [--clear startTime,remindAt,defaultEstimate,notes,
+                                         monthlyWeekOfMonth,monthlyWeekday,monthlyLastDay]
 ./sp repeat skip <cfg-id|title> --date YYYY-MM-DD|today|tomorrow
 ./sp repeat rm <cfg-id|title> [--yes]   # удалить repeat-конфиг; сами задачи остаются,
                                         # ссылка repeatCfgId снимается (живые + архив)
@@ -180,9 +181,19 @@ restoreToToday?}`): задача возвращается вместе со вс
 `repeat edit` шлёт `RU`. Очистка полей — только через `--clear`: очищаемые ключи
 уходят сиблингом `clearedFields` рядом с `taskRepeatCfg` в actionPayload, потому
 что `changes: {startTime: undefined}` теряется при любой JSON-сериализации и на
-других устройствах превращается в no-op. Смена `--every/--days/--interval`
-пересчитывает `quickSetting`, `repeatCycle` и все семь weekday-флагов; кастомный
-набор дней сохраняется, если меняется только `--interval`.
+других устройствах превращается в no-op. `--clear startTime` заодно чистит
+`remindAt` (напоминание привязано к времени старта, как в диалоге SP).
+
+Смена `--every/--days/--interval` пересчитывает `quickSetting`, `repeatCycle` и
+— только для недельного цикла — семь weekday-флагов. Дни недели сохраняются
+всегда, если цикл не меняется (даже у конфигов, созданных в SP с пресетами
+`MONDAY_TO_FRIDAY`/`WEEKLY_CURRENT_WEEKDAY`), так что `--interval 2` на «только
+среда» остаётся «только средой». `quickSetting` всегда согласован с флагами:
+mon–fri → `MONDAY_TO_FRIDAY`, ровно один день → `WEEKLY_CURRENT_WEEKDAY`,
+остальное (и любой `--interval` ≠ 1) → `CUSTOM` — иначе SP при следующем
+сохранении диалога перепишет дни сам. Смена цикла чистит месячные якоря
+(`monthlyWeekOfMonth`, `monthlyWeekday`, `monthlyLastDay`) через `clearedFields`
+— это `MONTHLY_ANCHOR_RESET` из SP.
 
 `repeat skip` шлёт `RDI` (append-only, идемпотентно): дата попадает в
 `deletedInstanceDates` и будущий инстанс не создаётся. Уже созданную задачу это

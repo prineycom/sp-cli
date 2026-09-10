@@ -380,6 +380,14 @@ WEEKDAY_KEYS = [
 ]
 
 
+WORKDAY_KEYS = frozenset(WEEKDAY_KEYS[:5])
+
+# The monthly anchors SP's MONTHLY_ANCHOR_RESET wipes when a monthly preset is
+# (re)applied: their presence is what discriminates the monthly variants, so a
+# stale Nth-weekday / last-day flag would silently take effect.
+MONTHLY_ANCHOR_FIELDS = ("monthlyWeekOfMonth", "monthlyWeekday", "monthlyLastDay")
+
+
 def repeat_cadence_fields(
     repeat_cycle: str,
     repeat_every: int = 1,
@@ -390,20 +398,39 @@ def repeat_cadence_fields(
     Shared by cfg creation and `sp repeat edit` so an edited cadence lands on
     exactly the same field set SP would have written itself.
     days: weekday keys ('monday'...) — overrides the default mon-fri pattern.
+
+    quickSetting must agree with the weekday booleans, because SP re-derives the
+    cadence from the preset on every dialog save (getQuickSettingUpdates): a
+    cfg tagged WEEKLY_CURRENT_WEEKDAY but carrying mon-fri would be rewritten to
+    a single weekday behind the user's back. Hence, for a 1-week cycle:
+    mon-fri → MONDAY_TO_FRIDAY, exactly one day → WEEKLY_CURRENT_WEEKDAY,
+    anything else → CUSTOM. Every non-1 interval is CUSTOM (no preset has one).
     """
     if repeat_cycle not in _QUICK_SETTING:
         raise ValueError(f"invalid repeat cycle: {repeat_cycle}")
-    quick = _QUICK_SETTING[repeat_cycle]
-    if repeat_every != 1 or (days is not None and repeat_cycle == "WEEKLY"):
+    if repeat_every < 1:
+        raise ValueError(f"repeat interval must be >= 1: {repeat_every}")
+    weekdays = {
+        k: (k in days) if days is not None else (k in WORKDAY_KEYS) for k in WEEKDAY_KEYS
+    }
+    if repeat_every != 1:
         quick = "CUSTOM"
-    fields = {
+    elif repeat_cycle == "WEEKLY":
+        on = {k for k, v in weekdays.items() if v}
+        if on == WORKDAY_KEYS:
+            quick = "MONDAY_TO_FRIDAY"
+        elif len(on) == 1:
+            quick = "WEEKLY_CURRENT_WEEKDAY"
+        else:
+            quick = "CUSTOM"
+    else:
+        quick = _QUICK_SETTING[repeat_cycle]
+    return {
         "quickSetting": quick,
         "repeatCycle": repeat_cycle,
         "repeatEvery": repeat_every,
+        **weekdays,
     }
-    for k in WEEKDAY_KEYS:
-        fields[k] = (k in days) if days is not None else (k not in ("saturday", "sunday"))
-    return fields
 
 
 def make_repeat_cfg(

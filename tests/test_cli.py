@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 
 import pytest
@@ -1870,6 +1871,66 @@ def _seed_repeat_cfg(d, cfg_id="R" * 21, **extra):
     return cfg
 
 
+class TestRepeatCreateCli:
+    def test_weekly_single_day_gets_current_weekday_preset(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="gym")
+        cli.cmd_repeat(
+            _args(["repeat", t["id"], "--every", "week", "--days", "wed"])
+        )
+        cfg = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]
+        assert cfg["quickSetting"] == "WEEKLY_CURRENT_WEEKDAY"
+        assert cfg["wednesday"] is True and cfg["monday"] is False
+
+    def test_weekly_without_days_is_monday_to_friday(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        t = add_task_entity(title="standup")
+        cli.cmd_repeat(_args(["repeat", t["id"], "--every", "week"]))
+        cfg = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]
+        assert cfg["quickSetting"] == "MONDAY_TO_FRIDAY"
+
+    def test_start_time_normalized(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="pills")
+        cli.cmd_repeat(
+            _args(["repeat", t["id"], "--every", "day", "--start-time", "8:05"])
+        )
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["startTime"] == "08:05"
+
+    def test_invalid_start_time_refused(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="pills")
+        with pytest.raises(cli.CliError, match="invalid time"):
+            cli.cmd_repeat(
+                _args(["repeat", t["id"], "--every", "day", "--start-time", "25:99"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_interval_below_one_refused(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="pills")
+        with pytest.raises(cli.CliError, match=">= 1"):
+            cli.cmd_repeat(
+                _args(["repeat", t["id"], "--every", "day", "--interval", "0"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_days_on_non_weekly_refused(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="pills")
+        with pytest.raises(cli.CliError, match="--every week"):
+            cli.cmd_repeat(
+                _args(["repeat", t["id"], "--every", "month", "--days", "mon"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_remind_without_start_time_refused(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="pills")
+        with pytest.raises(cli.CliError, match="needs a start time"):
+            cli.cmd_repeat(
+                _args(["repeat", t["id"], "--every", "day", "--remind", "m10"])
+            )
+        assert fake_ctx.ops == []
+
+
 class TestRepeatEditCli:
     def test_pause_emits_ru(self, fake_ctx, sample):
         _seed_repeat_cfg(sample)
@@ -1900,6 +1961,8 @@ class TestRepeatEditCli:
         payload = fake_ctx.ops[-1]["p"]["actionPayload"]
         assert payload["clearedFields"] == ["startTime", "remindAt"]
         assert payload["taskRepeatCfg"]["changes"] == {}
+        # clearedFields is a SIBLING of taskRepeatCfg — nested it is ignored.
+        assert "clearedFields" not in payload["taskRepeatCfg"]
         cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
         assert "startTime" not in cfg and "remindAt" not in cfg
 
@@ -1916,6 +1979,7 @@ class TestRepeatEditCli:
                 _args(["repeat", "edit", "RRRR", "--start-time", "8:00",
                        "--clear", "startTime"])
             )
+        assert fake_ctx.ops == []
 
     def test_nothing_to_change_refused(self, fake_ctx, sample):
         _seed_repeat_cfg(sample)
@@ -1939,7 +2003,9 @@ class TestRepeatEditCli:
         _seed_repeat_cfg(sample)
         cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--every", "week"]))
         changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
-        assert changes["quickSetting"] == "WEEKLY_CURRENT_WEEKDAY"
+        # mon-fri booleans are exactly what MONDAY_TO_FRIDAY means — tagging them
+        # WEEKLY_CURRENT_WEEKDAY would make SP rewrite them to a single weekday.
+        assert changes["quickSetting"] == "MONDAY_TO_FRIDAY"
         assert changes["repeatEvery"] == 1
         assert changes["saturday"] is False and changes["monday"] is True
 
@@ -1955,6 +2021,103 @@ class TestRepeatEditCli:
         assert changes["quickSetting"] == "CUSTOM"
         assert changes["monday"] is True and changes["thursday"] is True
         assert changes["tuesday"] is False
+
+    def test_interval_keeps_weekdays_of_sp_authored_cfg(self, fake_ctx, sample):
+        # SP writes single-weekday cfgs as WEEKLY_CURRENT_WEEKDAY, not CUSTOM;
+        # a plain --interval change must still keep that weekday.
+        cfg = _seed_repeat_cfg(sample)
+        cfg.update(model.repeat_cadence_fields("WEEKLY", 1, ["wednesday"]))
+        assert cfg["quickSetting"] == "WEEKLY_CURRENT_WEEKDAY"
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--interval", "2"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["wednesday"] is True
+        assert changes["monday"] is False and changes["friday"] is False
+        assert changes["quickSetting"] == "CUSTOM"
+
+    def test_interval_on_mon_fri_cfg_keeps_mon_fri(self, fake_ctx, sample):
+        cfg = _seed_repeat_cfg(sample)
+        cfg.update(model.repeat_cadence_fields("WEEKLY", 1, None))
+        assert cfg["quickSetting"] == "MONDAY_TO_FRIDAY"
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--interval", "3"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["friday"] is True and changes["sunday"] is False
+        assert changes["quickSetting"] == "CUSTOM"
+
+    def test_non_weekly_edit_does_not_touch_weekdays(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--every", "month"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["quickSetting"] == "MONTHLY_CURRENT_DATE"
+        assert not any(k in changes for k in model.WEEKDAY_KEYS)
+
+    def test_switch_to_monthly_clears_anchors(self, fake_ctx, sample):
+        _seed_repeat_cfg(
+            sample, monthlyWeekOfMonth=2, monthlyWeekday=3, monthlyLastDay=True
+        )
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--every", "month"]))
+        payload = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert payload["clearedFields"] == [
+            "monthlyWeekOfMonth", "monthlyWeekday", "monthlyLastDay",
+        ]
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert not any(k in cfg for k in model.MONTHLY_ANCHOR_FIELDS)
+
+    def test_anchor_clear_skipped_when_cycle_unchanged(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample, monthlyLastDay=True)
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--interval", "2"]))
+        payload = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert "clearedFields" not in payload
+
+    def test_interval_below_one_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match=">= 1"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--interval", "0"]))
+        assert fake_ctx.ops == []
+
+    def test_days_on_non_weekly_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="--every week"):
+            cli.cmd_repeat_edit(
+                _args(["repeat", "edit", "RRRR", "--every", "month", "--days", "mon"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_clear_start_time_also_clears_remind(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--clear", "startTime"]))
+        payload = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert payload["clearedFields"] == ["startTime", "remindAt"]
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert "remindAt" not in cfg
+
+    def test_remind_without_start_time_refused(self, fake_ctx, sample):
+        cfg = _seed_repeat_cfg(sample)
+        del cfg["startTime"]
+        with pytest.raises(cli.CliError, match="needs a start time"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--remind", "m10"]))
+        assert fake_ctx.ops == []
+
+    def test_remind_with_start_time_in_same_edit_ok(self, fake_ctx, sample):
+        cfg = _seed_repeat_cfg(sample)
+        del cfg["startTime"]
+        cli.cmd_repeat_edit(
+            _args(["repeat", "edit", "RRRR", "--start-time", "8:00",
+                   "--remind", "m10"])
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes == {"startTime": "08:00", "remindAt": "m10"}
+
+    def test_invalid_start_time_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="invalid time"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--start-time", "25:99"]))
+        assert fake_ctx.ops == []
+
+    def test_empty_title_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="empty title"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--title", ""]))
+        assert fake_ctx.ops == []
 
     def test_scalar_flags(self, fake_ctx, sample):
         _seed_repeat_cfg(sample)
@@ -2008,10 +2171,25 @@ class TestRepeatSkipCli:
         cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
         assert cfg["deletedInstanceDates"] == ["2026-10-01"]
 
-    def test_skip_today_keyword(self, fake_ctx, sample):
+    def test_skip_today_keyword_is_logical_today(self, fake_ctx, sample):
         _seed_repeat_cfg(sample)
         cli.cmd_repeat_skip(_args(["repeat", "skip", "RRRR", "--date", "today"]))
-        assert fake_ctx.ops[-1]["p"]["actionPayload"]["dateStr"] == today_str()
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["dateStr"] == model.logical_today_str(
+            sample
+        )
+
+    def test_skip_today_honours_start_of_next_day(self, fake_ctx, sample, monkeypatch):
+        _seed_repeat_cfg(sample)
+        sample["state"].setdefault("globalConfig", {}).setdefault("misc", {})[
+            "startOfNextDayTime"
+        ] = "04:00"
+        # 02:00 wall clock is still "yesterday" for SP with a 04:00 day boundary.
+        two_am = dt.datetime(2026, 10, 2, 2, 0)
+        monkeypatch.setattr(
+            model, "now_ms", lambda: int(two_am.timestamp() * 1000)
+        )
+        cli.cmd_repeat_skip(_args(["repeat", "skip", "RRRR", "--date", "today"]))
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["dateStr"] == "2026-10-01"
 
 
 class TestRepeatsListing:

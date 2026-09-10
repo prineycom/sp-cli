@@ -811,6 +811,31 @@ class TestRepeat:
         assert cfg["tuesday"] is False
         assert cfg["quickSetting"] == "CUSTOM"
 
+    @pytest.mark.parametrize(
+        "cycle,every,days,expected",
+        [
+            ("WEEKLY", 1, None, "MONDAY_TO_FRIDAY"),
+            ("WEEKLY", 1, ["monday", "tuesday", "wednesday", "thursday", "friday"],
+             "MONDAY_TO_FRIDAY"),
+            ("WEEKLY", 1, ["wednesday"], "WEEKLY_CURRENT_WEEKDAY"),
+            ("WEEKLY", 1, ["monday", "thursday"], "CUSTOM"),
+            ("WEEKLY", 2, ["wednesday"], "CUSTOM"),
+            ("DAILY", 1, None, "DAILY"),
+            ("DAILY", 3, None, "CUSTOM"),
+            ("MONTHLY", 1, None, "MONTHLY_CURRENT_DATE"),
+            ("YEARLY", 1, None, "YEARLY_CURRENT_DATE"),
+        ],
+    )
+    def test_quick_setting_matches_weekdays(self, cycle, every, days, expected):
+        # A preset SP would re-derive differently (getQuickSettingUpdates) would
+        # silently rewrite the weekdays on the next dialog save.
+        fields = model.repeat_cadence_fields(cycle, every, days)
+        assert fields["quickSetting"] == expected
+
+    def test_interval_below_one_rejected(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            model.repeat_cadence_fields("DAILY", 0)
+
 
 class TestProjectsTags:
     def test_project_add(self, sample, b):

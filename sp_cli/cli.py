@@ -18,6 +18,7 @@ from sp_cli.model import (
     INBOX_PROJECT_ID,
     ISSUE_PROVIDER_DEFAULT_CFG,
     ISSUE_PROVIDER_URL_FIELD,
+    MONTHLY_ANCHOR_FIELDS,
     PANEL_SORT_BY,
     SCHEDULED_STATE,
     SIMPLE_COUNTER_TYPES,
@@ -63,9 +64,15 @@ def _ctx() -> tuple[SyncFileClient, SyncStore]:
     return client, SyncStore(client, cfg.client_id)
 
 
-def _parse_day(text: str) -> str:
+def _parse_day(text: str, d: dict | None = None) -> str:
+    """Resolve a day expression. With `d`, 'today' is SP's LOGICAL today
+    (misc.startOfNextDay*) instead of the wall-clock date."""
     text = text.strip()
-    today = datetime.date.today()
+    today = (
+        datetime.date.fromisoformat(logical_today_str(d))
+        if d is not None
+        else datetime.date.today()
+    )
     if text == "today":
         return today.isoformat()
     if text == "tomorrow":
@@ -929,7 +936,13 @@ def cmd_repeat(args) -> int:
     d = client.get()
     tid = q.resolve_task(d, args.id)
     cycle = _CYCLES[args.every]
+    _check_interval(args.interval)
     days = _parse_days(args.days) if args.days else None
+    if days is not None and cycle != "WEEKLY":
+        raise CliError("--days only applies to a weekly cadence (use --every week)")
+    start_time = _parse_clock(args.start_time)
+    if args.remind and not start_time:
+        raise CliError("--remind needs a start time (pass --start-time HH:MM)")
     start_date = _parse_day(args.start_date) if args.start_date else None
     cfg_id = nanoid()
     store.commit(
@@ -943,7 +956,7 @@ def cmd_repeat(args) -> int:
                 repeat_every=args.interval,
                 days=days,
                 start_date=start_date,
-                start_time=args.start_time,
+                start_time=start_time,
                 remind_at=args.remind,
             )
         ],
@@ -960,25 +973,53 @@ def _parse_days(text: str) -> list[str]:
         raise CliError(f"invalid weekday {e} (use mon,tue,...)") from None
 
 
+def _check_interval(interval: int | None) -> None:
+    if interval is not None and interval < 1:
+        raise CliError("--interval must be >= 1")
+
+
+def _parse_clock(text: str | None) -> str | None:
+    """Normalize a HH:MM clock string ('8:00' -> '08:00'); None passes through.
+    SP stores startTime as a zero-padded clock string and compares it as text."""
+    if text is None:
+        return None
+    try:
+        return datetime.datetime.strptime(text.strip(), "%H:%M").strftime("%H:%M")
+    except ValueError:
+        raise CliError(f"invalid time '{text}' (use HH:MM, 24h)") from None
+
+
 def _cadence_changes(cfg: dict, args) -> dict:
     """Recompute quickSetting/repeatCycle/repeatEvery/weekdays for an edit.
 
-    Unspecified parts fall back to the config's current cadence; the weekday
-    list is only carried over when it was custom, so a plain --interval change
-    keeps custom days while a plain --every switch resets to the SP default.
+    Unspecified parts fall back to the config's current cadence, and that
+    includes the weekday booleans: SP-authored cfgs express their weekdays
+    through the MONDAY_TO_FRIDAY / WEEKLY_CURRENT_WEEKDAY presets just as much
+    as through CUSTOM, so `--interval 2` on a Wednesday-only cfg must stay
+    Wednesday-only whatever its quickSetting says. Only an actual cycle switch
+    (no --days given) falls back to SP's mon-fri default.
     """
     cycle = _CYCLES[args.every] if args.every else cfg.get("repeatCycle", "DAILY")
+    _check_interval(args.interval)
     every = args.interval if args.interval is not None else int(cfg.get("repeatEvery", 1))
     if args.days:
         days = _parse_days(args.days)
-    elif cycle == "WEEKLY" and cfg.get("quickSetting") == "CUSTOM":
+        if cycle != "WEEKLY":
+            raise CliError("--days only applies to a weekly cadence (use --every week)")
+    elif cycle == cfg.get("repeatCycle"):
         days = [k for k in WEEKDAY_KEYS if cfg.get(k)]
     else:
         days = None
     try:
-        return repeat_cadence_fields(cycle, every, days)
+        fields = repeat_cadence_fields(cycle, every, days)
     except ValueError as e:
         raise CliError(str(e)) from None
+    if cycle != "WEEKLY":
+        # Weekday booleans are inert outside a weekly cycle — don't clobber the
+        # ones the cfg carries for a cadence the user may switch back to.
+        for k in WEEKDAY_KEYS:
+            fields.pop(k, None)
+    return fields
 
 
 def cmd_repeat_edit(args) -> int:
@@ -990,12 +1031,21 @@ def cmd_repeat_edit(args) -> int:
     cfg = d["state"]["taskRepeatCfg"]["entities"][cfg_id]
 
     changes: dict = {}
+    anchor_reset: list[str] = []
     if args.every or args.days or args.interval is not None:
         changes.update(_cadence_changes(cfg, args))
-    if args.title:
+        if changes["repeatCycle"] != cfg.get("repeatCycle"):
+            # SP's MONTHLY_ANCHOR_RESET: the monthly anchors mean something only
+            # for the cadence they were picked for, and their presence is the
+            # discriminator — a cycle switch has to unset them, not zero them.
+            anchor_reset = [f for f in MONTHLY_ANCHOR_FIELDS if f in cfg]
+    if args.title is not None:
+        if not args.title.strip():
+            raise CliError("empty title")
         changes["title"] = args.title
-    if args.start_time:
-        changes["startTime"] = args.start_time
+    start_time = _parse_clock(args.start_time)
+    if start_time:
+        changes["startTime"] = start_time
     if args.remind:
         changes["remindAt"] = args.remind
     if args.est:
@@ -1024,6 +1074,19 @@ def cmd_repeat_edit(args) -> int:
                 raise CliError(f"'{name}' is both set and cleared")
             cleared.append(name)
 
+    # A reminder is anchored to the start time: SP's dialog drops remindAt
+    # whenever the cfg has no startTime, so clearing one clears the other.
+    if "startTime" in cleared and "remindAt" not in cleared:
+        if "remindAt" in changes:
+            raise CliError("'remindAt' is both set and cleared (clearing startTime)")
+        cleared.append("remindAt")
+    if args.remind and "startTime" not in changes and not cfg.get("startTime"):
+        raise CliError("--remind needs a start time (pass --start-time HH:MM)")
+
+    for field in anchor_reset:
+        if field not in cleared and field not in changes:
+            cleared.append(field)
+
     if not changes and not cleared:
         raise CliError("nothing to change")
 
@@ -1039,13 +1102,17 @@ def cmd_repeat_skip(args) -> int:
     client, store = _ctx()
     d = client.get()
     cfg_id = q.resolve_repeat_cfg(d, args.id)
-    day = _parse_day(args.date)
+    # 'today' is SP's logical today — a skip typed after midnight must land on
+    # the day the user is still working, like `sp track` does.
+    day = _parse_day(args.date, d)
     skipped: list[bool] = []
     store.commit(
         [lambda dd, b: skipped.append(mut.repeat_skip_instance(dd, b, cfg_id, day))],
         initial=d,
     )
-    if skipped and not skipped[0]:
+    # commit may retry the closure on a conflict — the last run is the one that
+    # actually landed.
+    if skipped and not skipped[-1]:
         print(f"{day} is already skipped")
         return 0
     print(f"skipped {day}")
