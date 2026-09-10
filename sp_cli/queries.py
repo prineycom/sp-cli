@@ -41,6 +41,20 @@ def resolve_task(d: dict, ref: str) -> str:
     return matches[0]
 
 
+def resolve_note(d: dict, ref: str) -> str:
+    ids = (d["state"].get("note") or {}).get("ids", [])
+    if ref in ids:
+        return ref
+    matches = [nid for nid in ids if nid.startswith(ref)]
+    if not matches:
+        matches = [nid for nid in ids if nid.lstrip("-_").startswith(ref)]
+    if not matches:
+        raise NotFoundError(f"no note with id (prefix) '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
 def _resolve_named(d: dict, registry: str, ref: str, kind: str) -> str:
     reg = d["state"][registry]
     if ref in reg["entities"]:
@@ -153,6 +167,31 @@ def today_list(d: dict) -> list[dict]:
     return [entities[tid] for tid in ordered]
 
 
+# ---------------------------------------------------------------- notes
+
+def all_notes(d: dict) -> list[dict]:
+    reg = d["state"].get("note") or {}
+    entities = reg.get("entities") or {}
+    return [entities[nid] for nid in reg.get("ids", []) if nid in entities]
+
+
+def list_notes(
+    d: dict, project: str | None = None, today: bool = False
+) -> list[dict]:
+    """Notes in state order; `today` = pinned ones in todayOrder order."""
+    reg = d["state"].get("note") or {}
+    entities = reg.get("entities") or {}
+    if today:
+        order = reg.get("todayOrder") or []
+        notes = [entities[nid] for nid in order if nid in entities]
+    else:
+        notes = all_notes(d)
+    if project is not None:
+        pid = resolve_project(d, project)
+        notes = [n for n in notes if n.get("projectId") == pid]
+    return notes
+
+
 def agenda(d: dict) -> dict:
     today_s = today_str()
     now = int(datetime.datetime.now().timestamp() * 1000)
@@ -243,7 +282,7 @@ def doctor(d: dict) -> list[str]:
     problems: list[str] = []
     state = d["state"]
 
-    for name in ("task", "project", "tag", "taskRepeatCfg"):
+    for name in ("task", "project", "tag", "taskRepeatCfg", "note"):
         reg = state.get(name)
         if not reg:
             continue
@@ -309,6 +348,36 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"tag {tg}: taskIds references missing task {tid}")
             elif tg not in tasks[tid].get("tagIds", []):
                 problems.append(f"tag {tg}: task {tid} lacks the tag (membership desync)")
+
+    note_reg = state.get("note") or {}
+    notes = note_reg.get("entities") or {}
+    note_ids = set(notes)
+    today_order = note_reg.get("todayOrder") or []
+    for nid in today_order:
+        if nid not in note_ids:
+            problems.append(f"note todayOrder: references missing note {nid}")
+    if len(set(today_order)) != len(today_order):
+        problems.append("note todayOrder: duplicate ids")
+    for nid, note in notes.items():
+        pid = note.get("projectId")
+        if pid is not None:
+            if pid not in state["project"]["entities"]:
+                problems.append(f"note {nid}: projectId '{pid}' does not exist")
+            elif nid not in state["project"]["entities"][pid].get("noteIds", []):
+                problems.append(
+                    f"note {nid}: not in project {pid}.noteIds (membership desync)"
+                )
+        if note.get("isPinnedToToday") and nid not in today_order:
+            problems.append(f"note {nid}: pinned to today but not in todayOrder")
+        if not note.get("isPinnedToToday") and nid in today_order:
+            problems.append(f"note {nid}: in todayOrder but not pinned")
+
+    for pid, project in state["project"]["entities"].items():
+        for nid in project.get("noteIds", []):
+            if nid not in note_ids:
+                problems.append(f"project {pid}: noteIds references missing note {nid}")
+            elif notes[nid].get("projectId") != pid:
+                problems.append(f"project {pid}: note {nid} projectId mismatch")
 
     for day, ids in (state.get("planner", {}).get("days") or {}).items():
         for tid in ids:

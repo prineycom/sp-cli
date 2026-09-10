@@ -271,3 +271,65 @@ class TestDurations:
     )
     def test_format(self, ms, text):
         assert format_duration(ms) == text
+
+
+def _add_note(d, note_id, content="n", project_id=None, pinned=False):
+    from sp_cli.model import make_note
+
+    note = make_note(note_id, content, project_id=project_id, is_pinned_to_today=pinned)
+    reg = d["state"]["note"]
+    reg["ids"].insert(0, note_id)
+    reg["entities"][note_id] = note
+    if pinned:
+        reg["todayOrder"].insert(0, note_id)
+    if project_id:
+        d["state"]["project"]["entities"][project_id]["noteIds"].insert(0, note_id)
+    return note
+
+
+class TestNotes:
+    def test_resolve_note_by_prefix(self, sample):
+        _add_note(sample, "noteAAAAAAAAAAAAAAAAA")
+        assert q.resolve_note(sample, "noteA") == "noteAAAAAAAAAAAAAAAAA"
+
+    def test_resolve_note_not_found(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.resolve_note(sample, "zzzz")
+
+    def test_resolve_note_ambiguous(self, sample):
+        _add_note(sample, "prefixAAAAAAAAAAAAAA1")
+        _add_note(sample, "prefixAAAAAAAAAAAAAA2")
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_note(sample, "prefix")
+
+    def test_list_notes_state_order(self, sample):
+        _add_note(sample, "1" * 21, "first")
+        _add_note(sample, "2" * 21, "second")
+        assert [n["id"] for n in q.list_notes(sample)] == ["2" * 21, "1" * 21]
+
+    def test_list_notes_today_uses_today_order(self, sample):
+        _add_note(sample, "1" * 21, "plain")
+        _add_note(sample, "2" * 21, "pinned", pinned=True)
+        assert [n["id"] for n in q.list_notes(sample, today=True)] == ["2" * 21]
+
+    def test_list_notes_by_project(self, sample):
+        _add_note(sample, "1" * 21, "inboxed", project_id="INBOX_PROJECT")
+        _add_note(sample, "2" * 21, "loose")
+        assert [n["id"] for n in q.list_notes(sample, project="inbox")] == ["1" * 21]
+
+    def test_doctor_detects_dangling_today_order(self, sample):
+        sample["state"]["note"]["todayOrder"].append("ghost")
+        assert any("todayOrder" in p and "ghost" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_dangling_project_note_ids(self, sample):
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["noteIds"].append("gh")
+        assert any("noteIds references missing note gh" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_ids_entities_desync(self, sample):
+        sample["state"]["note"]["ids"].append("ghostnote")
+        assert any("ghostnote" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_pin_desync(self, sample):
+        _add_note(sample, "N" * 21, "pinned", pinned=True)
+        sample["state"]["note"]["todayOrder"] = []
+        assert any("not in todayOrder" in p for p in q.doctor(sample))

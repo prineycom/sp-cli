@@ -13,6 +13,7 @@ from sp_cli.config import ConfigError, init_config, load_config
 from sp_cli.ids import nanoid
 from sp_cli.model import (
     INBOX_PROJECT_ID,
+    make_note,
     make_project,
     make_tag,
     make_task,
@@ -742,6 +743,107 @@ def cmd_tag_edit(args) -> int:
     return 0
 
 
+def cmd_notes(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    notes = q.list_notes(d, project=args.project, today=args.today)
+    if args.json:
+        render.print_json(notes)
+    else:
+        render.print_notes(d, notes)
+    return 0
+
+
+def cmd_note_add(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    project_id = q.resolve_project(d, args.project) if args.project else None
+    note_id = nanoid()
+
+    def _add(dd, b):
+        note = make_note(
+            note_id,
+            args.content,
+            project_id=project_id,
+            is_pinned_to_today=bool(args.pin),
+        )
+        mut.note_add(dd, b, note)
+
+    store.commit([_add], initial=d)
+    print(note_id)
+    return 0
+
+
+def cmd_note_show(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    nid = q.resolve_note(d, args.id)
+    note = d["state"]["note"]["entities"][nid]
+    if args.json:
+        render.print_json(note)
+    else:
+        print(render.note_card(d, note))
+    return 0
+
+
+def cmd_note_edit(args) -> int:
+    if args.pin and args.unpin:
+        raise CliError("note edit: --pin and --unpin are mutually exclusive")
+    if args.content is not None and args.append is not None:
+        raise CliError("note edit: --content and --append are mutually exclusive")
+    client, store = _ctx()
+    d = client.get()
+    nid = q.resolve_note(d, args.id)
+
+    def _edit(dd, b):
+        changes: dict = {}
+        if args.content is not None:
+            changes["content"] = args.content
+        if args.append is not None:
+            current = dd["state"]["note"]["entities"][nid].get("content") or ""
+            changes["content"] = (
+                current + "\n" + args.append if current else args.append
+            )
+        if args.color is not None:
+            changes["backgroundColor"] = args.color
+        if args.pin:
+            changes["isPinnedToToday"] = True
+        if args.unpin:
+            changes["isPinnedToToday"] = False
+        if not changes:
+            raise CliError("note edit: nothing to change")
+        mut.note_update(dd, b, nid, changes)
+
+    store.commit([_edit], initial=d)
+    print(f"updated {render.short_id(nid)}")
+    return 0
+
+
+def cmd_note_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    nid = q.resolve_note(d, args.id)
+    preview = render.truncate(
+        render.first_line(d["state"]["note"]["entities"][nid].get("content")), 60
+    )
+    if not _confirm(f"delete note '{preview}'?", args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    store.commit([lambda dd, b: mut.note_delete(dd, b, nid)], initial=d)
+    print(f"deleted {render.short_id(nid)}")
+    return 0
+
+
+def cmd_note_move(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    nid = q.resolve_note(d, args.id)
+    pid = q.resolve_project(d, args.project)
+    store.commit([lambda dd, b: mut.note_move(dd, b, nid, pid)], initial=d)
+    print(f"moved {render.short_id(nid)} to {pid}")
+    return 0
+
+
 def cmd_archive(args) -> int:
     client, store = _ctx()
     d = client.get()
@@ -782,6 +884,7 @@ def cmd_pull(args) -> int:
     print(f"tasks:        {len(tasks)} ({sum(1 for t in tasks if t.get('isDone'))} done)")
     print(f"projects:     {len(state['project']['ids'])}")
     print(f"tags:         {len(state['tag']['ids'])}")
+    print(f"notes:        {len(q.all_notes(d))}")
     return 0
 
 
@@ -816,6 +919,11 @@ _SUBCOMMAND_REWRITES = {
     ("project", "archive"): "project-archive",
     ("tag", "new"): "tag-new",
     ("tag", "edit"): "tag-edit",
+    ("note", "add"): "note-add",
+    ("note", "show"): "note-show",
+    ("note", "edit"): "note-edit",
+    ("note", "rm"): "note-rm",
+    ("note", "move"): "note-move",
 }
 
 
@@ -983,6 +1091,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s.add_argument("--title")
     s.add_argument("--color")
+
+    s = add("notes", cmd_notes, "list notes")
+    s.add_argument("--project")
+    s.add_argument("--today", action="store_true", help="only notes pinned to today")
+    s.add_argument("--json", action="store_true")
+    s = add("note-add", cmd_note_add, "create a note")
+    s.add_argument("content")
+    s.add_argument("--project")
+    s.add_argument("--pin", action="store_true", help="pin to today")
+    s = add("note-show", cmd_note_show, "show one note")
+    s.add_argument("id")
+    s.add_argument("--json", action="store_true")
+    s = add("note-edit", cmd_note_edit, "edit a note")
+    s.add_argument("id")
+    s.add_argument("--content")
+    s.add_argument("--append")
+    s.add_argument("--pin", action="store_true")
+    s.add_argument("--unpin", action="store_true")
+    s.add_argument("--color", help="background color, e.g. '#a05db1'")
+    s = add("note-rm", cmd_note_rm, "delete a note")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+    s = add("note-move", cmd_note_move, "move a note to another project")
+    s.add_argument("id")
+    s.add_argument("--project", required=True)
 
     s = add("archive", cmd_archive, "archive done tasks")
     s.add_argument("--yes", action="store_true")

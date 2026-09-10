@@ -51,3 +51,37 @@ class TestResolveTagRefs:
     def test_missing_without_create_flag_raises(self, sample):
         with pytest.raises(cli.CliError, match="--create-tags"):
             cli._resolve_tag_refs(sample, ["nope"], create_missing=False)
+
+
+class TestNoteSubcommandRewrite:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["note", "add", "x"], "note-add"),
+            (["note", "show", "abc"], "note-show"),
+            (["note", "edit", "abc"], "note-edit"),
+            (["note", "rm", "abc"], "note-rm"),
+            (["note", "move", "abc"], "note-move"),
+        ],
+    )
+    def test_rewritten(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_notes_is_not_rewritten(self):
+        assert cli._rewrite_argv(["notes", "--today"]) == ["notes", "--today"]
+
+
+class TestNoteEditFlagRejection:
+    def test_pin_and_unpin_conflict(self):
+        args = cli.build_parser().parse_args(
+            cli._rewrite_argv(["note", "edit", "abc", "--pin", "--unpin"])
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_note_edit(args)
+
+    def test_content_and_append_conflict(self):
+        args = cli.build_parser().parse_args(
+            cli._rewrite_argv(["note", "edit", "abc", "--content", "a", "--append", "b"])
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_note_edit(args)

@@ -52,7 +52,7 @@ pip install requests
 
 ## Команды
 
-Ссылаться на задачи/проекты/теги можно по id, короткому префиксу id или названию. У read-команд есть `--json`.
+Ссылаться на задачи/проекты/теги можно по id, короткому префиксу id или названию (заметки — по id или префиксу). У read-команд есть `--json`.
 
 ### Задачи
 
@@ -109,6 +109,17 @@ pip install requests
 ./sp tag edit <id> [--title T] [--color C]
 ```
 
+### Заметки
+
+```sh
+./sp notes [--project P] [--today] [--json]   # --today — закреплённые на сегодня
+./sp note add "Текст" [--project P] [--pin]   # печатает id
+./sp note show <id> [--json]
+./sp note edit <id> [--content T | --append T] [--pin|--unpin] [--color '#a05db1']
+./sp note rm <id> [--yes]                     # с подтверждением
+./sp note move <id> --project P
+```
+
 ### Время / worklog
 
 ```sh
@@ -134,7 +145,7 @@ pip install requests
 ## Тестирование
 
 ```sh
-python3 -m pytest tests/ -q    # 131 unit-тест, без сети
+python3 -m pytest tests/ -q    # 168 unit-тестов, без сети
 ```
 
 Плюс интеграционный свип против тестового WebDAV-сервера (копия live-файла) и проверка, что настоящий SP подхватывает изменения синком.
@@ -144,10 +155,11 @@ python3 -m pytest tests/ -q    # 131 unit-тест, без сети
 - [x] Research: структура sync-data.json, контракты операций, sync-слой
 - [x] MVP: полный набор read/write команд (задачи, план дня, расписание, проекты, теги, время)
 - [x] Sync-слой (vectorClock, recentOps, optimistic locking + retry)
+- [x] Заметки: CRUD, закрепление на сегодня, привязка к проекту
 - [ ] YouTrack-мост (опционально)
 
 ## Известные ограничения
 
 - Нет live-таймера (`start`/`stop`) — только пост-фактум `track`.
-- Заметки (notes-модуль) и boards не покрыты.
+- Boards не покрыты; у заметок нет переупорядочивания (`NO`) и вложений.
 - Конфликт с одновременной записью телефона решается retry (re-read + re-apply); при исчерпании попыток команда завершается ошибкой, данные не теряются.

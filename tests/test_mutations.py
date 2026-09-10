@@ -4,7 +4,7 @@ import pytest
 
 from conftest import assert_doctor_clean
 from sp_cli import mutations as mut
-from sp_cli.model import make_project, make_tag, make_task, today_str
+from sp_cli.model import make_note, make_project, make_tag, make_task, today_str
 from sp_cli.ops import OpBuilder
 
 CLI = "B_test01"
@@ -607,3 +607,182 @@ class TestArchive:
         n_ops = len(b.ops)
         assert mut.archive_done(sample, b) == []
         assert len(b.ops) == n_ops
+
+
+class TestNotes:
+    @staticmethod
+    def _note_reg(d):
+        return d["state"]["note"]
+
+    @staticmethod
+    def _project(d, pid="INBOX_PROJECT"):
+        return d["state"]["project"]["entities"][pid]
+
+    def test_add_basic(self, sample, b):
+        note = make_note("N" * 21, "hello note")
+        mut.note_add(sample, b, note)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("NA", "CRT", "NOTE", "N" * 21)
+        p = op["p"]["actionPayload"]
+        assert set(p) == {"note"}
+        assert p["note"]["content"] == "hello note"
+        assert p["note"]["projectId"] is None
+        assert p["note"]["isPinnedToToday"] is False
+        assert op["p"]["entityChanges"] == []
+
+        reg = self._note_reg(sample)
+        assert reg["ids"] == ["N" * 21]
+        assert reg["entities"]["N" * 21]["content"] == "hello note"
+        assert reg["todayOrder"] == []
+        assert_doctor_clean(sample)
+
+    def test_add_prepends_ids(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "first"))
+        mut.note_add(sample, b, make_note("2" * 21, "second"))
+        assert self._note_reg(sample)["ids"] == ["2" * 21, "1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_add_pinned_prepends_today_order(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_add(sample, b, make_note("2" * 21, "b", is_pinned_to_today=True))
+        assert self._note_reg(sample)["todayOrder"] == ["2" * 21, "1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_add_with_project_prepends_note_ids(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", project_id="INBOX_PROJECT"))
+        mut.note_add(sample, b, make_note("2" * 21, "b", project_id="INBOX_PROJECT"))
+        assert self._project(sample)["noteIds"] == ["2" * 21, "1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_add_unknown_project_raises(self, sample, b):
+        with pytest.raises(mut.MutationError):
+            mut.note_add(sample, b, make_note("N" * 21, "x", project_id="nope"))
+
+    def test_add_duplicate_id_raises(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "a"))
+        with pytest.raises(mut.MutationError):
+            mut.note_add(sample, b, make_note("N" * 21, "b"))
+
+    def test_update_content_patch(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "old"))
+        mut.note_update(sample, b, "N" * 21, {"content": "new"})
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("NU", "UPD", "NOTE", "N" * 21)
+        changes = op["p"]["actionPayload"]["note"]["changes"]
+        assert changes["content"] == "new"
+        assert "modified" in changes
+        assert "isPinnedToToday" not in changes
+        assert self._note_reg(sample)["entities"]["N" * 21]["content"] == "new"
+        assert self._note_reg(sample)["todayOrder"] == []
+        assert_doctor_clean(sample)
+
+    def test_update_content_leaves_today_order_untouched(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_add(sample, b, make_note("2" * 21, "b", is_pinned_to_today=True))
+        mut.note_update(sample, b, "1" * 21, {"content": "edited"})
+        assert self._note_reg(sample)["todayOrder"] == ["2" * 21, "1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_update_pin_prepends(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_add(sample, b, make_note("2" * 21, "b"))
+        mut.note_update(sample, b, "2" * 21, {"isPinnedToToday": True})
+        assert self._note_reg(sample)["todayOrder"] == ["2" * 21, "1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_update_unpin_filters(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_update(sample, b, "1" * 21, {"isPinnedToToday": False})
+        assert self._note_reg(sample)["todayOrder"] == []
+        assert self._note_reg(sample)["entities"]["1" * 21]["isPinnedToToday"] is False
+        assert_doctor_clean(sample)
+
+    def test_update_pin_twice_does_not_duplicate(self, sample, b):
+        mut.note_add(sample, b, make_note("1" * 21, "a", is_pinned_to_today=True))
+        mut.note_update(sample, b, "1" * 21, {"isPinnedToToday": True})
+        assert self._note_reg(sample)["todayOrder"] == ["1" * 21]
+        assert_doctor_clean(sample)
+
+    def test_update_missing_note_raises(self, sample, b):
+        with pytest.raises(mut.MutationError):
+            mut.note_update(sample, b, "nope", {"content": "x"})
+
+    def test_delete_payload_and_lists(self, sample, b):
+        mut.note_add(
+            sample,
+            b,
+            make_note(
+                "N" * 21, "bye", project_id="INBOX_PROJECT", is_pinned_to_today=True
+            ),
+        )
+        mut.note_delete(sample, b, "N" * 21)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("ND", "DEL", "NOTE", "N" * 21)
+        p = op["p"]["actionPayload"]
+        assert p == {
+            "id": "N" * 21,
+            "projectId": "INBOX_PROJECT",
+            "isPinnedToToday": True,
+        }
+        reg = self._note_reg(sample)
+        assert reg["ids"] == []
+        assert reg["entities"] == {}
+        assert reg["todayOrder"] == []
+        assert self._project(sample)["noteIds"] == []
+        assert_doctor_clean(sample)
+
+    def test_delete_payload_reflects_current_state(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "x"))
+        mut.note_update(sample, b, "N" * 21, {"isPinnedToToday": True})
+        mut.note_move(sample, b, "N" * 21, "INBOX_PROJECT")
+        mut.note_delete(sample, b, "N" * 21)
+        p = _last_op(b)["p"]["actionPayload"]
+        assert p["projectId"] == "INBOX_PROJECT"
+        assert p["isPinnedToToday"] is True
+        assert_doctor_clean(sample)
+
+    def test_move_payload_carries_old_project(self, sample, b):
+        other = make_project("P" * 21, "Other")
+        mut.project_add(sample, b, other)
+        mut.note_add(sample, b, make_note("N" * 21, "x", project_id="INBOX_PROJECT"))
+        mut.note_move(sample, b, "N" * 21, "P" * 21)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("NM", "UPD", "NOTE", "N" * 21)
+        p = op["p"]["actionPayload"]
+        assert p["note"]["projectId"] == "INBOX_PROJECT"  # OLD project id
+        assert p["targetProjectId"] == "P" * 21
+        assert self._project(sample)["noteIds"] == []
+        assert self._project(sample, "P" * 21)["noteIds"] == ["N" * 21]
+        assert self._note_reg(sample)["entities"]["N" * 21]["projectId"] == "P" * 21
+        assert_doctor_clean(sample)
+
+    def test_move_appends_to_target(self, sample, b):
+        other = make_project("P" * 21, "Other")
+        mut.project_add(sample, b, other)
+        mut.note_add(sample, b, make_note("1" * 21, "a", project_id="P" * 21))
+        mut.note_add(sample, b, make_note("2" * 21, "b"))
+        mut.note_move(sample, b, "2" * 21, "P" * 21)
+        assert self._project(sample, "P" * 21)["noteIds"] == ["1" * 21, "2" * 21]
+        assert_doctor_clean(sample)
+
+    def test_move_to_same_project_raises(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "x", project_id="INBOX_PROJECT"))
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError):
+            mut.note_move(sample, b, "N" * 21, "INBOX_PROJECT")
+        assert len(b.ops) == n_ops
+
+    def test_move_unknown_project_raises(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "x"))
+        with pytest.raises(mut.MutationError):
+            mut.note_move(sample, b, "N" * 21, "nope")
+
+    def test_full_lifecycle_keeps_state_clean(self, sample, b):
+        mut.note_add(sample, b, make_note("N" * 21, "draft", is_pinned_to_today=True))
+        mut.note_update(sample, b, "N" * 21, {"content": "draft\nmore"})
+        mut.note_move(sample, b, "N" * 21, "INBOX_PROJECT")
+        mut.note_update(sample, b, "N" * 21, {"isPinnedToToday": False})
+        mut.note_delete(sample, b, "N" * 21)
+        assert [o["a"] for o in b.ops] == ["NA", "NU", "NM", "NU", "ND"]
+        assert sample["state"]["note"]["ids"] == []
+        assert_doctor_clean(sample)

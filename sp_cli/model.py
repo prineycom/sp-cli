@@ -100,6 +100,24 @@ def make_task(
     return task
 
 
+def make_note(
+    note_id: str,
+    content: str,
+    project_id: str | None = None,
+    is_pinned_to_today: bool = False,
+    created: int | None = None,
+) -> dict:
+    ts = created if created is not None else now_ms()
+    return {
+        "id": note_id,
+        "projectId": project_id,
+        "isPinnedToToday": is_pinned_to_today,
+        "content": content,
+        "created": ts,
+        "modified": ts,
+    }
+
+
 def make_project(project_id: str, title: str, color: str | None = None) -> dict:
     return {
         "id": project_id,

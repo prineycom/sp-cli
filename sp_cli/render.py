@@ -120,6 +120,53 @@ def print_tasks(d: dict, tasks: list[dict]) -> None:
     print_table(["id", "✓", "title", "project", "due", "est/spent", "tags"], task_rows(d, tasks))
 
 
+def first_line(text: str | None) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def note_rows(d: dict, notes: list[dict]) -> list[list[str]]:
+    projects = d["state"]["project"]["entities"]
+    rows = []
+    for n in notes:
+        pid = n.get("projectId")
+        project = projects.get(pid, {}).get("title", "-") if pid else "-"
+        rows.append(
+            [
+                short_id(n["id"]),
+                ("📌" if n.get("isPinnedToToday") else " "),
+                truncate(first_line(n.get("content")), TITLE_WIDTH),
+                project,
+            ]
+        )
+    return rows
+
+
+def print_notes(d: dict, notes: list[dict]) -> None:
+    print_table(["id", "pin", "content", "project"], note_rows(d, notes))
+
+
+def note_card(d: dict, note: dict) -> str:
+    projects = d["state"]["project"]["entities"]
+    pid = note.get("projectId")
+    project = f"{projects.get(pid, {}).get('title', '?')} ({pid})" if pid else "-"
+    lines = [
+        f"id:       {note['id']}",
+        f"project:  {project}",
+        f"pinned:   {'yes' if note.get('isPinnedToToday') else 'no'}",
+        f"created:  {format_ts(note.get('created'))}",
+        f"modified: {format_ts(note.get('modified'))}",
+    ]
+    if note.get("backgroundColor"):
+        lines.append(f"color:    {note['backgroundColor']}")
+    lines.append("content:")
+    for ln in (note.get("content") or "").splitlines():
+        lines.append(f"  {ln}")
+    return "\n".join(lines)
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 

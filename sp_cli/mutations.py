@@ -601,6 +601,120 @@ def tag_task(
         update_task(d, b, task_id, {"tagIds": new_tags})
 
 
+# ---------------------------------------------------------------- notes
+
+def _note_reg(state: dict) -> dict:
+    reg = state.setdefault("note", {"ids": [], "entities": {}, "todayOrder": []})
+    reg.setdefault("ids", [])
+    reg.setdefault("entities", {})
+    reg.setdefault("todayOrder", [])
+    return reg
+
+
+def _note(state: dict, note_id: str) -> dict:
+    try:
+        return state["note"]["entities"][note_id]
+    except KeyError:
+        raise MutationError(f"note not found: {note_id}") from None
+
+
+def _note_unlink(state: dict, note_id: str) -> None:
+    """Drop the id from every project's noteIds (never leave dangling refs)."""
+    for project in state["project"]["entities"].values():
+        _list_remove(project.setdefault("noteIds", []), note_id)
+
+
+def note_add(d: dict, b: OpBuilder, note: dict) -> str:
+    """Create a note (already built via model.make_note)."""
+    state = _state(d)
+    reg = _note_reg(state)
+    if note["id"] in reg["entities"]:
+        raise MutationError(f"entity already exists: {note['id']}")
+    project = None
+    if note.get("projectId"):
+        project = _project(state, note["projectId"])
+
+    b.op("NA", "CRT", "NOTE", note["id"], {"note": copy.deepcopy(note)})
+
+    # SP prepends everywhere: newest note first.
+    reg["entities"][note["id"]] = note
+    reg["ids"].insert(0, note["id"])
+    if note.get("isPinnedToToday"):
+        reg["todayOrder"].insert(0, note["id"])
+    if project is not None:
+        project.setdefault("noteIds", []).insert(0, note["id"])
+    return note["id"]
+
+
+def note_update(d: dict, b: OpBuilder, note_id: str, changes: dict) -> None:
+    state = _state(d)
+    reg = _note_reg(state)
+    note = _note(state, note_id)
+    changes = dict(changes)
+    changes["modified"] = now_ms()
+
+    b.op(
+        "NU",
+        "UPD",
+        "NOTE",
+        note_id,
+        {"note": {"id": note_id, "changes": copy.deepcopy(changes)}},
+    )
+
+    # todayOrder moves ONLY when the pin flag is part of the patch.
+    if "isPinnedToToday" in changes:
+        if changes["isPinnedToToday"]:
+            _list_remove(reg["todayOrder"], note_id)
+            reg["todayOrder"].insert(0, note_id)
+        else:
+            _list_remove(reg["todayOrder"], note_id)
+    note.update(changes)
+
+
+def note_delete(d: dict, b: OpBuilder, note_id: str) -> None:
+    state = _state(d)
+    reg = _note_reg(state)
+    note = _note(state, note_id)
+    # Payload carries the pre-delete linkage for the cross-slice reducers.
+    b.op(
+        "ND",
+        "DEL",
+        "NOTE",
+        note_id,
+        {
+            "id": note_id,
+            "projectId": note.get("projectId"),
+            "isPinnedToToday": bool(note.get("isPinnedToToday")),
+        },
+    )
+
+    _reg_remove(reg, note_id)
+    _list_remove(reg["todayOrder"], note_id)
+    _note_unlink(state, note_id)
+
+
+def note_move(d: dict, b: OpBuilder, note_id: str, target_project_id: str) -> None:
+    state = _state(d)
+    _note_reg(state)
+    note = _note(state, note_id)
+    target = _project(state, target_project_id)
+    if note.get("projectId") == target_project_id:
+        raise MutationError(f"note is already in project {target_project_id}")
+
+    # The payload note keeps the OLD projectId — that is the source list.
+    b.op(
+        "NM",
+        "UPD",
+        "NOTE",
+        note_id,
+        {"note": copy.deepcopy(note), "targetProjectId": target_project_id},
+    )
+
+    note["projectId"] = target_project_id
+    _note_unlink(state, note_id)
+    target.setdefault("noteIds", []).append(note_id)
+
+
 # ---------------------------------------------------------------- archive
 
 def archive_done(d: dict, b: OpBuilder) -> list[str]:
