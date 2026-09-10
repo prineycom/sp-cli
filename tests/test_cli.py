@@ -2579,3 +2579,164 @@ class TestDeadlineClearCommands:
         assert task["remindAt"] is None
         assert task["dueWithTime"] == 1900000000000
         assert "dismissed" in capsys.readouterr().out
+
+
+def _seed_shortsyntax_world(d):
+    """A project and a tag for the short-syntax integration tests."""
+    state = d["state"]
+    state["project"]["ids"].append("P_WORK")
+    state["project"]["entities"]["P_WORK"] = {
+        "id": "P_WORK",
+        "title": "Work",
+        "taskIds": [],
+        "backlogTaskIds": [],
+        "isEnableBacklog": True,
+    }
+    state["tag"]["ids"].append("T_HOME")
+    state["tag"]["entities"]["T_HOME"] = {
+        "id": "T_HOME",
+        "title": "home",
+        "taskIds": [],
+    }
+
+
+def _payload(ops, action):
+    for op in ops:
+        if op["a"] == action:
+            return op["p"]["actionPayload"]
+    raise AssertionError(f"no {action} op in {[o['a'] for o in ops]}")
+
+
+class TestAddShortSyntax:
+    def test_full_title_is_parsed(self, fake_ctx, sample, capsys):
+        _seed_shortsyntax_world(sample)
+        tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        assert cli.cmd_add(
+            _args(["add", "Buy milk #home +Work @tomorrow 30m"])
+        ) == 0
+        out = capsys.readouterr()
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task["title"] == "Buy milk"
+        assert task["projectId"] == "P_WORK"
+        assert task["tagIds"] == ["T_HOME"]
+        assert task["timeEstimate"] == 1_800_000
+        assert task["dueDay"] == tomorrow
+        assert out.out.strip() == task["id"]  # stdout stays machine-readable
+        assert "parsed:" in out.err
+
+    def test_unknown_tag_is_created_with_ga_before_ha(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x #brandnew"])) == 0
+        actions = [op["a"] for op in fake_ctx.ops]
+        assert actions.index("GA") < actions.index("HA")
+        tag = _payload(fake_ctx.ops, "GA")["tag"]
+        assert tag["title"] == "brandnew"
+        assert _payload(fake_ctx.ops, "HA")["task"]["tagIds"] == [tag["id"]]
+
+    def test_no_parse_keeps_the_raw_title(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x #home +Work 30m", "--no-parse"])) == 0
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task["title"] == "x #home +Work 30m"
+        assert task["projectId"] == "INBOX_PROJECT"
+        assert task["tagIds"] == [] and task["timeEstimate"] == 0
+
+    def test_explicit_flags_override_parsed_values(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        argv = [
+            "add",
+            "x +Work #home @tomorrow 30m",
+            "--project",
+            "inbox",
+            "--tag",
+            "home",
+            "--est",
+            "2h",
+            "--due",
+            "2030-01-01",
+        ]
+        assert cli.cmd_add(_args(argv)) == 0
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task["projectId"] == "INBOX_PROJECT"
+        assert task["tagIds"] == ["T_HOME"]
+        assert task["timeEstimate"] == 7_200_000
+        assert task["dueDay"] == "2030-01-01"
+        assert task["title"] == "x"  # the title is still cleaned
+
+    def test_time_with_slash_tracks_spent_time(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x 1h/2h"])) == 0
+        assert _payload(fake_ctx.ops, "HA")["task"]["timeEstimate"] == 7_200_000
+        kt = _payload(fake_ctx.ops, "KT")
+        assert kt["duration"] == 3_600_000
+        assert kt["date"] == model.logical_today_str(sample)
+
+    def test_due_with_time_emits_hs_after_ha(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x @tomorrow 9:00"])) == 0
+        actions = [op["a"] for op in fake_ctx.ops]
+        assert actions == ["HA", "HS"]
+        expected = dt.datetime.combine(
+            dt.date.today() + dt.timedelta(days=1), dt.time(9, 0)
+        )
+        assert _payload(fake_ctx.ops, "HS")["dueWithTime"] == int(
+            expected.timestamp() * 1000
+        )
+
+    def test_deadline_needs_the_flag(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x !2030-01-01"])) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["HA"]
+        assert _payload(fake_ctx.ops, "HA")["task"]["title"] == "x !2030-01-01"
+
+    def test_deadline_with_flag_emits_hdl(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "x !2030-01-01", "--parse-deadline"])) == 0
+        assert _payload(fake_ctx.ops, "HDL")["deadlineDay"] == "2030-01-01"
+        assert _payload(fake_ctx.ops, "HA")["task"]["title"] == "x"
+
+    def test_every_emits_ra_with_a_weekly_cfg(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(_args(["add", "standup @every monday +Work"])) == 0
+        actions = [op["a"] for op in fake_ctx.ops]
+        assert actions == ["HA", "RA"]
+        cfg = _payload(fake_ctx.ops, "RA")["taskRepeatCfg"]
+        assert cfg["quickSetting"] == "WEEKLY_CURRENT_WEEKDAY"
+        assert cfg["repeatCycle"] == "WEEKLY" and cfg["monday"] is True
+        assert cfg["title"] == "standup" and cfg["projectId"] == "P_WORK"
+        assert cfg["lastTaskCreationDay"] == model.today_str()
+        task_id = _payload(fake_ctx.ops, "HA")["task"]["id"]
+        assert sample["state"]["task"]["entities"][task_id]["repeatCfgId"] == cfg["id"]
+
+    def test_daily_preset(self, fake_ctx, sample):
+        assert cli.cmd_add(_args(["add", "pills @daily"])) == 0
+        cfg = _payload(fake_ctx.ops, "RA")["taskRepeatCfg"]
+        assert (cfg["quickSetting"], cfg["repeatCycle"]) == ("DAILY", "DAILY")
+
+    def test_backlog_drops_a_parsed_due(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(
+            _args(["add", "later +Work @tomorrow", "--backlog"])
+        ) == 0
+        task = _payload(fake_ctx.ops, "HA")["task"]
+        assert task.get("dueDay") is None
+        assert sample["state"]["project"]["entities"]["P_WORK"]["backlogTaskIds"] == [
+            task["id"]
+        ]
+
+    def test_subtask_is_never_parsed(self, fake_ctx, sample, add_task_entity):
+        parent = add_task_entity(title="parent")
+        assert cli.cmd_add(
+            _args(["add", "sub #home 30m", "--parent", parent["id"]])
+        ) == 0
+        sub = _payload(fake_ctx.ops, "TA")["task"]
+        assert sub["title"] == "sub #home 30m"
+
+    def test_state_stays_consistent(self, fake_ctx, sample):
+        _seed_shortsyntax_world(sample)
+        assert cli.cmd_add(
+            _args(["add", "Report #home #new +Work @tomorrow 1h/2h"])
+        ) == 0
+        from conftest import assert_doctor_clean
+
+        assert_doctor_clean(sample)

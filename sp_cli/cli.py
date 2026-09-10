@@ -10,6 +10,7 @@ import sys
 from sp_cli import mutations as mut
 from sp_cli import queries as q
 from sp_cli import render
+from sp_cli import shortsyntax
 from sp_cli import timer
 from sp_cli.config import ConfigError, init_config, load_config
 from sp_cli.ids import nanoid
@@ -220,6 +221,16 @@ def cmd_add(args) -> int:
     task_id = nanoid()
     muts = []
 
+    # Short syntax runs only for top-level tasks: a subtask carries no project,
+    # scheduling or tags of its own, so there would be nothing to parse into.
+    parsed = None
+    if not args.no_parse and not args.parent:
+        parsed = shortsyntax.parse(
+            args.title, d, force_deadline=bool(args.parse_deadline)
+        )
+        if parsed.touched:
+            print("parsed: " + " ".join(parsed.summary), file=sys.stderr)
+
     if args.parent:
         parent_id = q.resolve_task(d, args.parent)
 
@@ -237,11 +248,30 @@ def cmd_add(args) -> int:
 
         muts.append(_sub)
     else:
-        project_id = (
-            q.resolve_project(d, args.project) if args.project else INBOX_PROJECT_ID
-        )
-        tag_ids, tag_muts = _resolve_tag_refs(d, args.tag or [], args.create_tags)
+        # Explicit flags always win over what short syntax found.
+        title = parsed.clean_title if parsed else args.title
+        if args.project:
+            project_id = q.resolve_project(d, args.project)
+        elif parsed and parsed.project_id:
+            project_id = parsed.project_id
+        else:
+            project_id = INBOX_PROJECT_ID
+        if args.tag or not parsed:
+            tag_ids, tag_muts = _resolve_tag_refs(d, args.tag or [], args.create_tags)
+        else:
+            tag_ids = list(parsed.tag_ids)
+            tag_muts = []
+            for tag_title in parsed.new_tag_titles:
+                new_id = nanoid()
+                tag_ids.append(new_id)
+
+                def _create(dd, b, _id=new_id, _title=tag_title):
+                    mut.tag_add(dd, b, make_tag(_id, _title))
+
+                tag_muts.append(_create)
         muts.extend(tag_muts)
+        if not args.est and parsed and parsed.time_estimate_ms:
+            est = parsed.time_estimate_ms
 
         due_day = _parse_day(args.due) if args.due else None
         at_ts = _parse_dt(args.at) if args.at else None
@@ -252,11 +282,20 @@ def cmd_add(args) -> int:
                 "--backlog is incompatible with --due / --at: a backlog task "
                 "is explicitly not scheduled"
             )
+        # A backlog task is explicitly unscheduled — a parsed `@due` is dropped
+        # rather than fought over (only the explicit flags are an error).
+        if parsed and not args.backlog and not due_day and at_ts is None:
+            due_day = parsed.due_day
+            at_ts = parsed.due_with_time
+        spent_ms = parsed.time_spent_ms if parsed else None
+        deadline_day = parsed.deadline_day if parsed else None
+        deadline_ts = parsed.deadline_with_time if parsed else None
+        repeat = parsed.repeat if parsed else None
 
         def _add(dd, b):
             task = make_task(
                 task_id,
-                args.title,
+                title,
                 project_id,
                 time_estimate=est,
                 tag_ids=tag_ids,
@@ -267,6 +306,18 @@ def cmd_add(args) -> int:
             if at_ts is not None:
                 offset = render.parse_offset(args.remind) if args.remind else 0
                 mut.schedule_task(dd, b, task_id, at_ts, remind_at=at_ts - offset)
+            if deadline_day is not None or deadline_ts is not None:
+                mut.set_deadline(
+                    dd,
+                    b,
+                    task_id,
+                    deadline_day=deadline_day,
+                    deadline_with_time=deadline_ts,
+                )
+            if spent_ms:
+                mut.track_time(dd, b, task_id, logical_today_str(dd), spent_ms)
+            if repeat:
+                mut.repeat_add(dd, b, task_id, nanoid(), **repeat)
 
         muts.append(_add)
 
@@ -2592,6 +2643,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--backlog",
         action="store_true",
         help="create in the project's backlog (needs --enable-backlog)",
+    )
+    s.add_argument(
+        "--no-parse",
+        action="store_true",
+        help="do not parse short syntax (+project #tag @due !deadline 30m)",
+    )
+    s.add_argument(
+        "--parse-deadline",
+        action="store_true",
+        help="parse '!<date>' as a deadline even when shortSyntax.isEnableDeadline is off",
     )
 
     s = add("edit", cmd_edit, "edit a task")
