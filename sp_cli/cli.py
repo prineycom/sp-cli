@@ -1084,7 +1084,9 @@ def cmd_project_rm(args) -> int:
         result.append(mut.project_delete(dd, b, pid))
 
     store.commit([_rm], initial=d)
-    deleted_tasks, deleted_notes = result[0]
+    # commit() may retry the mutation on a conflict — the LAST run is the
+    # one that landed.
+    deleted_tasks, deleted_notes = result[-1]
     print(
         f"deleted {pid} ({len(deleted_tasks)} task(s), "
         f"{len(deleted_notes)} note(s))"
@@ -1163,7 +1165,8 @@ def cmd_tag_rm(args) -> int:
         orphaned.append(mut.tag_delete(dd, b, tag_id))
 
     store.commit([_rm], initial=d)
-    extra = f", deleted {len(orphaned[0])} orphaned task(s)" if orphaned[0] else ""
+    # last run == the one that landed (commit() retries on conflict)
+    extra = f", deleted {len(orphaned[-1])} orphaned task(s)" if orphaned[-1] else ""
     print(f"deleted {tag_id}{extra}")
     return 0
 

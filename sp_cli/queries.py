@@ -816,6 +816,20 @@ def doctor(d: dict) -> list[str]:
             if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
                 problems.append(f"counter {cid}: countOnDay[{day}] = {val!r} is invalid")
 
+    # A repeat cfg pointing at a project or tag that no longer exists spawns
+    # its next instance into nothing — SP's own delete cascades drop such
+    # cfgs, so a survivor means the file was written by something that didn't.
+    cfg_reg = state.get("taskRepeatCfg") or {}
+    for cid, cfg in (cfg_reg.get("entities") or {}).items():
+        cfg_pid = cfg.get("projectId")
+        if cfg_pid is not None and cfg_pid not in state["project"]["entities"]:
+            problems.append(
+                f"repeat cfg {cid}: projectId '{cfg_pid}' does not exist"
+            )
+        for tg in cfg.get("tagIds") or []:
+            if tg not in tags:
+                problems.append(f"repeat cfg {cid}: tagIds references missing tag {tg}")
+
     for day, ids in (state.get("planner", {}).get("days") or {}).items():
         for tid in ids:
             if tid not in task_ids:

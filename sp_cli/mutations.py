@@ -282,6 +282,23 @@ def reopen_task(d: dict, b: OpBuilder, task_id: str) -> None:
     update_task(d, b, task_id, {"isDone": False, "doneOn": None})
 
 
+def _clear_current_task_refs(state: dict, task_ids: list[str]) -> None:
+    """Null `task.currentTaskId` / `lastCurrentTaskId` when they point at a
+    task that no longer exists.
+
+    Cosmetic and device-local (the running timer never travels through the
+    sync file), but leaving a dangling id in the snapshot we PUT is untidy
+    and would make another device's task bar reference a phantom task.
+    """
+    reg = state.get("task")
+    if not isinstance(reg, dict):
+        return
+    gone = set(task_ids)
+    for key in ("currentTaskId", "lastCurrentTaskId"):
+        if reg.get(key) in gone:
+            reg[key] = None
+
+
 def _cascade_remove_task(state: dict, task_id: str) -> None:
     """Remove a task (and its subtasks) from every referencing structure."""
     task = state["task"]["entities"].get(task_id)
@@ -305,6 +322,7 @@ def _cascade_remove_task(state: dict, task_id: str) -> None:
         for tid in all_ids:
             _list_remove(tag.get("taskIds", []), tid)
     _planner_purge(state, all_ids)
+    _clear_current_task_refs(state, all_ids)
 
 
 def delete_task(d: dict, b: OpBuilder, task_id: str) -> None:
@@ -918,6 +936,20 @@ def project_delete(d: dict, b: OpBuilder, project_id: str) -> tuple[list, list]:
     it, plus any live task that claims the project only via `projectId` —
     including those keeps the receivers' cascade identical to ours instead of
     stranding a task whose project no longer exists. Same for noteIds.
+
+    That widening is deliberate and is a SUPERSET of SP's own payload: SP
+    trusts its two order lists, we also sweep by `projectId`. Caveat: a task
+    another device added to the project concurrently is only in *our* copy of
+    the lists if we already pulled it, so the sweep improves — but cannot
+    guarantee — completeness under concurrent edits. The stray tasks we do
+    catch are named in allTaskIds, so receivers delete exactly what we did.
+
+    Beyond the tasks/notes cascade this mirrors SP's project-shared reducer:
+    repeat configs whose `projectId` is the deleted project are REMOVED
+    outright (regardless of their tags — cleanupTaskRepeatCfgsForProject),
+    `timeTracking.project[pid]` is dropped (live + both archive blobs), and
+    the two globalConfig fields that can point at a project are healed the
+    way project.effects.ts `deleteProjectRelatedData` heals them.
     """
     state = _state(d)
     project = _project(state, project_id)
@@ -976,6 +1008,7 @@ def project_delete(d: dict, b: OpBuilder, project_id: str) -> tuple[list, list]:
         for tid in all_task_ids:
             _list_remove(tag.setdefault("taskIds", []), tid)
     _planner_purge(state, all_task_ids)
+    _clear_current_task_refs(state, all_task_ids)
 
     # notes
     for nid in note_ids:
@@ -991,6 +1024,36 @@ def project_delete(d: dict, b: OpBuilder, project_id: str) -> tuple[list, list]:
                 _reg_remove(sections, sid)
 
     _menu_tree_prune(state, "p", project_id)
+
+    # repeat cfgs of the project: removed outright, tags or no tags
+    # (project-shared.reducer.ts cleanupTaskRepeatCfgsForProject). Their tasks
+    # are in the project and die with it, so SP never clears `repeatCfgId`
+    # refs here either — we mirror that exactly.
+    cfg_reg = state.get("taskRepeatCfg")
+    if isinstance(cfg_reg, dict) and isinstance(cfg_reg.get("entities"), dict):
+        for cid, cfg in list(cfg_reg["entities"].items()):
+            if isinstance(cfg, dict) and cfg.get("projectId") == project_id:
+                _reg_remove(cfg_reg, cid)
+
+    # time tracking: live bucket (cleanupTimeTrackingForProject) plus both
+    # archive blobs (ArchiveOperationHandler._handleDeleteProject)
+    for tt in _time_tracking_maps(d):
+        by_project = tt.get("project")
+        if isinstance(by_project, dict):
+            by_project.pop(project_id, None)
+
+    # globalConfig healing — project.effects.ts deleteProjectRelatedData:
+    # defaultProjectId falls back to the Inbox (the canonical "unset" target),
+    # defaultStartPage back to 0 so nobody lands on a dead route. This touches
+    # only these two fields; the `sync` section stays device-local.
+    cfg = state.get("globalConfig")
+    if isinstance(cfg, dict):
+        tasks_cfg = cfg.get("tasks")
+        if isinstance(tasks_cfg, dict) and tasks_cfg.get("defaultProjectId") == project_id:
+            tasks_cfg["defaultProjectId"] = INBOX_PROJECT_ID
+        misc_cfg = cfg.get("misc")
+        if isinstance(misc_cfg, dict) and misc_cfg.get("defaultStartPage") == project_id:
+            misc_cfg["defaultStartPage"] = 0
 
     for provider in ((state.get("issueProvider") or {}).get("entities") or {}).values():
         if provider.get("defaultProjectId") == project_id:
@@ -1058,10 +1121,27 @@ def tag_delete(d: dict, b: OpBuilder, tag_id: str) -> list[str]:
     _reg_remove(state["tag"], tag_id)
     _menu_tree_prune(state, "t", tag_id)
 
-    for entities in archive_task_entity_maps(d):
+    # archives: strip the tag, then apply the SAME orphan rule the live state
+    # got — task-archive.service.ts _removeTagsFromAllTasks hard-deletes an
+    # archived task left with no tags, no project and no parent, along with
+    # everything in its subTaskIds.
+    for _key, reg in archive_task_blobs(d):
+        entities = reg["entities"]
         for task in entities.values():
             if tag_id in (task.get("tagIds") or []):
                 task["tagIds"] = [t for t in task["tagIds"] if t != tag_id]
+        doomed: list[str] = []
+        for tid in list(reg.get("ids") or []):
+            task = entities.get(tid)
+            if task is None:
+                continue
+            if task.get("tagIds") or task.get("projectId") or task.get("parentId"):
+                continue
+            doomed.append(tid)
+            doomed.extend(task.get("subTaskIds") or [])
+        for tid in doomed:
+            entities.pop(tid, None)
+            _list_remove(reg.setdefault("ids", []), tid)
 
     return orphans
 

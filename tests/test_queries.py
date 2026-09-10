@@ -212,6 +212,32 @@ class TestDoctor:
         reg.setdefault("entities", {})[pid] = provider
         return provider
 
+    @staticmethod
+    def _seed_cfg(d, **fields):
+        reg = d["state"].setdefault("taskRepeatCfg", {"ids": [], "entities": {}})
+        cfg = {"id": "C1", "title": "cfg", "projectId": None, "tagIds": [], **fields}
+        reg.setdefault("ids", []).append(cfg["id"])
+        reg.setdefault("entities", {})[cfg["id"]] = cfg
+        return cfg
+
+    def test_dangling_repeat_cfg_project_id(self, sample):
+        self._seed_cfg(sample, projectId="gone")
+        assert any(
+            "repeat cfg C1: projectId 'gone' does not exist" in p
+            for p in q.doctor(sample)
+        )
+
+    def test_repeat_cfg_without_a_project_is_fine(self, sample):
+        self._seed_cfg(sample, projectId=None)
+        assert q.doctor(sample) == []
+
+    def test_dangling_repeat_cfg_tag_id(self, sample):
+        self._seed_cfg(sample, projectId="INBOX_PROJECT", tagIds=["nope"])
+        assert any(
+            "repeat cfg C1: tagIds references missing tag nope" in p
+            for p in q.doctor(sample)
+        )
+
     def test_dangling_issue_provider_id_on_live_task(self, sample, add_task_entity):
         t = add_task_entity(task_id="D" * 21)
         t["issueProviderId"] = "gone"

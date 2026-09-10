@@ -183,6 +183,20 @@ class TestDelete:
         assert "2030-05-05" not in state["planner"]["days"]
         assert_doctor_clean(sample)
 
+    def test_delete_nulls_current_task_refs(self, sample, b, add_task_entity):
+        parent = add_task_entity(title="parent")
+        sub = make_task("S" * 21, "sub", "INBOX_PROJECT")
+        mut.add_subtask(sample, b, parent["id"], sub)
+        other = add_task_entity(title="other")
+        state = sample["state"]
+        state["task"]["currentTaskId"] = "S" * 21
+        state["task"]["lastCurrentTaskId"] = other["id"]
+
+        mut.delete_task(sample, b, parent["id"])
+        assert state["task"]["currentTaskId"] is None
+        # a ref to a surviving task is left alone
+        assert state["task"]["lastCurrentTaskId"] == other["id"]
+
     def test_bulk_delete(self, sample, b, add_task_entity):
         t1 = add_task_entity(title="one")
         t2 = add_task_entity(title="two")
@@ -2506,6 +2520,36 @@ class TestProjectDelete:
                 "K" * 21: make_task("K" * 21, "kept", "INBOX_PROJECT"),
             },
         }
+        state["taskRepeatCfg"] = {
+            "ids": ["C1", "C2", "C3"],
+            "entities": {
+                # of the doomed project, WITH tags: removed anyway
+                "C1": {"id": "C1", "title": "c1", "projectId": "P" * 21,
+                       "tagIds": ["G" * 21]},
+                # of the doomed project, no tags: removed
+                "C2": {"id": "C2", "title": "c2", "projectId": "P" * 21,
+                       "tagIds": []},
+                # another project: survives
+                "C3": {"id": "C3", "title": "c3", "projectId": "INBOX_PROJECT",
+                       "tagIds": []},
+            },
+        }
+        state["timeTracking"] = {
+            "project": {"P" * 21: {"2026-01-01": {"s": 1}}, "INBOX_PROJECT": {}},
+            "tag": {},
+        }
+        state["archiveYoung"]["timeTracking"] = {
+            "project": {"P" * 21: {"2025-01-01": {"s": 2}}},
+            "tag": {},
+        }
+        state["archiveOld"]["timeTracking"] = {
+            "project": {"P" * 21: {"2024-01-01": {"s": 3}}},
+            "tag": {},
+        }
+        state["globalConfig"]["tasks"]["defaultProjectId"] = "P" * 21
+        state["globalConfig"]["misc"]["defaultStartPage"] = "P" * 21
+        state["task"]["currentTaskId"] = "T" * 21
+        state["task"]["lastCurrentTaskId"] = "B" * 21
         provider = make_issue_provider("I" * 21, "ICAL", defaultProjectId="P" * 21)
         mut.provider_add(sample, b, provider)
         return proj
@@ -2546,6 +2590,47 @@ class TestProjectDelete:
         assert arch["ids"] == ["K" * 21]
         assert "A" * 21 not in arch["entities"]
         assert_doctor_clean(sample)
+
+    def test_repeat_cfgs_of_the_project_are_removed_regardless_of_tags(
+        self, sample, b
+    ):
+        self._seed(sample, b)
+        mut.project_delete(sample, b, "P" * 21)
+        reg = sample["state"]["taskRepeatCfg"]
+        assert reg["ids"] == ["C3"]
+        assert set(reg["entities"]) == {"C3"}
+        assert_doctor_clean(sample)
+
+    def test_time_tracking_is_dropped_live_and_in_both_archives(self, sample, b):
+        self._seed(sample, b)
+        mut.project_delete(sample, b, "P" * 21)
+        state = sample["state"]
+        assert "P" * 21 not in state["timeTracking"]["project"]
+        assert "INBOX_PROJECT" in state["timeTracking"]["project"]
+        assert state["archiveYoung"]["timeTracking"]["project"] == {}
+        assert state["archiveOld"]["timeTracking"]["project"] == {}
+
+    def test_global_config_refs_are_healed(self, sample, b):
+        self._seed(sample, b)
+        mut.project_delete(sample, b, "P" * 21)
+        cfg = sample["state"]["globalConfig"]
+        assert cfg["tasks"]["defaultProjectId"] == "INBOX_PROJECT"
+        assert cfg["misc"]["defaultStartPage"] == 0
+
+    def test_global_config_refs_to_other_projects_are_left_alone(self, sample, b):
+        self._seed(sample, b)
+        cfg = sample["state"]["globalConfig"]
+        cfg["tasks"]["defaultProjectId"] = "INBOX_PROJECT"
+        cfg["misc"]["defaultStartPage"] = 3
+        mut.project_delete(sample, b, "P" * 21)
+        assert cfg["tasks"]["defaultProjectId"] == "INBOX_PROJECT"
+        assert cfg["misc"]["defaultStartPage"] == 3
+
+    def test_current_task_refs_to_deleted_tasks_are_nulled(self, sample, b):
+        self._seed(sample, b)
+        mut.project_delete(sample, b, "P" * 21)
+        assert sample["state"]["task"]["currentTaskId"] is None
+        assert sample["state"]["task"]["lastCurrentTaskId"] is None
 
     def test_subtasks_are_in_all_task_ids(self, sample, b):
         self._seed(sample, b)
@@ -2686,6 +2771,35 @@ class TestTagDelete:
         assert orphans == ["O" * 21]
         assert "O" * 21 not in state["task"]["entities"]
         assert "U" * 21 not in state["task"]["entities"]
+
+    def test_archived_orphans_are_hard_deleted_with_their_subtasks(self, sample, b):
+        """SP task-archive.service.ts _removeTagsFromAllTasks: an archived task
+        left with no tags, no project and no parent goes, subtasks included."""
+        self._seed(sample, b)
+        reg = sample["state"]["archiveYoung"]["task"]
+        orphan = make_task("O" * 21, "arch orphan", "INBOX_PROJECT",
+                           tag_ids=["G" * 21])
+        orphan["projectId"] = None
+        orphan["subTaskIds"] = ["U" * 21]
+        sub = make_task("U" * 21, "arch orphan sub", "INBOX_PROJECT",
+                        parent_id="O" * 21)
+        sub["projectId"] = None
+        for t in (orphan, sub):
+            reg["ids"].append(t["id"])
+            reg["entities"][t["id"]] = t
+
+        mut.tag_delete(sample, b, "G" * 21)
+        assert "O" * 21 not in reg["entities"]
+        assert "U" * 21 not in reg["entities"]
+        assert "O" * 21 not in reg["ids"] and "U" * 21 not in reg["ids"]
+        # the archived task that keeps its project is untouched apart from tags
+        assert reg["ids"] == ["A" * 21]
+
+    def test_archived_task_keeping_its_project_survives(self, sample, b):
+        self._seed(sample, b)
+        mut.tag_delete(sample, b, "G" * 21)
+        reg = sample["state"]["archiveYoung"]["task"]
+        assert reg["entities"]["A" * 21]["tagIds"] == ["H" * 21]
 
     def test_task_keeping_its_project_survives(self, sample, b):
         self._seed(sample, b)
