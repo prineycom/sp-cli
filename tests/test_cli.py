@@ -4,8 +4,10 @@ import pytest
 
 from sp_cli import cli
 from sp_cli import queries as q
+from sp_cli import model
 from sp_cli import timer
 from sp_cli.model import make_tag, today_str
+from sp_cli.webdav import ConflictError
 
 
 class TestAddParentFlagRejection:
@@ -1034,6 +1036,92 @@ class TestProviderCommands:
             )
         assert fake_ctx.ops == []
 
+    def test_edit_ical_extra_flags(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21)
+        cli.cmd_provider_edit(
+            _args(
+                [
+                    "provider", "edit", "P" * 21,
+                    "--banner-before", "30m",
+                    "--include-regex", "standup",
+                    "--exclude-regex", "",
+                ]
+            )
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]["changes"]
+        assert changes == {
+            "showBannerBeforeThreshold": 1800000,
+            "filterIncludeRegex": "standup",
+            "filterExcludeRegex": None,
+        }
+
+    def test_edit_caldav_credentials(self, fake_ctx, sample):
+        _seed_provider(sample, "C" * 21, key="CALDAV")
+        cli.cmd_provider_edit(
+            _args(
+                [
+                    "provider", "edit", "C" * 21,
+                    "--username", "u2",
+                    "--password", "pw2",
+                    "--category-filter", "work",
+                    "--store-plaintext-credentials",
+                ]
+            )
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["issueProvider"]["changes"]
+        assert changes == {
+            "username": "u2",
+            "password": "pw2",
+            "categoryFilter": "work",
+        }
+
+    def test_edit_password_requires_the_plaintext_flag(self, fake_ctx, sample):
+        _seed_provider(sample, "C" * 21, key="CALDAV")
+        with pytest.raises(cli.CliError, match="PLAIN TEXT"):
+            cli.cmd_provider_edit(
+                _args(["provider", "edit", "C" * 21, "--password", "pw"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_edit_caldav_only_flags_on_ical_rejected(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21)
+        with pytest.raises(cli.CliError, match="only apply to CalDAV"):
+            cli.cmd_provider_edit(
+                _args(["provider", "edit", "P" * 21, "--username", "u"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_edit_rejects_empty_url(self, fake_ctx, sample):
+        _seed_provider(sample, "P" * 21, icalUrl="https://c/x.ics")
+        with pytest.raises(cli.CliError, match="cannot be empty"):
+            cli.cmd_provider_edit(_args(["provider", "edit", "P" * 21, "--url", ""]))
+        with pytest.raises(cli.CliError, match="cannot be empty"):
+            cli.cmd_provider_edit(_args(["provider", "edit", "P" * 21, "--url", "  "]))
+        assert fake_ctx.ops == []
+
+    def _seed_jira(self, sample):
+        reg = sample["state"].setdefault("issueProvider", {"ids": [], "entities": {}})
+        reg["ids"].append("J" * 21)
+        reg["entities"]["J" * 21] = {
+            "id": "J" * 21,
+            "issueProviderKey": "JIRA",
+            "isEnabled": True,
+        }
+
+    def test_edit_refuses_non_builtin_key(self, fake_ctx, sample):
+        self._seed_jira(sample)
+        with pytest.raises(cli.CliError, match="managed by the app"):
+            cli.cmd_provider_edit(
+                _args(["provider", "edit", "J" * 21, "--disable"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_rm_refuses_non_builtin_key(self, fake_ctx, sample):
+        self._seed_jira(sample)
+        with pytest.raises(cli.CliError, match="managed by the app"):
+            cli.cmd_provider_rm(_args(["provider", "rm", "J" * 21, "--yes"]))
+        assert fake_ctx.ops == []
+
     def test_edit_conflicting_flags(self, fake_ctx, sample):
         _seed_provider(sample, "P" * 21)
         with pytest.raises(cli.CliError, match="mutually exclusive"):
@@ -1181,6 +1269,87 @@ class TestSplitByDay:
         start = _ms(2026, 9, 9, 10, 0)
         assert timer.split_by_day(start, start) == []
 
+    def test_offset_shifts_the_boundary(self):
+        # startOfNextDay 04:00 => work at 01:00 still belongs to the day before.
+        diff = 4 * 3600000
+        start = _ms(2026, 9, 9, 0, 30)
+        end = _ms(2026, 9, 9, 1, 30)
+        assert timer.split_by_day(start, end, diff) == [("2026-09-08", 3600000)]
+
+    def test_offset_splits_at_the_configured_hour(self):
+        diff = 4 * 3600000
+        start = _ms(2026, 9, 9, 3, 30)
+        end = _ms(2026, 9, 9, 4, 30)
+        assert timer.split_by_day(start, end, diff) == [
+            ("2026-09-08", 1800000),
+            ("2026-09-09", 1800000),
+        ]
+
+    def test_zero_offset_is_plain_midnight(self):
+        start = _ms(2026, 9, 8, 23, 50)
+        end = _ms(2026, 9, 9, 0, 20)
+        assert timer.split_by_day(start, end, 0) == timer.split_by_day(start, end)
+
+
+class TestStartOfNextDay:
+    @staticmethod
+    def _misc(d, **misc):
+        d["state"]["globalConfig"]["misc"].update(misc)
+        return d
+
+    def test_sample_default_is_zero(self, sample):
+        assert cli.start_of_next_day_diff_ms(sample) == 0
+        assert model.logical_day_of_ms(_ms(2026, 9, 9, 1, 0), sample) == "2026-09-09"
+
+    def test_time_string_wins(self, sample):
+        self._misc(sample, startOfNextDayTime="04:30", startOfNextDay=9)
+        assert cli.start_of_next_day_diff_ms(sample) == (4 * 60 + 30) * 60000
+        assert model.logical_day_of_ms(_ms(2026, 9, 9, 4, 0), sample) == "2026-09-08"
+        assert model.logical_day_of_ms(_ms(2026, 9, 9, 5, 0), sample) == "2026-09-09"
+
+    def test_invalid_time_string_resets_to_zero(self, sample):
+        # SP #7645: a bad string makes the whole pair untrustworthy — it does
+        # NOT fall back to the legacy hour.
+        self._misc(sample, startOfNextDayTime="nonsense", startOfNextDay=9)
+        assert cli.start_of_next_day_diff_ms(sample) == 0
+
+    def test_legacy_hour_used_only_without_a_time_string(self, sample):
+        sample["state"]["globalConfig"]["misc"].pop("startOfNextDayTime")
+        self._misc(sample, startOfNextDay=3)
+        assert cli.start_of_next_day_diff_ms(sample) == 3 * 3600000
+        self._misc(sample, startOfNextDay=0)
+        assert cli.start_of_next_day_diff_ms(sample) == 0
+        self._misc(sample, startOfNextDay=99)
+        assert cli.start_of_next_day_diff_ms(sample) == 0
+        self._misc(sample, startOfNextDay=None)
+        assert cli.start_of_next_day_diff_ms(sample) == 0
+
+    def test_missing_config_is_zero(self):
+        assert cli.start_of_next_day_diff_ms({"state": {}}) == 0
+        assert cli.start_of_next_day_diff_ms(None) == 0
+
+    def test_track_defaults_to_the_logical_day(
+        self, fake_ctx, sample, add_task_entity, monkeypatch
+    ):
+        t = add_task_entity(task_id="L" * 21, title="late night")
+        self._misc(sample, startOfNextDayTime="04:00")
+        monkeypatch.setattr(cli, "now_ms", lambda: _ms(2026, 9, 9, 1, 0))
+        monkeypatch.setattr(model, "now_ms", lambda: _ms(2026, 9, 9, 1, 0))
+        assert cli.cmd_track(_args(["track", t["id"], "30m"])) == 0
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["date"] == "2026-09-08"
+
+    def test_stop_uses_the_logical_day(
+        self, fake_ctx, sample, add_task_entity, timer_file, monkeypatch
+    ):
+        t = add_task_entity(task_id="T" * 21, title="timed")
+        self._misc(sample, startOfNextDayTime="04:00")
+        monkeypatch.setattr(cli, "now_ms", lambda: _ms(2026, 9, 9, 1, 0))
+        timer.write_timer(t["id"], "timed", _ms(2026, 9, 9, 0, 0))
+        assert cli.cmd_stop(_args(["stop"])) == 0
+        assert [op["p"]["actionPayload"]["date"] for op in fake_ctx.ops] == [
+            "2026-09-08"
+        ]
+
 
 class TestTimerCommands:
     def _task(self, add_task_entity, **kw):
@@ -1205,9 +1374,10 @@ class TestTimerCommands:
         assert cli.cmd_start(_args(["start"])) == 0
         assert "1h" in capsys.readouterr().out
 
-    def test_bare_start_without_timer_errors(self, fake_ctx, timer_file):
-        with pytest.raises(cli.CliError):
-            cli.cmd_start(_args(["start"]))
+    def test_bare_start_without_timer_is_current(self, fake_ctx, timer_file, capsys):
+        # Bare `sp start` is an alias of `sp current`: exit 1, "no timer".
+        assert cli.cmd_start(_args(["start"])) == 1
+        assert capsys.readouterr().out.strip() == "no timer"
 
     def test_start_same_task_keeps_timer(self, fake_ctx, add_task_entity, timer_file):
         t = self._task(add_task_entity)
@@ -1286,6 +1456,64 @@ class TestTimerCommands:
             {"taskId": t["id"], "date": "2026-09-09", "duration": 1200000},
         ]
 
+    def test_stop_when_task_is_gone_discards_and_exits_0(
+        self, fake_ctx, timer_file, capsys
+    ):
+        timer.write_timer("G" * 21, "vanished", cli.now_ms() - 3600000)
+        assert cli.cmd_stop(_args(["stop"])) == 0
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        assert timer.read_timer() is None
+        out = capsys.readouterr()
+        assert "no longer exists" in out.err
+        assert "the task is gone" in out.out
+
+    def test_start_auto_stop_of_gone_task_still_starts(
+        self, fake_ctx, add_task_entity, timer_file, capsys
+    ):
+        new = self._task(add_task_entity)
+        timer.write_timer("G" * 21, "vanished", cli.now_ms() - 3600000)
+        assert cli.cmd_start(_args(["start", new["id"]])) == 0
+        assert fake_ctx.ops == []
+        assert "no longer exists" in capsys.readouterr().err
+        assert timer.read_timer()["task_id"] == new["id"]
+
+    def test_stop_with_future_start_errors_and_keeps_timer(
+        self, fake_ctx, add_task_entity, timer_file
+    ):
+        t = self._task(add_task_entity)
+        timer.write_timer(t["id"], "timed", cli.now_ms() + 3600000)
+        with pytest.raises(cli.CliError, match="future"):
+            cli.cmd_stop(_args(["stop"]))
+        assert fake_ctx.ops == []
+        assert timer.read_timer()["task_id"] == t["id"]
+
+    def test_stop_discard_does_not_parse_the_file(self, fake_ctx, timer_file, capsys):
+        # --discard is the escape hatch for a corrupt file: clear it blindly.
+        timer_file.write_text("{not json", encoding="utf-8")
+        assert cli.cmd_stop(_args(["stop", "--discard"])) == 0
+        assert not timer_file.exists()
+        assert fake_ctx.ops == []
+
+    def test_stop_discard_without_timer_is_still_ok(self, fake_ctx, timer_file):
+        assert cli.cmd_stop(_args(["stop", "--discard"])) == 0
+
+    def test_failed_put_keeps_the_timer_file(
+        self, sample, add_task_entity, timer_file, monkeypatch
+    ):
+        t = add_task_entity(task_id="T" * 21, title="timed")
+
+        class _ConflictCtx(_FakeCtx):
+            def commit(self, mutations, initial=None):
+                raise ConflictError("PUT: HTTP 412 (concurrent write)")
+
+        ctx = _ConflictCtx(sample)
+        monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+        timer.write_timer(t["id"], "timed", cli.now_ms() - 3600000)
+        with pytest.raises(ConflictError):
+            cli.cmd_stop(_args(["stop"]))
+        # The time is still recoverable: the timer file survives.
+        assert timer.read_timer()["task_id"] == t["id"]
+
     def test_current_without_timer(self, timer_file, capsys):
         assert cli.cmd_current(_args(["current"])) == 1
         assert capsys.readouterr().out.strip() == "no timer"
@@ -1316,6 +1544,17 @@ class TestUntrackCommand:
             "duration": 600000,
         }
         assert "untracked" in capsys.readouterr().out
+
+    def test_untrack_prints_the_clamped_delta(self, fake_ctx, add_task_entity, capsys):
+        t = add_task_entity(task_id="C" * 21, title="clamped")
+        t["timeSpentOnDay"] = {today_str(): 300000}
+        t["timeSpent"] = 300000
+        assert cli.cmd_untrack(_args(["untrack", t["id"], "1h"])) == 0
+        # The op still asks for the full hour (SP's reducer clamps), but the
+        # message reports what actually came off.
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["duration"] == 3600000
+        out = capsys.readouterr().out
+        assert "untracked 5m" in out and "1h" not in out
 
 
 class TestBacklogArgvRewrites:

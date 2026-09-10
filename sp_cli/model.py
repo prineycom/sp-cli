@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import re
 import time
 
 INBOX_PROJECT_ID = "INBOX_PROJECT"
@@ -48,6 +49,78 @@ def today_str(dt: datetime.date | None = None) -> str:
 def day_of_ms(ts: int) -> str:
     """Local YYYY-MM-DD of an epoch-ms timestamp."""
     return datetime.datetime.fromtimestamp(ts / 1000).date().isoformat()
+
+
+# `misc.startOfNextDayTime` is a "HH:MM" string (canonical since v18.5.0);
+# `misc.startOfNextDay` is the deprecated hour-only number kept for older data.
+_START_OF_NEXT_DAY_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def start_of_next_day_diff_ms(d: dict | None = None) -> int:
+    """The logical-day offset in ms (SP's `getStartOfNextDayDiffMs`).
+
+    Mirrors src/app/util/start-of-next-day.util.ts:
+    - a `startOfNextDayTime` string wins outright; when it is present but
+      malformed the whole pair is untrustworthy and the offset resets to 0
+      (SP #7645) — it does NOT fall back to the legacy hour;
+    - only when no time string exists at all is the numeric
+      `startOfNextDay` (whole hours, 0-23) honoured;
+    - anything else (absent, 0, out of range, wrong type) means 0, which
+      keeps plain calendar days.
+
+    Accepts either a whole sync file or a bare `state` dict.
+    """
+    if not isinstance(d, dict):
+        return 0
+    state = d["state"] if isinstance(d.get("state"), dict) else d
+    misc = (state.get("globalConfig") or {}).get("misc")
+    if not isinstance(misc, dict):
+        return 0
+    time_str = misc.get("startOfNextDayTime")
+    if isinstance(time_str, str):
+        m = _START_OF_NEXT_DAY_RE.match(time_str)
+        if not m:
+            return 0
+        return (int(m.group(1)) * 60 + int(m.group(2))) * 60_000
+    hour = misc.get("startOfNextDay")
+    if isinstance(hour, bool) or not isinstance(hour, (int, float)):
+        return 0
+    if hour < 0 or hour > 23:
+        return 0
+    return int(hour) * 3_600_000
+
+
+def logical_day_of_ms(ts: int, d: dict | None = None) -> str:
+    """The day a moment BELONGS to, honouring `misc.startOfNextDay*`.
+
+    With the default offset of 0 this is exactly `day_of_ms`.
+    """
+    return day_of_ms(int(ts) - start_of_next_day_diff_ms(d))
+
+
+def logical_today_str(d: dict | None = None) -> str:
+    """Today as SP sees it (now shifted back by the start-of-next-day offset)."""
+    return logical_day_of_ms(now_ms(), d)
+
+
+def archive_task_entity_maps(d: dict) -> list[dict]:
+    """Every archived-task `entities` map in the file.
+
+    `archiveYoung` / `archiveOld` live at the TOP level in current files, but
+    older (and partially-migrated) ones keep them under `state` — and a file
+    can carry BOTH at once. Every blob is returned so a scan can never
+    short-circuit on the first one it finds and miss the tasks in the other.
+    """
+    state = d.get("state") if isinstance(d.get("state"), dict) else {}
+    maps: list[dict] = []
+    for key in ("archiveYoung", "archiveOld"):
+        for blob in (d.get(key), state.get(key)):
+            if not isinstance(blob, dict):
+                continue
+            entities = (blob.get("task") or {}).get("entities")
+            if isinstance(entities, dict):
+                maps.append(entities)
+    return maps
 
 
 def default_theme(primary: str | None = None) -> dict:
@@ -549,7 +622,12 @@ def make_issue_provider(provider_id: str, key: str, **overrides) -> dict:
     provider["id"] = provider_id
     provider["issueProviderKey"] = key
     provider["isEnabled"] = True
+    # Overrides may only touch fields this key actually has: a stray field
+    # (a CalDAV one on an ICAL provider, or a typo) would sail into the sync
+    # file and fail SP's typia validation for the whole discriminated union.
     for name, value in overrides.items():
+        if name not in provider:
+            raise ValueError(f"issue provider {key}: unknown field '{name}'")
         if value is not None:
             provider[name] = value
     return provider

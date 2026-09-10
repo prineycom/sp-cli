@@ -4,6 +4,7 @@ import pytest
 
 from conftest import assert_doctor_clean
 from sp_cli import mutations as mut
+from sp_cli import queries as q
 from sp_cli.model import (
     make_board,
     make_issue_provider,
@@ -621,6 +622,77 @@ class TestTrackTime:
         t = add_task_entity(title="neg")
         with pytest.raises(mut.MutationError):
             mut.track_time(sample, b, t["id"], "2026-09-09", -5)
+
+
+def _parent_with_subs(add_task_entity, n=2):
+    parent = add_task_entity(task_id="P" * 21, title="parent")
+    subs = []
+    for i in range(n):
+        sub = add_task_entity(
+            task_id=chr(ord("A") + i) * 21, title=f"sub{i}", parent_id=parent["id"]
+        )
+        parent["subTaskIds"].append(sub["id"])
+        subs.append(sub)
+    return parent, subs
+
+
+class TestParentTimeRollup:
+    """SP's updateParentTimeSpentIncremental: a subtask's time aggregates onto
+    its parent (state only — the KT/TR payload never mentions the parent)."""
+
+    def test_track_on_subtask_updates_parent(self, sample, b, add_task_entity):
+        parent, (a, c) = _parent_with_subs(add_task_entity)
+        mut.track_time(sample, b, a["id"], "2026-09-09", 600000)
+        mut.track_time(sample, b, c["id"], "2026-09-09", 300000)
+        mut.track_time(sample, b, c["id"], "2026-09-10", 60000)
+        assert parent["timeSpentOnDay"] == {"2026-09-09": 900000, "2026-09-10": 60000}
+        assert parent["timeSpent"] == 960000
+        # Every op still targets the SUBTASK only.
+        assert [op["d"] for op in b.ops] == [a["id"], c["id"], c["id"]]
+        assert all("parent" not in str(op["p"]["actionPayload"]) for op in b.ops)
+        assert_doctor_clean(sample)
+
+    def test_untrack_on_subtask_updates_parent(self, sample, b, add_task_entity):
+        parent, (a, c) = _parent_with_subs(add_task_entity)
+        mut.track_time(sample, b, a["id"], "2026-09-09", 600000)
+        mut.track_time(sample, b, c["id"], "2026-09-09", 300000)
+        assert mut.untrack_time(sample, b, a["id"], "2026-09-09", 200000) == 200000
+        assert parent["timeSpentOnDay"] == {"2026-09-09": 700000}
+        assert parent["timeSpent"] == 700000
+
+    def test_untrack_clamp_only_removes_what_was_there(
+        self, sample, b, add_task_entity
+    ):
+        parent, (a, c) = _parent_with_subs(add_task_entity)
+        mut.track_time(sample, b, a["id"], "2026-09-09", 600000)
+        mut.track_time(sample, b, c["id"], "2026-09-09", 300000)
+        # Asking for more than the subtask has must not drag the parent below
+        # the sibling's contribution.
+        assert mut.untrack_time(sample, b, a["id"], "2026-09-09", 99_000_000) == 600000
+        assert a["timeSpentOnDay"]["2026-09-09"] == 0
+        assert parent["timeSpentOnDay"] == {"2026-09-09": 300000}
+        assert parent["timeSpent"] == 300000
+
+    def test_parent_day_key_dropped_when_it_reaches_zero(
+        self, sample, b, add_task_entity
+    ):
+        parent, (a, _) = _parent_with_subs(add_task_entity)
+        mut.track_time(sample, b, a["id"], "2026-09-09", 600000)
+        mut.untrack_time(sample, b, a["id"], "2026-09-09", 600000)
+        assert parent["timeSpentOnDay"] == {}
+        assert parent["timeSpent"] == 0
+
+    def test_top_level_task_has_no_rollup(self, sample, b, add_task_entity):
+        parent, _ = _parent_with_subs(add_task_entity)
+        top = add_task_entity(task_id="Z" * 21, title="top")
+        mut.track_time(sample, b, top["id"], "2026-09-09", 600000)
+        assert parent["timeSpentOnDay"] == {}
+
+    def test_missing_parent_is_a_no_op(self, sample, b, add_task_entity):
+        t = add_task_entity(task_id="O" * 21, title="orphan")
+        t["parentId"] = "ghost"
+        mut.track_time(sample, b, t["id"], "2026-09-09", 600000)
+        assert t["timeSpent"] == 600000
 
 
 class TestUntrackTime:
@@ -1867,6 +1939,26 @@ class TestIssueProviders:
         )
         mut.provider_add(sample, b, provider)
         payload = _last_op(b)["p"]["actionPayload"]["issueProvider"]
+        assert set(payload) == {
+            "id",
+            "issueProviderKey",
+            "isEnabled",
+            "isAutoPoll",
+            "isAutoAddToBacklog",
+            "isIntegratedAddTaskBar",
+            "defaultProjectId",
+            "pinnedSearch",
+            "pollingMode",
+            "defaultTagIds",
+            "defaultNote",
+            "caldavUrl",
+            "resourceName",
+            "username",
+            "password",
+            "categoryFilter",
+            "isAddSubTasks",
+            "twoWaySync",
+        }
         assert payload["issueProviderKey"] == "CALDAV"
         assert payload["password"] == "pw"
         assert payload["categoryFilter"] is None
@@ -1884,6 +1976,19 @@ class TestIssueProviders:
     def test_unknown_key_rejected(self):
         with pytest.raises(ValueError, match="unsupported issue provider key"):
             make_issue_provider("X" * 21, "JIRA")
+
+    def test_override_of_unknown_field_rejected(self):
+        with pytest.raises(ValueError, match="unknown field 'noSuchField'"):
+            make_issue_provider("X" * 21, "ICAL", noSuchField=1)
+        # A field belonging to the OTHER built-in key is just as wrong.
+        with pytest.raises(ValueError, match="unknown field 'caldavUrl'"):
+            make_issue_provider("X" * 21, "ICAL", caldavUrl="https://dav/")
+        with pytest.raises(ValueError, match="unknown field 'icalUrl'"):
+            make_issue_provider("X" * 21, "CALDAV", icalUrl="https://c/x.ics")
+
+    def test_override_of_common_field_allowed(self):
+        p = make_issue_provider("X" * 21, "ICAL", defaultNote="n", isAutoPoll=False)
+        assert p["defaultNote"] == "n" and p["isAutoPoll"] is False
 
     def test_update_emits_iu(self, sample, b):
         mut.provider_add(sample, b, self._ical())
@@ -1943,12 +2048,14 @@ class TestIssueProviders:
             sample, "archiveYoung", self._linked_task("Y" * 21, pid)
         )
         old = self._archive(sample, "archiveOld", self._linked_task("O" * 21, pid))
+        mut.provider_add(sample, b, self._ical("Q" * 21))
         other = self._archive(
-            sample, "archiveOld", self._linked_task("N" * 21, "other-provider")
+            sample, "archiveOld", self._linked_task("N" * 21, "Q" * 21)
         )
 
         unlinked = mut.provider_delete(sample, b, pid)
-        assert sorted(unlinked) == sorted([live["id"], young["id"], old["id"]])
+        # live first, then archiveYoung, then archiveOld — deterministic.
+        assert unlinked == [live["id"], young["id"], old["id"]]
         op = _last_op(b)
         assert (op["a"], op["o"], op["e"], op["d"]) == (
             "HID",
@@ -1956,8 +2063,10 @@ class TestIssueProviders:
             "ISSUE_PROVIDER",
             pid,
         )
-        assert op["p"]["actionPayload"]["issueProviderId"] == pid
-        assert sorted(op["p"]["actionPayload"]["taskIdsToUnlink"]) == sorted(unlinked)
+        assert op["p"]["actionPayload"] == {
+            "issueProviderId": pid,
+            "taskIdsToUnlink": [live["id"], young["id"], old["id"]],
+        }
 
         fields = (
             "issueId",
@@ -1973,9 +2082,42 @@ class TestIssueProviders:
             assert not [f for f in fields if f in task]
         # A task of a different provider keeps every field.
         assert all(f in other for f in fields)
-        assert self._reg(sample)["ids"] == []
-        assert self._reg(sample)["entities"] == {}
+        assert self._reg(sample)["ids"] == ["Q" * 21]
         assert_doctor_clean(sample)
+
+    def test_delete_scans_both_top_level_and_state_archives(self, sample, b):
+        """A file can carry archiveYoung at the top level AND archiveOld under
+        `state`; neither blob may be skipped (`a or b` short-circuits)."""
+        pid = "P" * 21
+        mut.provider_add(sample, b, self._ical(pid))
+        young = self._linked_task("Y" * 21, pid)
+        self._archive(sample, "archiveYoung", young)
+        old = self._linked_task("O" * 21, pid)
+        self._archive(sample["state"], "archiveOld", old)
+        # …and a second pair in the OTHER location for each key.
+        state_young = self._linked_task("S" * 21, pid)
+        self._archive(sample["state"], "archiveYoung", state_young)
+        top_old = self._linked_task("T" * 21, pid)
+        self._archive(sample, "archiveOld", top_old)
+
+        unlinked = mut.provider_delete(sample, b, pid)
+        assert sorted(unlinked) == sorted(
+            [young["id"], old["id"], state_young["id"], top_old["id"]]
+        )
+        assert sorted(_last_op(b)["p"]["actionPayload"]["taskIdsToUnlink"]) == sorted(
+            unlinked
+        )
+        for task in (young, old, state_young, top_old):
+            assert "issueProviderId" not in task and "issueId" not in task
+        assert q.tasks_of_provider(sample, pid) == []
+        assert_doctor_clean(sample)
+
+    def test_tasks_of_provider_sees_both_archive_locations(self, sample, b):
+        pid = "P" * 21
+        mut.provider_add(sample, b, self._ical(pid))
+        self._archive(sample, "archiveYoung", self._linked_task("Y" * 21, pid))
+        self._archive(sample["state"], "archiveOld", self._linked_task("O" * 21, pid))
+        assert sorted(q.tasks_of_provider(sample, pid)) == ["O" * 21, "Y" * 21]
 
     def test_delete_without_linked_tasks(self, sample, b):
         mut.provider_add(sample, b, self._ical())

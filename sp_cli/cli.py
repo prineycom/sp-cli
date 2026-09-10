@@ -16,6 +16,7 @@ from sp_cli.ids import nanoid
 from sp_cli.model import (
     BACKLOG_STATE,
     INBOX_PROJECT_ID,
+    ISSUE_PROVIDER_DEFAULT_CFG,
     ISSUE_PROVIDER_URL_FIELD,
     PANEL_SORT_BY,
     SCHEDULED_STATE,
@@ -23,6 +24,7 @@ from sp_cli.model import (
     STREAK_DAY_KEYS,
     TASK_DONE_STATE,
     TODAY_TAG_ID,
+    logical_today_str,
     make_board,
     make_issue_provider,
     make_note,
@@ -33,6 +35,7 @@ from sp_cli.model import (
     make_tag,
     make_task,
     now_ms,
+    start_of_next_day_diff_ms,
     streak_week_days,
     today_str,
 )
@@ -601,7 +604,9 @@ def cmd_track(args) -> int:
     d = client.get()
     tid = q.resolve_task(d, args.id)
     ms = render.parse_duration(args.duration)
-    date = _parse_day(args.date) if args.date else today_str()
+    # The default day is SP's LOGICAL today (misc.startOfNextDay*), so time
+    # tracked just after midnight still lands on the day the user is working.
+    date = _parse_day(args.date) if args.date else logical_today_str(d)
     store.commit([lambda dd, b: mut.track_time(dd, b, tid, date, ms)], initial=d)
     print(f"tracked {render.format_duration(ms)} on {render.short_id(tid)} ({date})")
     return 0
@@ -612,9 +617,19 @@ def cmd_untrack(args) -> int:
     d = client.get()
     tid = q.resolve_task(d, args.id)
     ms = render.parse_duration(args.duration)
-    date = _parse_day(args.date) if args.date else today_str()
-    store.commit([lambda dd, b: mut.untrack_time(dd, b, tid, date, ms)], initial=d)
-    print(f"untracked {render.format_duration(ms)} on {render.short_id(tid)} ({date})")
+    date = _parse_day(args.date) if args.date else logical_today_str(d)
+    removed: list[int] = []
+
+    def _untrack(dd, b):
+        removed.append(mut.untrack_time(dd, b, tid, date, ms))
+
+    store.commit([_untrack], initial=d)
+    # SP's reducer clamps at zero, so report what actually came off.
+    actual = removed[0] if removed else 0
+    print(
+        f"untracked {render.format_duration(actual)} on "
+        f"{render.short_id(tid)} ({date})"
+    )
     return 0
 
 
@@ -629,25 +644,54 @@ def _print_timer(running: dict) -> None:
     )
 
 
-def _stop_timer(store, running: dict, initial: dict | None = None) -> int:
+def _stop_timer(store, running: dict, d: dict) -> int | None:
     """Write the accrued time (one KT op per day, single batch), clear the
-    timer file, print the summary. Returns the tracked ms."""
+    timer file, print the summary. Returns the tracked ms — or None when the
+    task has vanished and the segment was dropped.
+
+    A negative elapsed (the clock moved backwards, or the file was hand-edited
+    with a future `started_at`) is refused and the timer file is KEPT, so
+    nothing is silently lost.
+    """
     tid = running["task_id"]
     started = int(running["started_at"])
     elapsed = now_ms() - started
+    if elapsed < 0:
+        raise CliError(
+            f"timer on {render.short_id(tid)} started in the future "
+            f"({render.format_ts(started)}); refusing to track negative time. "
+            "Fix the clock, or run `sp stop --discard`."
+        )
+    if tid not in d["state"]["task"]["entities"]:
+        # Deleted on another device while the timer ran: there is no task for
+        # a KT to land on, so drop the segment rather than emit a dangling op.
+        print(
+            f"warning: task {render.short_id(tid)} no longer exists "
+            "(deleted elsewhere?)",
+            file=sys.stderr,
+        )
+        timer.clear_timer()
+        print(
+            f"discarded {render.format_duration(max(elapsed, 0))} on "
+            f"{render.short_id(tid)} {running.get('title', '')}: "
+            "the task is gone"
+        )
+        return None
     if elapsed < timer.MIN_TRACK_MS:
         print(
             f"warning: elapsed {max(elapsed, 0) // 1000}s is under 1m; tracking 1m",
             file=sys.stderr,
         )
         elapsed = timer.MIN_TRACK_MS
-    segments = timer.split_by_day(started, started + elapsed)
+    segments = timer.split_by_day(
+        started, started + elapsed, start_of_next_day_diff_ms(d)
+    )
     store.commit(
         [
             (lambda dd, b, day=day, ms=ms: mut.track_time(dd, b, tid, day, ms))
             for day, ms in segments
         ],
-        initial=initial,
+        initial=d,
     )
     timer.clear_timer()
     total = sum(ms for _, ms in segments)
@@ -664,8 +708,10 @@ def _stop_timer(store, running: dict, initial: dict | None = None) -> int:
 def cmd_start(args) -> int:
     running = timer.read_timer()
     if not args.id:
+        # Bare `sp start` is an alias of `sp current`.
         if not running:
-            raise CliError("start: task id required (no timer running)")
+            print("no timer")
+            return 1
         _print_timer(running)
         return 0
     client, store = _ctx()
@@ -678,22 +724,28 @@ def cmd_start(args) -> int:
         if running["task_id"] == tid:
             _print_timer(running)
             return 0
-        _stop_timer(store, running, initial=d)
+        # A vanished previous task only warns — the new timer still starts.
+        _stop_timer(store, running, d)
     timer.write_timer(tid, task.get("title", ""), now_ms())
     print(f"started {render.short_id(tid)} {task.get('title', '')}")
     return 0
 
 
 def cmd_stop(args) -> int:
+    if args.discard:
+        # Blind clear: --discard is the escape hatch for a corrupt timer
+        # file, so it must never parse one.
+        if timer.clear_timer():
+            print("discarded the running timer")
+        else:
+            print("no timer running")
+        return 0
     running = timer.read_timer()
     if not running:
         raise CliError("no timer running")
-    if args.discard:
-        timer.clear_timer()
-        print(f"discarded timer on {render.short_id(running['task_id'])}")
-        return 0
-    _, store = _ctx()
-    _stop_timer(store, running)
+    client, store = _ctx()
+    d = client.get()
+    _stop_timer(store, running, d)
     return 0
 
 
@@ -1477,6 +1529,20 @@ _PLAINTEXT_WARNING = (
 )
 
 
+def _require_writable_provider(key: str | None, what: str) -> None:
+    """The CLI only owns the two providers it can build a complete cfg for.
+
+    Jira/GitHub/GitLab/plugin providers carry cfg shapes (and secrets) the
+    CLI does not model; rewriting or deleting one from here would corrupt it.
+    """
+    if key not in ISSUE_PROVIDER_DEFAULT_CFG:
+        raise CliError(
+            f"provider {what}: {key or 'this provider'} is managed by the app "
+            "and its plugins; only ICAL and CALDAV providers can be edited or "
+            "removed from the CLI"
+        )
+
+
 def _provider_common(args, d: dict) -> tuple[dict, list]:
     """Shared add-flags → cfg fields; returns (fields, extra tag mutations)."""
     fields: dict = {}
@@ -1565,6 +1631,7 @@ def cmd_provider_edit(args) -> int:
     pid = q.resolve_provider(d, args.id)
     provider = d["state"]["issueProvider"]["entities"][pid]
     key = provider.get("issueProviderKey")
+    _require_writable_provider(key, "edit")
 
     changes: dict = {}
     if args.enable:
@@ -1575,6 +1642,12 @@ def cmd_provider_edit(args) -> int:
         field = ISSUE_PROVIDER_URL_FIELD.get(key)
         if not field:
             raise CliError(f"provider edit: --url is not supported for key {key}")
+        if not args.url.strip():
+            # An empty url silently disables polling in SP; make it explicit.
+            raise CliError(
+                "provider edit: --url cannot be empty "
+                "(use --disable to turn the provider off)"
+            )
         changes[field] = args.url
     if args.auto_import:
         changes["isAutoImportForCurrentDay"] = True
@@ -1586,11 +1659,38 @@ def cmd_provider_edit(args) -> int:
         changes["defaultProjectId"] = None
     if args.check_every:
         changes["checkUpdatesEvery"] = render.parse_duration(args.check_every)
-    if ("isAutoImportForCurrentDay" in changes or "checkUpdatesEvery" in changes) and (
-        key != "ICAL"
-    ):
+    if args.banner_before:
+        changes["showBannerBeforeThreshold"] = render.parse_duration(args.banner_before)
+    if args.include_regex is not None:
+        changes["filterIncludeRegex"] = args.include_regex or None
+    if args.exclude_regex is not None:
+        changes["filterExcludeRegex"] = args.exclude_regex or None
+    if args.username is not None:
+        changes["username"] = args.username
+    if args.password is not None:
+        if not args.store_plaintext_credentials:
+            raise CliError(_PLAINTEXT_WARNING)
+        changes["password"] = args.password
+    if args.category_filter is not None:
+        changes["categoryFilter"] = args.category_filter or None
+
+    ical_only = {
+        "isAutoImportForCurrentDay",
+        "checkUpdatesEvery",
+        "showBannerBeforeThreshold",
+        "filterIncludeRegex",
+        "filterExcludeRegex",
+    }
+    caldav_only = {"username", "password", "categoryFilter"}
+    if ical_only & set(changes) and key != "ICAL":
         raise CliError(
-            "provider edit: --auto-import / --check-every only apply to ICAL providers"
+            "provider edit: --auto-import / --check-every / --banner-before / "
+            "--include-regex / --exclude-regex only apply to ICAL providers"
+        )
+    if caldav_only & set(changes) and key != "CALDAV":
+        raise CliError(
+            "provider edit: --username / --password / --category-filter "
+            "only apply to CalDAV providers"
         )
     if not changes:
         raise CliError("provider edit: nothing to change")
@@ -1604,6 +1704,9 @@ def cmd_provider_rm(args) -> int:
     client, store = _ctx()
     d = client.get()
     pid = q.resolve_provider(d, args.id)
+    _require_writable_provider(
+        d["state"]["issueProvider"]["entities"][pid].get("issueProviderKey"), "rm"
+    )
     linked = q.tasks_of_provider(d, pid)
     what = f"delete provider {pid} and unlink {len(linked)} task(s)?"
     if not _confirm(what, args.yes):
@@ -1897,6 +2000,7 @@ _PROVIDER_USAGE = """usage: sp provider <subcommand> ...
   sp provider add-caldav --url U --resource R --username U --password P \\
       --store-plaintext-credentials
   sp provider edit ID [--enable|--disable] [--url U] [--project P] ...
+                                        (ICAL/CALDAV only)
   sp provider rm ID [--yes]
   sp provider order ID [ID ...]         listed providers first
 
@@ -2245,7 +2349,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-auto-import", action="store_true")
     s.add_argument("--project")
     s.add_argument("--no-project", action="store_true")
-    s.add_argument("--check-every", help="poll interval, e.g. 2h")
+    s.add_argument("--check-every", help="poll interval, e.g. 2h (ICAL)")
+    s.add_argument("--banner-before", help="banner lead time, e.g. 2h (ICAL)")
+    s.add_argument("--include-regex", help="only import matching events (ICAL)")
+    s.add_argument("--exclude-regex", help="skip matching events (ICAL)")
+    s.add_argument("--username", help="CalDAV user")
+    s.add_argument("--password", help="CalDAV password (needs --store-plaintext-credentials)")
+    s.add_argument("--category-filter", help="CalDAV category filter")
+    s.add_argument(
+        "--store-plaintext-credentials",
+        action="store_true",
+        help="required with --password: it is stored in plain text in the sync file",
+    )
     s = add("provider-rm", cmd_provider_rm, "delete a provider, unlinking its tasks")
     s.add_argument("id")
     s.add_argument("--yes", action="store_true")

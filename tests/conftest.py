@@ -18,6 +18,12 @@ SAMPLE_PATH = REPO_ROOT / "docs" / "sample-sync-data.json"
 _SAMPLE = json.loads(strip_prefix(SAMPLE_PATH.read_text(encoding="utf-8")))
 
 
+@pytest.fixture(autouse=True)
+def _isolated_timer_file(tmp_path, monkeypatch):
+    """No test may ever touch the developer's real ~/.local timer file."""
+    monkeypatch.setenv("SP_CLI_TIMER", str(tmp_path / "timer.json"))
+
+
 @pytest.fixture
 def sample() -> dict:
     """Fresh deep copy of the real sample sync file (prefix stripped)."""

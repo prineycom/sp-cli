@@ -13,6 +13,7 @@ from sp_cli.model import (
     METRIC_DEAD_FIELDS,
     METRIC_FIELDS,
     TODAY_TAG_ID,
+    archive_task_entity_maps,
     day_of_ms,
     make_metric,
     make_repeat_cfg,
@@ -593,6 +594,30 @@ def set_deadline(
 
 # ---------------------------------------------------------------- tracking
 
+def _rollup_parent_time(state: dict, task: dict, date: str, delta: int) -> None:
+    """Mirror SP's `updateParentTimeSpentIncremental`.
+
+    A subtask's time is aggregated onto its parent: the parent's value for
+    the day moves by the same delta (the key is dropped once it reaches 0,
+    exactly as SP does) and `timeSpent` is the sum over `timeSpentOnDay`.
+    State-only — the KT/TR payload never mentions the parent, every device
+    derives the rollup itself.
+    """
+    parent_id = task.get("parentId")
+    if not parent_id or not delta:
+        return
+    parent = state["task"]["entities"].get(parent_id)
+    if parent is None:
+        return
+    tsod = parent.setdefault("timeSpentOnDay", {})
+    value = int(tsod.get(date, 0)) + delta
+    if value > 0:
+        tsod[date] = value
+    else:
+        tsod.pop(date, None)
+    parent["timeSpent"] = sum(int(v) for v in tsod.values())
+
+
 def track_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) -> None:
     state = _state(d)
     task = _task(state, task_id)
@@ -619,21 +644,33 @@ def track_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) ->
     tsod = task.setdefault("timeSpentOnDay", {})
     tsod[date] = int(tsod.get(date, 0)) + duration
     task["timeSpent"] = sum(int(v) for v in tsod.values())
+    _rollup_parent_time(state, task, date, duration)
 
 
-def untrack_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) -> None:
+def untrack_time(d: dict, b: OpBuilder, task_id: str, date: str, duration: int) -> int:
     """Remove tracked time (correction). TR payload key is `id`, not `taskId`;
-    the reducer clamps at zero (max(x - duration, 0))."""
+    the reducer clamps at zero (max(x - duration, 0)).
+
+    Returns the ms actually removed, which is less than `duration` when the
+    clamp bites.
+    """
     state = _state(d)
     task = _task(state, task_id)
     if not isinstance(duration, int) or duration < 0:
         raise MutationError("untrack: duration must be a non-negative integer (ms)")
 
+    # No entityChanges: SP's TR reducer recomputes everything (including the
+    # parent rollup) from {id, date, duration}, and a stale entity snapshot
+    # here would fight the clamp on replay. Deliberately payload-only.
     b.op("TR", "UPD", "TASK", task_id, {"id": task_id, "date": date, "duration": duration})
 
     tsod = task.setdefault("timeSpentOnDay", {})
-    tsod[date] = max(int(tsod.get(date, 0)) - duration, 0)
+    before = int(tsod.get(date, 0))
+    tsod[date] = max(before - duration, 0)
     task["timeSpent"] = sum(int(v) for v in tsod.values())
+    removed = before - tsod[date]
+    _rollup_parent_time(state, task, date, -removed)
+    return removed
 
 
 # ---------------------------------------------------------------- repeat
@@ -1444,8 +1481,9 @@ def _unlink_issue_fields(task: dict) -> None:
 def provider_delete(d: dict, b: OpBuilder, provider_id: str) -> list[str]:
     """HID: delete a provider and unlink every task that referenced it.
 
-    taskIdsToUnlink is collected from live tasks AND both archive blobs; the
-    issue fields are cleared in all three places. Returns the unlinked ids.
+    taskIdsToUnlink is collected from live tasks AND every archive blob
+    (archiveYoung/archiveOld, top-level and under `state`); the issue fields
+    are cleared in all of them. Returns the unlinked ids.
     """
     state = _state(d)
     reg = _provider_reg(state)
@@ -1457,12 +1495,7 @@ def provider_delete(d: dict, b: OpBuilder, provider_id: str) -> list[str]:
         if state["task"]["entities"].get(tid, {}).get("issueProviderId")
         == provider_id
     ]
-    archives = []
-    for key in ("archiveYoung", "archiveOld"):
-        blob = d.get(key) or state.get(key) or {}
-        arch_reg = blob.get("task") or {}
-        entities = arch_reg.get("entities") or {}
-        archives.append(entities)
+    archives = archive_task_entity_maps(d)
     task_ids = list(live)
     for entities in archives:
         for tid, task in entities.items():

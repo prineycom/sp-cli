@@ -229,7 +229,9 @@ payload затирает поля. Полей mood/productivity/obstruction/impr
 ./sp provider add-caldav --url U --resource R --username U --password P \
     [--category-filter C] [--project P] [--tag T ...] --store-plaintext-credentials
 ./sp provider edit <id> [--enable|--disable] [--url U] \
-    [--auto-import|--no-auto-import] [--project P|--no-project] [--check-every 2h]
+    [--auto-import|--no-auto-import] [--project P|--no-project] \
+    [--check-every 2h] [--banner-before 2h] [--include-regex RE] [--exclude-regex RE] \
+    [--username U] [--password P --store-plaintext-credentials] [--category-filter C]
 ./sp provider rm <id> [--yes]                 # удалить провайдер и отвязать его задачи
 ./sp provider order <id>...                   # перечисленные — первыми, хвост сохраняется
 ```
@@ -238,8 +240,9 @@ CLI только подключает и настраивает провайде
 создаёт само приложение при следующем поллинге, CLI их не синтезирует.
 Провайдер всегда пишется целиком (полный cfg для своего ключа): SP валидирует
 built-in провайдеров через typia и отбраковывает частичный объект.
-`provider rm` собирает `taskIdsToUnlink` из живых задач **и обоих архивов**
-(`archiveYoung`/`archiveOld`) и вычищает у них поля привязки к issue
+`provider rm` собирает `taskIdsToUnlink` из живых задач **и всех архивных блобов**
+(`archiveYoung`/`archiveOld` — и на верхнем уровне файла, и внутри `state`:
+файл может нести оба сразу) и вычищает у них поля привязки к issue
 (`issueId`, `issueProviderId`, `issueType`, `issueWasUpdated`,
 `issueLastUpdated`, `issueAttachmentNr`, `issueTimeTracked`, `issuePoints`).
 
@@ -247,8 +250,14 @@ built-in провайдеров через typia и отбраковывает �
 **открытым текстом** (и попадают в каждый бэкап). Поэтому `add-caldav` без
 явного флага `--store-plaintext-credentials` отказывается работать.
 
-Поддерживаются ключи `ICAL` и `CALDAV`. Провайдеры-плагины (`plugin:*`) и
-`dismissedCalendarAutoImportEventIdsByProvider` CLI не трогает.
+Поддерживаются ключи `ICAL` и `CALDAV`. Провайдеры-плагины (`plugin:*`),
+Jira/GitHub/GitLab и `dismissedCalendarAutoImportEventIdsByProvider` CLI не
+трогает: `provider edit`/`provider rm` для чужого ключа отказывают — такой
+провайдер редактируется в приложении.
+
+`sp doctor` дополнительно ругается на задачи (живые и архивные) с
+`issueProviderId`, указывающим в никуда, и на built-in ICAL/CALDAV провайдеров
+с неполным cfg.
 
 ### Время / worklog
 
@@ -262,10 +271,11 @@ built-in провайдеров через typia и отбраковывает �
 
 ```sh
 ./sp start <id>          # запустить таймер (если уже идёт другой — сначала автостоп)
-./sp start               # показать текущий таймер
+./sp start               # показать текущий таймер (алиас `current`: exit 1, если его нет)
 ./sp current [--json]    # что тикает: задача, старт, elapsed (exit 1, если таймера нет)
 ./sp stop                # остановить и списать время (KT), exit 2 если таймера нет
-./sp stop --discard      # сбросить без записи времени
+./sp stop --discard      # сбросить без записи времени (файл трётся вслепую —
+                         #   работает и на битом timer.json)
 ```
 
 Таймер локальный: `currentTaskId` в SP не синкается (нет op-представления), поэтому
@@ -273,6 +283,21 @@ built-in провайдеров через typia и отбраковывает �
 env `SP_CLI_TIMER`), а по сети уходит только натиканное время при `stop` — один op
 `KT` на день. Таймер через полночь разбивается на несколько `KT` в одном батче.
 Меньше минуты — предупреждение и списание 1m (или `--discard`).
+Если задача успела исчезнуть (удалена на другом устройстве), `stop` предупреждает
+в stderr, отбрасывает отрезок, чистит файл таймера и выходит с 0; автостоп в
+`start` ведёт себя так же и всё равно запускает новую задачу. `started_at` из
+будущего — ошибка (exit 2), файл таймера сохраняется.
+
+День у `track`/`stop` — **логический**: `globalConfig.misc.startOfNextDayTime`
+(строка `"HH:MM"`, канон) или устаревший числовой `misc.startOfNextDay` (часы,
+учитывается только если строки нет вовсе). Как и в SP, битая строка сбрасывает
+смещение в 0, а не откатывается к числу. При значении по умолчанию (0) границей
+остаётся обычная полночь.
+
+Время подзадачи агрегируется на родителя: `track`/`untrack` пересчитывают
+`timeSpentOnDay[date]` и `timeSpent` родительской задачи (как
+`updateParentTimeSpentIncremental` в SP) — только в state, payload op не
+меняется, каждое устройство выводит роллап само.
 
 ### Сервисные
 

@@ -204,6 +204,49 @@ class TestDoctor:
     def test_clean_sample(self, sample):
         assert q.doctor(sample) == []
 
+    @staticmethod
+    def _seed_provider(d, pid="P" * 21, key="ICAL", **overrides):
+        provider = make_issue_provider(pid, key, **overrides)
+        reg = d["state"].setdefault("issueProvider", {"ids": [], "entities": {}})
+        reg.setdefault("ids", []).append(pid)
+        reg.setdefault("entities", {})[pid] = provider
+        return provider
+
+    def test_dangling_issue_provider_id_on_live_task(self, sample, add_task_entity):
+        t = add_task_entity(task_id="D" * 21)
+        t["issueProviderId"] = "gone"
+        assert any(
+            "issueProviderId 'gone' does not exist" in p for p in q.doctor(sample)
+        )
+        self._seed_provider(sample, "gone")
+        assert q.doctor(sample) == []
+
+    def test_dangling_issue_provider_id_in_archives(self, sample):
+        for key, holder in (("archiveYoung", sample), ("archiveOld", sample["state"])):
+            task = make_task(key[7] * 21, "archived", "INBOX_PROJECT")
+            task["issueProviderId"] = "gone"
+            holder[key] = {"task": {"ids": [task["id"]], "entities": {task["id"]: task}}}
+        problems = [p for p in q.doctor(sample) if "issueProviderId" in p]
+        assert len(problems) == 2
+
+    def test_incomplete_builtin_provider_cfg(self, sample):
+        provider = self._seed_provider(sample)
+        del provider["icalUrl"]
+        del provider["pollingMode"]
+        problems = [p for p in q.doctor(sample) if "cfg is incomplete" in p]
+        assert len(problems) == 1
+        assert "icalUrl" in problems[0] and "pollingMode" in problems[0]
+
+    def test_non_builtin_provider_cfg_not_checked(self, sample):
+        reg = sample["state"].setdefault("issueProvider", {"ids": [], "entities": {}})
+        reg["ids"].append("J" * 21)
+        reg["entities"]["J" * 21] = {
+            "id": "J" * 21,
+            "issueProviderKey": "JIRA",
+            "isEnabled": True,
+        }
+        assert q.doctor(sample) == []
+
     def test_detects_ids_entities_desync(self, sample):
         sample["state"]["task"]["ids"].append("ghost")
         assert any("ghost" in p for p in q.doctor(sample))

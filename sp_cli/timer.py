@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 
 from sp_cli.config import timer_path
+from sp_cli.model import day_of_ms
 
 MIN_TRACK_MS = 60_000
 
@@ -79,26 +80,31 @@ def clear_timer(path: str | os.PathLike | None = None) -> bool:
         raise TimerError(f"cannot remove timer file {p}: {e}") from None
 
 
-def _midnight_after(ms: int) -> int:
-    day = datetime.datetime.fromtimestamp(ms / 1000).date()
+def _next_day_boundary(ms: int, diff_ms: int = 0) -> int:
+    """The next logical day change at or after `ms` (exclusive)."""
+    day = datetime.datetime.fromtimestamp((ms - diff_ms) / 1000).date()
     nxt = datetime.datetime.combine(
         day + datetime.timedelta(days=1), datetime.time.min
     )
-    return int(nxt.timestamp() * 1000)
+    return int(nxt.timestamp() * 1000) + diff_ms
 
 
-def split_by_day(started_at: int, stopped_at: int) -> list[tuple[str, int]]:
-    """Split an interval into per-local-day (YYYY-MM-DD, duration_ms) chunks.
+def split_by_day(
+    started_at: int, stopped_at: int, diff_ms: int = 0
+) -> list[tuple[str, int]]:
+    """Split an interval into per-logical-day (YYYY-MM-DD, duration_ms) chunks.
 
-    A timer running across midnight yields one chunk per day, so the stop
-    emits one KT op per day (all in a single batch).
+    A timer running across the day boundary yields one chunk per day, so the
+    stop emits one KT op per day (all in a single batch). `diff_ms` is the
+    start-of-next-day offset (model.start_of_next_day_diff_ms): with the
+    default 0 the boundary is plain local midnight.
     """
     segments: list[tuple[str, int]] = []
     cur = int(started_at)
     end = int(stopped_at)
     while cur < end:
-        day = datetime.datetime.fromtimestamp(cur / 1000).date().isoformat()
-        chunk_end = min(_midnight_after(cur), end)
+        day = day_of_ms(cur - diff_ms)
+        chunk_end = min(_next_day_boundary(cur, diff_ms), end)
         segments.append((day, chunk_end - cur))
         cur = chunk_end
     return segments

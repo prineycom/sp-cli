@@ -5,11 +5,14 @@ from __future__ import annotations
 import datetime
 
 from sp_cli.model import (
+    ISSUE_PROVIDER_COMMON_CFG,
+    ISSUE_PROVIDER_DEFAULT_CFG,
     ISSUE_PROVIDER_URL_FIELD,
     METRIC_DEAD_FIELDS,
     PANEL_SORT_BY,
     SIMPLE_COUNTER_TYPES,
     TODAY_TAG_ID,
+    archive_task_entity_maps,
     day_of_ms,
     today_str,
 )
@@ -433,11 +436,16 @@ def agenda(d: dict) -> dict:
 # ---------------------------------------------------------------- worklog
 
 def _archive_tasks(d: dict) -> list[dict]:
-    tasks = []
-    for key in ("archiveYoung", "archiveOld"):
-        blob = d.get(key) or d["state"].get(key) or {}
-        reg = blob.get("task") or {}
-        tasks.extend((reg.get("entities") or {}).values())
+    """Every archived task, from EVERY archive blob (top-level and under
+    `state`), deduped by id so a task present in both is counted once."""
+    tasks: list[dict] = []
+    seen: set[str] = set()
+    for entities in archive_task_entity_maps(d):
+        for tid, task in entities.items():
+            if tid in seen:
+                continue
+            seen.add(tid)
+            tasks.append(task)
     return tasks
 
 
@@ -687,5 +695,40 @@ def doctor(d: dict) -> list[str]:
         for tid in ids:
             if tid not in task_ids:
                 problems.append(f"planner {day}: references missing task {tid}")
+
+    providers = (state.get("issueProvider") or {}).get("entities") or {}
+    for pid, provider in providers.items():
+        key = provider.get("issueProviderKey")
+        required = ISSUE_PROVIDER_DEFAULT_CFG.get(key)
+        if required is None:
+            # Non-built-in keys (JIRA, GitHub, plugins…) are the app's to
+            # validate; the CLI only guarantees the two it can write.
+            continue
+        missing = sorted(
+            f
+            for f in list(ISSUE_PROVIDER_COMMON_CFG) + list(required)
+            if f not in provider
+        )
+        if missing:
+            problems.append(
+                f"issue provider {pid}: {key} cfg is incomplete, missing "
+                f"{', '.join(missing)} (SP rejects a partial built-in provider)"
+            )
+
+    # A dangling issueProviderId leaves a task permanently marked as an issue
+    # with nothing to sync it against — check the archives too, since HID
+    # unlinks there as well.
+    seen_dangling: set[str] = set()
+    for task in list(tasks.values()) + _archive_tasks(d):
+        ipid = task.get("issueProviderId")
+        if not ipid or ipid in providers:
+            continue
+        tid = task.get("id")
+        if tid in seen_dangling:
+            continue
+        seen_dangling.add(tid)
+        problems.append(
+            f"task {tid}: issueProviderId '{ipid}' does not exist"
+        )
 
     return problems
