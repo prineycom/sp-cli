@@ -2744,3 +2744,140 @@ class TestRepeatDelete:
     def test_unknown_cfg_is_refused(self, sample, b):
         with pytest.raises(mut.MutationError, match="repeat config not found"):
             mut.repeat_delete(sample, b, "Z" * 21)
+
+
+class TestRepeatUpdate:
+    @staticmethod
+    def _seed(sample, b, **extra):
+        t = make_task("T" * 21, "repeating", "INBOX_PROJECT")
+        mut.add_task(sample, b, t)
+        mut.repeat_add(
+            sample, b, "T" * 21, "R" * 21, repeat_cycle="DAILY",
+            start_time="09:00", remind_at="AtStart",
+        )
+        sample["state"]["taskRepeatCfg"]["entities"]["R" * 21].update(extra)
+        return sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+
+    def test_ru_op_shape(self, sample, b):
+        self._seed(sample, b)
+        mut.repeat_update(sample, b, "R" * 21, {"title": "renamed"})
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "RU", "UPD", "TASK_REPEAT_CFG", "R" * 21,
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskRepeatCfg": {"id": "R" * 21, "changes": {"title": "renamed"}}
+        }
+        assert "clearedFields" not in op["p"]["actionPayload"]
+        assert op["p"]["entityChanges"] == []
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["title"] == "renamed"
+        assert_doctor_clean(sample)
+
+    def test_pause_and_resume(self, sample, b):
+        self._seed(sample, b)
+        mut.repeat_update(sample, b, "R" * 21, {"isPaused": True})
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["isPaused"] is True
+        mut.repeat_update(sample, b, "R" * 21, {"isPaused": False})
+        assert cfg["isPaused"] is False
+        assert _last_op(b)["p"]["actionPayload"]["taskRepeatCfg"]["changes"] == {
+            "isPaused": False
+        }
+
+    def test_cleared_fields_are_siblings_and_removed_from_entity(self, sample, b):
+        self._seed(sample, b, defaultEstimate=1800000, notes="n")
+        mut.repeat_update(
+            sample, b, "R" * 21, {"title": "x"},
+            cleared_fields=["startTime", "remindAt", "startTime"],
+        )
+        payload = _last_op(b)["p"]["actionPayload"]
+        # cleared keys are siblings of taskRepeatCfg, deduped, and are NOT
+        # smuggled into changes (JSON would drop the undefined value there)
+        assert payload["clearedFields"] == ["startTime", "remindAt"]
+        assert payload["taskRepeatCfg"]["changes"] == {"title": "x"}
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        # removed outright, never written as null
+        assert "startTime" not in cfg and "remindAt" not in cfg
+        assert cfg["defaultEstimate"] == 1800000
+        assert_doctor_clean(sample)
+
+    def test_clear_only_needs_no_changes(self, sample, b):
+        self._seed(sample, b)
+        mut.repeat_update(sample, b, "R" * 21, {}, cleared_fields=["startTime"])
+        payload = _last_op(b)["p"]["actionPayload"]
+        assert payload["taskRepeatCfg"]["changes"] == {}
+        assert payload["clearedFields"] == ["startTime"]
+
+    def test_non_whitelisted_field_is_refused(self, sample, b):
+        self._seed(sample, b)
+        with pytest.raises(mut.MutationError, match="not clearable"):
+            mut.repeat_update(sample, b, "R" * 21, {}, cleared_fields=["isPaused"])
+
+    def test_field_both_set_and_cleared_is_refused(self, sample, b):
+        self._seed(sample, b)
+        with pytest.raises(mut.MutationError, match="both set and cleared"):
+            mut.repeat_update(
+                sample, b, "R" * 21, {"startTime": "10:00"},
+                cleared_fields=["startTime"],
+            )
+
+    def test_empty_update_is_refused(self, sample, b):
+        self._seed(sample, b)
+        with pytest.raises(mut.MutationError, match="nothing to change"):
+            mut.repeat_update(sample, b, "R" * 21, {})
+
+    def test_unknown_cfg_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="repeat config not found"):
+            mut.repeat_update(sample, b, "Z" * 21, {"title": "x"})
+
+    def test_payload_changes_are_deep_copied(self, sample, b):
+        self._seed(sample, b)
+        changes = {"tagIds": ["A" * 21]}
+        mut.repeat_update(sample, b, "R" * 21, changes)
+        changes["tagIds"].append("B" * 21)
+        assert _last_op(b)["p"]["actionPayload"]["taskRepeatCfg"]["changes"][
+            "tagIds"
+        ] == ["A" * 21]
+
+
+class TestRepeatSkipInstance:
+    @staticmethod
+    def _seed(sample, b):
+        t = make_task("T" * 21, "repeating", "INBOX_PROJECT")
+        mut.add_task(sample, b, t)
+        mut.repeat_add(sample, b, "T" * 21, "R" * 21, repeat_cycle="DAILY")
+
+    def test_rdi_payload_and_append(self, sample, b):
+        self._seed(sample, b)
+        assert mut.repeat_skip_instance(sample, b, "R" * 21, "2026-09-10") is True
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "RDI", "UPD", "TASK_REPEAT_CFG", "R" * 21,
+        )
+        assert op["p"]["actionPayload"] == {
+            "repeatCfgId": "R" * 21, "dateStr": "2026-09-10",
+        }
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["deletedInstanceDates"] == ["2026-09-10"]
+        assert_doctor_clean(sample)
+
+    def test_second_date_appends(self, sample, b):
+        self._seed(sample, b)
+        mut.repeat_skip_instance(sample, b, "R" * 21, "2026-09-10")
+        mut.repeat_skip_instance(sample, b, "R" * 21, "2026-09-11")
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["deletedInstanceDates"] == ["2026-09-10", "2026-09-11"]
+
+    def test_repeat_skip_is_idempotent_and_emits_no_op(self, sample, b):
+        self._seed(sample, b)
+        mut.repeat_skip_instance(sample, b, "R" * 21, "2026-09-10")
+        n_ops = len(b.ops)
+        assert mut.repeat_skip_instance(sample, b, "R" * 21, "2026-09-10") is False
+        assert len(b.ops) == n_ops
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["deletedInstanceDates"] == ["2026-09-10"]
+
+    def test_unknown_cfg_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="repeat config not found"):
+            mut.repeat_skip_instance(sample, b, "Z" * 21, "2026-09-10")

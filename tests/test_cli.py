@@ -1857,3 +1857,186 @@ class TestHardDeleteCommands:
     )
     def test_subcommand_rewrites(self, argv, expected):
         assert cli._rewrite_argv(argv)[0] == expected
+
+
+def _seed_repeat_cfg(d, cfg_id="R" * 21, **extra):
+    from sp_cli.model import make_repeat_cfg
+
+    cfg = make_repeat_cfg(cfg_id, "daily thing", None, "DAILY", start_time="09:00")
+    cfg["remindAt"] = "AtStart"
+    cfg.update(extra)
+    d["state"]["taskRepeatCfg"] = {"ids": [cfg_id], "entities": {cfg_id: cfg}}
+    return cfg
+
+
+class TestRepeatEditCli:
+    def test_pause_emits_ru(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        assert cli.cmd_repeat_edit(_args(["repeat", "edit", "daily thing", "--pause"])) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"], op["d"]) == ("RU", "TASK_REPEAT_CFG", "R" * 21)
+        assert op["p"]["actionPayload"]["taskRepeatCfg"]["changes"] == {"isPaused": True}
+        assert sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]["isPaused"] is True
+
+    def test_resume(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample, isPaused=True)
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--resume"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes == {"isPaused": False}
+
+    def test_pause_and_resume_together_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--pause", "--resume"]))
+        assert fake_ctx.ops == []
+
+    def test_clear_goes_to_cleared_fields(self, fake_ctx, sample, capsys):
+        _seed_repeat_cfg(sample, defaultEstimate=1800000, notes="n")
+        rc = cli.cmd_repeat_edit(
+            _args(["repeat", "edit", "RRRR", "--clear", "startTime, remindAt"])
+        )
+        assert rc == 0
+        payload = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert payload["clearedFields"] == ["startTime", "remindAt"]
+        assert payload["taskRepeatCfg"]["changes"] == {}
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert "startTime" not in cfg and "remindAt" not in cfg
+
+    def test_clear_unknown_field_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="cannot clear"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--clear", "isPaused"]))
+        assert fake_ctx.ops == []
+
+    def test_clear_and_set_same_field_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="both set and cleared"):
+            cli.cmd_repeat_edit(
+                _args(["repeat", "edit", "RRRR", "--start-time", "8:00",
+                       "--clear", "startTime"])
+            )
+
+    def test_nothing_to_change_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR"]))
+
+    def test_cadence_switch_to_weekly_days(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_edit(
+            _args(["repeat", "edit", "RRRR", "--every", "week", "--days", "mon,thu"])
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["repeatCycle"] == "WEEKLY"
+        assert changes["quickSetting"] == "CUSTOM"
+        assert changes["monday"] is True and changes["thursday"] is True
+        assert changes["tuesday"] is False and changes["sunday"] is False
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["friday"] is False
+
+    def test_every_without_days_resets_to_sp_default(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--every", "week"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["quickSetting"] == "WEEKLY_CURRENT_WEEKDAY"
+        assert changes["repeatEvery"] == 1
+        assert changes["saturday"] is False and changes["monday"] is True
+
+    def test_interval_only_keeps_custom_weekdays(self, fake_ctx, sample):
+        cfg = _seed_repeat_cfg(sample)
+        cfg.update(
+            model.repeat_cadence_fields("WEEKLY", 1, ["monday", "thursday"])
+        )
+        cli.cmd_repeat_edit(_args(["repeat", "edit", "RRRR", "--interval", "2"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes["repeatEvery"] == 2
+        assert changes["repeatCycle"] == "WEEKLY"
+        assert changes["quickSetting"] == "CUSTOM"
+        assert changes["monday"] is True and changes["thursday"] is True
+        assert changes["tuesday"] is False
+
+    def test_scalar_flags(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_edit(
+            _args(["repeat", "edit", "RRRR", "--title", "new", "--start-time", "07:30",
+                   "--remind", "m10", "--est", "45m", "--notes", "hi",
+                   "--start-date", "2026-10-01"])
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskRepeatCfg"]["changes"]
+        assert changes == {
+            "title": "new",
+            "startTime": "07:30",
+            "remindAt": "m10",
+            "defaultEstimate": 45 * 60 * 1000,
+            "notes": "hi",
+            "startDate": "2026-10-01",
+        }
+
+    def test_invalid_weekday_refused(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        with pytest.raises(cli.CliError, match="invalid weekday"):
+            cli.cmd_repeat_edit(
+                _args(["repeat", "edit", "RRRR", "--every", "week", "--days", "xxx"])
+            )
+
+
+class TestRepeatSkipCli:
+    def test_skip_emits_rdi_and_hints(self, fake_ctx, sample, capsys):
+        _seed_repeat_cfg(sample)
+        rc = cli.cmd_repeat_skip(
+            _args(["repeat", "skip", "RRRR", "--date", "2026-10-01"])
+        )
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "RDI", "UPD", "TASK_REPEAT_CFG", "R" * 21,
+        )
+        assert op["p"]["actionPayload"] == {
+            "repeatCfgId": "R" * 21, "dateStr": "2026-10-01",
+        }
+        out = capsys.readouterr().out
+        assert f"sp delete rpt_{'R' * 21}_2026-10-01" in out
+
+    def test_skip_twice_is_idempotent(self, fake_ctx, sample, capsys):
+        _seed_repeat_cfg(sample, deletedInstanceDates=["2026-10-01"])
+        assert cli.cmd_repeat_skip(
+            _args(["repeat", "skip", "RRRR", "--date", "2026-10-01"])
+        ) == 0
+        assert fake_ctx.ops == []
+        assert "already skipped" in capsys.readouterr().out
+        cfg = sample["state"]["taskRepeatCfg"]["entities"]["R" * 21]
+        assert cfg["deletedInstanceDates"] == ["2026-10-01"]
+
+    def test_skip_today_keyword(self, fake_ctx, sample):
+        _seed_repeat_cfg(sample)
+        cli.cmd_repeat_skip(_args(["repeat", "skip", "RRRR", "--date", "today"]))
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["dateStr"] == today_str()
+
+
+class TestRepeatsListing:
+    def test_listing_shows_pause_time_and_skips(self, fake_ctx, sample, capsys):
+        _seed_repeat_cfg(
+            sample, isPaused=True,
+            deletedInstanceDates=["2026-10-01", "2026-10-02", "2026-10-03"],
+        )
+        assert cli.cmd_repeats(_args(["repeats"])) == 0
+        out = capsys.readouterr().out
+        assert "paused" in out
+        assert "09:00" in out and "AtStart" in out
+        assert "3 (2026-10-02, 2026-10-03)" in out
+
+    def test_json_listing(self, fake_ctx, sample, capsys):
+        _seed_repeat_cfg(sample)
+        assert cli.cmd_repeats(_args(["repeats", "--json"])) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data[0]["id"] == "R" * 21
+
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["repeat", "edit", "x"], "repeat-edit"),
+            (["repeat", "skip", "x"], "repeat-skip"),
+        ],
+    )
+    def test_subcommand_rewrites(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected

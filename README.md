@@ -138,10 +138,26 @@ restoreToToday?}`): задача возвращается вместе со вс
 ./sp repeat <id> --every day|week|month|year [--interval N] [--days mon,tue] \
              [--start-time HH:MM] [--start-date YYYY-MM-DD] \
              [--remind AtStart|m5|m10|m15|m30|h1]
-./sp repeats [--json]          # список repeat-конфигов
+./sp repeats [--json]          # список repeat-конфигов (пауза, время, напоминание, скипы)
+./sp repeat edit <cfg-id|title> [--title T] [--every day|week|month|year] [--interval N] \
+             [--days mon,thu] [--start-time HH:MM] [--start-date YYYY-MM-DD] \
+             [--remind AtStart|m5|m10|m15|m30|h1] [--est 30m] [--notes N] \
+             [--pause|--resume] [--clear startTime,remindAt,defaultEstimate,notes]
+./sp repeat skip <cfg-id|title> --date YYYY-MM-DD|today|tomorrow
 ./sp repeat rm <cfg-id|title> [--yes]   # удалить repeat-конфиг; сами задачи остаются,
                                         # ссылка repeatCfgId снимается (живые + архив)
 ```
+
+`repeat edit` шлёт `RU`. Очистка полей — только через `--clear`: очищаемые ключи
+уходят сиблингом `clearedFields` рядом с `taskRepeatCfg` в actionPayload, потому
+что `changes: {startTime: undefined}` теряется при любой JSON-сериализации и на
+других устройствах превращается в no-op. Смена `--every/--days/--interval`
+пересчитывает `quickSetting`, `repeatCycle` и все семь weekday-флагов; кастомный
+набор дней сохраняется, если меняется только `--interval`.
+
+`repeat skip` шлёт `RDI` (append-only, идемпотентно): дата попадает в
+`deletedInstanceDates` и будущий инстанс не создаётся. Уже созданную задачу это
+не удаляет — её нужно снести отдельно (`sp delete rpt_<cfgId>_<date>`).
 
 ### Проекты и теги
 

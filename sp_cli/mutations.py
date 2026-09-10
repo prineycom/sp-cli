@@ -1066,6 +1066,83 @@ def tag_delete(d: dict, b: OpBuilder, tag_id: str) -> list[str]:
     return orphans
 
 
+CLEARABLE_REPEAT_CFG_FIELDS = ("startTime", "remindAt", "defaultEstimate", "notes")
+MAX_CLEARED_FIELDS = 32  # SP's applyClearedFields caps the wire list at 32
+
+
+def _repeat_cfg(state: dict, cfg_id: str) -> dict:
+    reg = state.get("taskRepeatCfg")
+    entities = (reg or {}).get("entities") or {}
+    if not isinstance(reg, dict) or cfg_id not in entities:
+        raise MutationError(f"repeat config not found: {cfg_id}")
+    return entities[cfg_id]
+
+
+def repeat_update(
+    d: dict,
+    b: OpBuilder,
+    cfg_id: str,
+    changes: dict,
+    cleared_fields: list[str] | None = None,
+) -> None:
+    """RU: update a repeat config; `cleared_fields` unsets optional fields.
+
+    Clearing MUST go through the `clearedFields` sibling of the actionPayload:
+    `changes: {startTime: undefined}` survives locally but every JSON hop drops
+    the key, so the clear replays as a no-op elsewhere (SP issue #9776).
+    Mirrors applyClearedFields: cleared keys are REMOVED from the entity, never
+    written as null, and are never listed in `changes`.
+    """
+    state = _state(d)
+    cfg = _repeat_cfg(state, cfg_id)
+    cleared = list(dict.fromkeys(cleared_fields or []))
+    for field in cleared:
+        if field not in CLEARABLE_REPEAT_CFG_FIELDS:
+            raise MutationError(
+                f"field is not clearable: {field} "
+                f"(allowed: {', '.join(CLEARABLE_REPEAT_CFG_FIELDS)})"
+            )
+        if field in changes:
+            raise MutationError(f"field both set and cleared: {field}")
+    if len(cleared) > MAX_CLEARED_FIELDS:
+        raise MutationError(f"too many cleared fields (max {MAX_CLEARED_FIELDS})")
+    if not changes and not cleared:
+        raise MutationError("repeat update: nothing to change")
+
+    payload = {
+        "taskRepeatCfg": {"id": cfg_id, "changes": copy.deepcopy(changes)},
+    }
+    if cleared:
+        payload["clearedFields"] = list(cleared)
+    b.op("RU", "UPD", "TASK_REPEAT_CFG", cfg_id, payload)
+
+    cfg.update(copy.deepcopy(changes))
+    for field in cleared:
+        cfg.pop(field, None)
+
+
+def repeat_skip_instance(d: dict, b: OpBuilder, cfg_id: str, date_str: str) -> bool:
+    """RDI: suppress the instance of `date_str`. Returns False (and emits NO op)
+    when the date is already suppressed — the list is an append-only set.
+
+    Does NOT delete an already generated task for that date.
+    """
+    state = _state(d)
+    cfg = _repeat_cfg(state, cfg_id)
+    dates = list(cfg.get("deletedInstanceDates") or [])
+    if date_str in dates:
+        return False
+    b.op(
+        "RDI",
+        "UPD",
+        "TASK_REPEAT_CFG",
+        cfg_id,
+        {"repeatCfgId": cfg_id, "dateStr": date_str},
+    )
+    cfg["deletedInstanceDates"] = dates + [date_str]
+    return True
+
+
 def repeat_delete(d: dict, b: OpBuilder, cfg_id: str) -> None:
     """HRC: delete a repeat config and unlink every task pointing at it.
 

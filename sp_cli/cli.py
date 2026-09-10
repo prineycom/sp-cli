@@ -24,6 +24,7 @@ from sp_cli.model import (
     STREAK_DAY_KEYS,
     TASK_DONE_STATE,
     TODAY_TAG_ID,
+    WEEKDAY_KEYS,
     logical_today_str,
     make_board,
     make_issue_provider,
@@ -35,6 +36,7 @@ from sp_cli.model import (
     make_tag,
     make_task,
     now_ms,
+    repeat_cadence_fields,
     start_of_next_day_diff_ms,
     streak_week_days,
     today_str,
@@ -810,12 +812,7 @@ def cmd_repeat(args) -> int:
     d = client.get()
     tid = q.resolve_task(d, args.id)
     cycle = _CYCLES[args.every]
-    days = None
-    if args.days:
-        try:
-            days = [_DAY_KEYS[p.strip().lower()] for p in args.days.split(",")]
-        except KeyError as e:
-            raise CliError(f"invalid weekday {e} (use mon,tue,...)") from None
+    days = _parse_days(args.days) if args.days else None
     start_date = _parse_day(args.start_date) if args.start_date else None
     cfg_id = nanoid()
     store.commit(
@@ -839,6 +836,110 @@ def cmd_repeat(args) -> int:
     return 0
 
 
+def _parse_days(text: str) -> list[str]:
+    try:
+        return [_DAY_KEYS[p.strip().lower()] for p in text.split(",")]
+    except KeyError as e:
+        raise CliError(f"invalid weekday {e} (use mon,tue,...)") from None
+
+
+def _cadence_changes(cfg: dict, args) -> dict:
+    """Recompute quickSetting/repeatCycle/repeatEvery/weekdays for an edit.
+
+    Unspecified parts fall back to the config's current cadence; the weekday
+    list is only carried over when it was custom, so a plain --interval change
+    keeps custom days while a plain --every switch resets to the SP default.
+    """
+    cycle = _CYCLES[args.every] if args.every else cfg.get("repeatCycle", "DAILY")
+    every = args.interval if args.interval is not None else int(cfg.get("repeatEvery", 1))
+    if args.days:
+        days = _parse_days(args.days)
+    elif cycle == "WEEKLY" and cfg.get("quickSetting") == "CUSTOM":
+        days = [k for k in WEEKDAY_KEYS if cfg.get(k)]
+    else:
+        days = None
+    try:
+        return repeat_cadence_fields(cycle, every, days)
+    except ValueError as e:
+        raise CliError(str(e)) from None
+
+
+def cmd_repeat_edit(args) -> int:
+    if args.pause and args.resume:
+        raise CliError("--pause and --resume are mutually exclusive")
+    client, store = _ctx()
+    d = client.get()
+    cfg_id = q.resolve_repeat_cfg(d, args.id)
+    cfg = d["state"]["taskRepeatCfg"]["entities"][cfg_id]
+
+    changes: dict = {}
+    if args.every or args.days or args.interval is not None:
+        changes.update(_cadence_changes(cfg, args))
+    if args.title:
+        changes["title"] = args.title
+    if args.start_time:
+        changes["startTime"] = args.start_time
+    if args.remind:
+        changes["remindAt"] = args.remind
+    if args.est:
+        changes["defaultEstimate"] = render.parse_duration(args.est)
+    if args.notes is not None:
+        changes["notes"] = args.notes
+    if args.start_date:
+        changes["startDate"] = _parse_day(args.start_date)
+    if args.pause:
+        changes["isPaused"] = True
+    if args.resume:
+        changes["isPaused"] = False
+
+    cleared: list[str] = []
+    if args.clear:
+        for name in args.clear.split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if name not in mut.CLEARABLE_REPEAT_CFG_FIELDS:
+                raise CliError(
+                    f"cannot clear '{name}' (allowed: "
+                    f"{','.join(mut.CLEARABLE_REPEAT_CFG_FIELDS)})"
+                )
+            if name in changes:
+                raise CliError(f"'{name}' is both set and cleared")
+            cleared.append(name)
+
+    if not changes and not cleared:
+        raise CliError("nothing to change")
+
+    store.commit(
+        [lambda dd, b: mut.repeat_update(dd, b, cfg_id, changes, cleared)],
+        initial=d,
+    )
+    print(cfg_id)
+    return 0
+
+
+def cmd_repeat_skip(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cfg_id = q.resolve_repeat_cfg(d, args.id)
+    day = _parse_day(args.date)
+    skipped: list[bool] = []
+    store.commit(
+        [lambda dd, b: skipped.append(mut.repeat_skip_instance(dd, b, cfg_id, day))],
+        initial=d,
+    )
+    if skipped and not skipped[0]:
+        print(f"{day} is already skipped")
+        return 0
+    print(f"skipped {day}")
+    inst_id = f"rpt_{cfg_id}_{day}"
+    print(
+        f"note: an already created instance is not removed — "
+        f"run 'sp delete {inst_id}' if it exists"
+    )
+    return 0
+
+
 def cmd_repeats(args) -> int:
     client, _ = _ctx()
     d = client.get()
@@ -847,18 +948,29 @@ def cmd_repeats(args) -> int:
     if args.json:
         render.print_json(cfgs)
         return 0
-    rows = [
-        [
-            render.short_id(c["id"]),
-            render.truncate(c.get("title", ""), 40),
-            c.get("repeatCycle", "?"),
-            str(c.get("repeatEvery", "?")),
-            c.get("startDate", "-"),
-            "paused" if c.get("isPaused") else "",
-        ]
-        for c in cfgs
-    ]
-    render.print_table(["id", "title", "cycle", "every", "start", ""], rows)
+    rows = []
+    for c in cfgs:
+        skipped = list(c.get("deletedInstanceDates") or [])
+        skip_col = ""
+        if skipped:
+            skip_col = f"{len(skipped)} ({', '.join(sorted(skipped)[-2:])})"
+        rows.append(
+            [
+                render.short_id(c["id"]),
+                render.truncate(c.get("title", ""), 40),
+                c.get("repeatCycle", "?"),
+                str(c.get("repeatEvery", "?")),
+                c.get("startDate", "-"),
+                c.get("startTime") or "-",
+                c.get("remindAt") or "-",
+                skip_col,
+                "paused" if c.get("isPaused") else "",
+            ]
+        )
+    render.print_table(
+        ["id", "title", "cycle", "every", "start", "time", "remind", "skipped", ""],
+        rows,
+    )
     return 0
 
 
@@ -2022,6 +2134,8 @@ _SUBCOMMAND_REWRITES = {
     ("tag", "edit"): "tag-edit",
     ("tag", "rm"): "tag-rm",
     ("repeat", "rm"): "repeat-rm",
+    ("repeat", "edit"): "repeat-edit",
+    ("repeat", "skip"): "repeat-skip",
     ("backlog", "add"): "backlog-add",
     ("backlog", "rm"): "backlog-rm",
     ("backlog", "clear"): "backlog-clear",
@@ -2294,6 +2408,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--remind", choices=["AtStart", "m5", "m10", "m15", "m30", "h1"]
     )
     s.add_argument("--start-date")
+
+    s = add("repeat-edit", cmd_repeat_edit, "edit / pause a repeat config")
+    s.add_argument("id")
+    s.add_argument("--title")
+    s.add_argument("--every", choices=sorted(_CYCLES))
+    s.add_argument("--interval", type=int)
+    s.add_argument("--days", help="mon,tue,...")
+    s.add_argument("--start-time", help="HH:MM")
+    s.add_argument("--remind", choices=["AtStart", "m5", "m10", "m15", "m30", "h1"])
+    s.add_argument("--est", help="default estimate, e.g. 30m")
+    s.add_argument("--notes")
+    s.add_argument("--start-date")
+    s.add_argument("--pause", action="store_true")
+    s.add_argument("--resume", action="store_true")
+    s.add_argument(
+        "--clear",
+        help="comma-separated fields to unset: "
+        + ",".join(mut.CLEARABLE_REPEAT_CFG_FIELDS),
+    )
+
+    s = add("repeat-skip", cmd_repeat_skip, "skip one instance of a repeat config")
+    s.add_argument("id")
+    s.add_argument("--date", required=True, help="YYYY-MM-DD | today | tomorrow")
 
     s = add("repeat-rm", cmd_repeat_rm, "delete a repeat config (tasks are kept)")
     s.add_argument("id")

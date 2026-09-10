@@ -380,6 +380,32 @@ WEEKDAY_KEYS = [
 ]
 
 
+def repeat_cadence_fields(
+    repeat_cycle: str,
+    repeat_every: int = 1,
+    days: list[str] | None = None,
+) -> dict:
+    """The cadence half of a TaskRepeatCfg: quickSetting + cycle + weekdays.
+
+    Shared by cfg creation and `sp repeat edit` so an edited cadence lands on
+    exactly the same field set SP would have written itself.
+    days: weekday keys ('monday'...) — overrides the default mon-fri pattern.
+    """
+    if repeat_cycle not in _QUICK_SETTING:
+        raise ValueError(f"invalid repeat cycle: {repeat_cycle}")
+    quick = _QUICK_SETTING[repeat_cycle]
+    if repeat_every != 1 or (days is not None and repeat_cycle == "WEEKLY"):
+        quick = "CUSTOM"
+    fields = {
+        "quickSetting": quick,
+        "repeatCycle": repeat_cycle,
+        "repeatEvery": repeat_every,
+    }
+    for k in WEEKDAY_KEYS:
+        fields[k] = (k in days) if days is not None else (k not in ("saturday", "sunday"))
+    return fields
+
+
 def make_repeat_cfg(
     cfg_id: str,
     title: str,
@@ -397,15 +423,7 @@ def make_repeat_cfg(
     days: weekday keys ('monday'...) — overrides the default mon-fri pattern.
     remind_at: TaskReminderOptionId string (e.g. 'AtStart'), not a timestamp.
     """
-    if repeat_cycle not in _QUICK_SETTING:
-        raise ValueError(f"invalid repeat cycle: {repeat_cycle}")
-    quick = _QUICK_SETTING[repeat_cycle]
-    if repeat_every != 1 or (days is not None and repeat_cycle == "WEEKLY"):
-        quick = "CUSTOM"
-    weekdays = {
-        k: (k in days) if days is not None else (k not in ("saturday", "sunday"))
-        for k in WEEKDAY_KEYS
-    }
+    cadence = repeat_cadence_fields(repeat_cycle, repeat_every, days)
     cfg = {
         "id": cfg_id,
         "projectId": project_id,
@@ -413,16 +431,13 @@ def make_repeat_cfg(
         "tagIds": [],
         "order": 0,
         "isPaused": False,
-        "quickSetting": quick,
-        "repeatCycle": repeat_cycle,
         "startDate": start_date or today_str(),
-        "repeatEvery": repeat_every,
         "lastTaskCreationDay": today_str(),
         "skipOverdue": False,
         "waitForCompletion": False,
         "repeatFromCompletionDate": False,
         "shouldInheritSubtasks": False,
-        **weekdays,
+        **cadence,
     }
     if default_estimate is not None:
         cfg["defaultEstimate"] = default_estimate
