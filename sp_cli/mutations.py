@@ -1205,6 +1205,9 @@ def remove_from_today(d: dict, b: OpBuilder, task_id: str) -> None:
     task["dueDay"] = None
     _clear_due_with_time(task)
     _list_remove(_today_order(state), task_id)
+    # An unscheduled task has no planner day either — HSX drops it from the
+    # planner on every device, so the local mirror must drop it too.
+    _planner_purge(state, [task_id])
 
 
 unschedule = remove_from_today

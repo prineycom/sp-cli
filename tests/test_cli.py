@@ -2970,8 +2970,9 @@ class TestBulkSelector:
         assert fake_ctx.ops == []
         assert "no tasks matched" in capsys.readouterr().err
 
-    def test_selection_is_recomputed_inside_the_commit(self, sample, monkeypatch, add_task_entity):
-        """412 retry: the closure must re-run the selector on the fresh file."""
+    def test_selection_growth_under_a_retry_aborts(self, sample, monkeypatch, add_task_entity):
+        """412 retry: a selection that grew is never applied — the user
+        confirmed the old, smaller one."""
         _seed_shortsyntax_world(sample)
         add_task_entity(project_id="P_WORK", title="first")
 
@@ -2980,8 +2981,36 @@ class TestBulkSelector:
 
         ctx = _RetryCtx(sample, _mutate)
         monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
+        with pytest.raises(cli.CliError, match="re-run"):
+            cli.cmd_bulk(_args(["bulk", "--project", "Work", "--est", "1h"]))
+        assert ctx.ops == []
+
+    def test_selection_shrinking_under_a_retry_is_applied(
+        self, sample, monkeypatch, add_task_entity, capsys
+    ):
+        """A task that vanished underneath just drops out; the printed count
+        is the set that was actually written, not the pre-commit snapshot."""
+        _seed_shortsyntax_world(sample)
+        keep = add_task_entity(project_id="P_WORK", title="keep")
+        gone = add_task_entity(project_id="P_WORK", title="gone")
+
+        def _mutate(d):
+            state = d["state"]["task"]
+            state["ids"].remove(gone["id"])
+            del state["entities"][gone["id"]]
+
+        ctx = _RetryCtx(sample, _mutate)
+        monkeypatch.setattr(cli, "_ctx", lambda: (ctx, ctx))
         assert cli.cmd_bulk(_args(["bulk", "--project", "Work", "--est", "1h"])) == 0
-        assert len(ctx.ops) == 2  # the task that appeared underneath is included
+        assert [op["d"] for op in ctx.ops] == [keep["id"]]
+        assert "wrote 1 of 2" in capsys.readouterr().out
+
+    def test_all_selects_done_and_open_tasks(self, fake_ctx, sample, add_task_entity):
+        done = add_task_entity(title="done one")
+        done["isDone"] = True
+        open_ = add_task_entity(title="open one")
+        assert cli.cmd_bulk(_args(["bulk", "--all", "--est", "1h"])) == 0
+        assert {op["d"] for op in fake_ctx.ops} >= {done["id"], open_["id"]}
 
 
 class TestBulkActions:
@@ -2997,24 +3026,87 @@ class TestBulkActions:
         assert cli.cmd_bulk(_args(["bulk", "--search", "x", "--dry-run"])) == 0
         assert fake_ctx.ops == []
 
-    def test_due_est_and_complete_share_one_hu_per_task(self, fake_ctx, add_task_entity):
-        a = add_task_entity(title="a")
+    def test_field_edits_share_one_hu_per_task_and_due_rides_lp(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        _seed_shortsyntax_world(sample)
+        a = add_task_entity(title="a", tag_ids=["T_HOME"])
+        sample["state"]["tag"]["entities"]["T_HOME"]["taskIds"].append(a["id"])
         b = add_task_entity(title="b")
         assert cli.cmd_bulk(
             _args(["bulk", a["id"], b["id"], "--due", "2030-05-05", "--est", "2h",
-                   "--complete"])
+                   "--complete", "--tag-rm", "home"])
         ) == 0
-        assert _actions(fake_ctx.ops) == ["HU", "HU"]
+        # exactly one HU per task (tag removal folded in), plus the planner op
+        assert _actions(fake_ctx.ops) == ["HU", "LP", "HU", "LP"]
         changes = fake_ctx.ops[0]["p"]["actionPayload"]["task"]["changes"]
-        assert changes["dueDay"] == "2030-05-05"
         assert changes["timeEstimate"] == 7_200_000
         assert changes["isDone"] is True and changes["doneOn"] > 0
+        assert changes["tagIds"] == []
+        assert "dueDay" not in changes  # scheduling belongs to LP
+        assert fake_ctx.ops[1]["p"]["actionPayload"]["day"] == "2030-05-05"
+        assert sample["state"]["task"]["entities"][a["id"]]["dueDay"] == "2030-05-05"
+        assert sample["state"]["planner"]["days"]["2030-05-05"] == [a["id"], b["id"]]
 
-    def test_clear_due_nulls_the_scheduling_fields(self, fake_ctx, add_task_entity):
+    def test_due_refuses_a_past_day(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(mut.MutationError, match="past day"):
+            cli.cmd_bulk(_args(["bulk", a["id"], "--due", "2000-01-01"]))
+        assert fake_ctx.ops == []
+
+    def test_clear_due_emits_hsx_and_purges_the_planner(
+        self, fake_ctx, sample, add_task_entity
+    ):
         a = add_task_entity(title="a", due_day="2030-01-01")
+        sample["state"].setdefault("planner", {"days": {}})["days"] = {
+            "2030-01-01": [a["id"]]
+        }
         assert cli.cmd_bulk(_args(["bulk", a["id"], "--clear-due"])) == 0
-        changes = _payload(fake_ctx.ops, "HU")["task"]["changes"]
-        assert changes == {"dueDay": None, "dueWithTime": None, "remindAt": None}
+        assert _actions(fake_ctx.ops) == ["HSX"]
+        assert _payload(fake_ctx.ops, "HSX")["id"] == a["id"]
+        task = sample["state"]["task"]["entities"][a["id"]]
+        assert task["dueDay"] is None and task["dueWithTime"] is None
+        assert sample["state"]["planner"]["days"] == {}
+
+    def test_empty_due_string_clears_like_clear_due(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a", due_day="2030-01-01")
+        assert cli.cmd_bulk(_args(["bulk", a["id"], "--due", ""])) == 0
+        assert _actions(fake_ctx.ops) == ["HSX"]
+
+    def test_clear_due_on_an_unscheduled_task_writes_nothing(
+        self, fake_ctx, add_task_entity, capsys
+    ):
+        a = add_task_entity(title="a")
+        assert cli.cmd_bulk(_args(["bulk", a["id"], "--clear-due"])) == 0
+        assert fake_ctx.ops == []
+        assert "nothing to do" in capsys.readouterr().out
+
+    def test_subtasks_are_excluded_from_due_and_tag_actions(
+        self, fake_ctx, sample, add_task_entity, capsys
+    ):
+        _seed_shortsyntax_world(sample)
+        parent = add_task_entity(project_id="P_WORK", title="parent")
+        sub = add_task_entity(project_id="P_WORK", title="sub", parent_id=parent["id"])
+        parent["subTaskIds"] = [sub["id"]]
+        assert cli.cmd_bulk(
+            _args(["bulk", sub["id"], "--project", "Work", "--tag-add", "home"])
+        ) == 0
+        assert [op["d"] for op in fake_ctx.ops] == [parent["id"]]
+        assert "subtask" in capsys.readouterr().err
+
+    def test_conflicting_tag_add_and_rm_is_rejected(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(cli.CliError, match="both added and removed"):
+            cli.cmd_bulk(
+                _args(["bulk", a["id"], "--tag-add", "home", "--tag-rm", "HOME"])
+            )
+        assert fake_ctx.ops == []
+
+    def test_unknown_tag_fails_before_any_write(self, fake_ctx, add_task_entity):
+        a = add_task_entity(title="a")
+        with pytest.raises(q.NotFoundError):
+            cli.cmd_bulk(_args(["bulk", a["id"], "--tag-add", "nope-nope"]))
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
 
     def test_complete_skips_already_done_tasks(self, fake_ctx, add_task_entity):
         done = add_task_entity(title="done")
@@ -3111,7 +3203,7 @@ class TestBulkNeverEmitsMultiEntityOps:
         ) == 0
         assert cli.cmd_edit(_args(["edit", a["id"], b["id"], "--est", "2h"])) == 0
         actions = set(_actions(fake_ctx.ops))
-        assert actions <= {"HU", "HGT", "HMP"}
+        assert actions <= {"HU", "HGT", "HMP", "LP"}
         assert "HUM" not in actions and "TU" not in actions
         assert fake_ctx.commits == 2  # one batch per command
 

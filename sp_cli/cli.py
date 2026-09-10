@@ -369,9 +369,10 @@ def _dedupe(ids: list[str]) -> list[str]:
 def cmd_edit(args) -> int:
     client, store = _ctx()
     d = client.get()
-    if args.title is not None and len(args.ids) > 1:
-        raise CliError("edit: --title takes exactly one task id")
     tids = _dedupe(_resolve_tasks(d, args.ids))
+    # After dedupe: `sp edit ID ID --title x` names one task, not two.
+    if args.title is not None and len(tids) > 1:
+        raise CliError("edit: --title takes exactly one task id")
     est = render.parse_duration(args.est) if args.est else None
 
     def _edit(dd, b, tid):
@@ -408,13 +409,18 @@ def cmd_edit(args) -> int:
 
 # --- bulk -----------------------------------------------------------------
 
-def _bulk_select(d: dict, args) -> list[str]:
+def _bulk_select(d: dict, args, parents_only: bool = False) -> list[str]:
     """Task ids the bulk selector matches: explicit ids ∪ filter matches.
 
     Filters combine exactly like `sp list` (AND between them); explicit ids
-    come first so the printed order is predictable.
+    come first so the printed order is predictable. `parents_only` drops
+    subtasks — actions that are meaningless on a subtask (scheduling, tags)
+    must never sweep one in through a filter.
     """
     ids = _resolve_tasks(d, args.ids)
+    if parents_only:
+        entities = d["state"]["task"]["entities"]
+        ids = [i for i in ids if not entities[i].get("parentId")]
     if _bulk_has_filter(args):
         ids += [
             t["id"]
@@ -426,29 +432,35 @@ def _bulk_select(d: dict, args) -> list[str]:
                 search=args.search,
                 only_done=args.done,
                 include_done=args.all,
+                parents_only=parents_only,
             )
         ]
     return _dedupe(ids)
 
 
 def _bulk_has_filter(args) -> bool:
-    return bool(args.project or args.tag or args.overdue or args.search or args.done)
+    return bool(
+        args.project or args.tag or args.overdue or args.search or args.done or args.all
+    )
 
 
 def cmd_bulk(args) -> int:
     if not args.ids and not _bulk_has_filter(args):
         raise CliError(
             "bulk: no selector (pass task ids and/or "
-            "--project/--tag/--overdue/--search/--done)"
+            "--project/--tag/--overdue/--search/--done/--all)"
         )
-    if args.due is not None and args.clear_due:
+    # `--due ""` is the same "clear it" spelling `sp edit --due ""` accepts.
+    clear_due = bool(args.clear_due) or args.due == ""
+    due = args.due or None
+    if due is not None and clear_due:
         raise CliError("bulk: --due and --clear-due are mutually exclusive")
     if args.complete and args.reopen:
         raise CliError("bulk: --complete and --reopen are mutually exclusive")
     has_action = any(
         (
-            args.due is not None,
-            args.clear_due,
+            due is not None,
+            clear_due,
             args.tag_add,
             args.tag_rm,
             args.est is not None,
@@ -459,17 +471,43 @@ def cmd_bulk(args) -> int:
     )
     if not has_action and not args.dry_run:
         raise CliError("bulk: nothing to do (pass an action or --dry-run)")
+    if args.tag_add and args.tag_rm:
+        overlap = {t.lower() for t in args.tag_add} & {t.lower() for t in args.tag_rm}
+        if overlap:
+            raise CliError(
+                f"bulk: {', '.join(sorted(overlap))} is both added and removed"
+            )
+    est = render.parse_duration(args.est) if args.est else None
+    if due is not None:
+        _parse_day(due)  # fail on a bad day expression before touching the net
+
+    # Scheduling and tagging are parent-level actions in SP: a subtask has no
+    # own place in the planner, the Today list or a tag's task list.
+    parents_only = bool(due is not None or clear_due or args.tag_add or args.tag_rm)
 
     client, store = _ctx()
     d = client.get()
-    est = render.parse_duration(args.est) if args.est else None
+    entities = d["state"]["task"]["entities"]
+    if parents_only:
+        for tid in _dedupe(_resolve_tasks(d, args.ids)):
+            if entities[tid].get("parentId"):
+                print(
+                    f"skipped {render.short_id(tid)}: subtask — due/tag actions "
+                    "apply to its parent",
+                    file=sys.stderr,
+                )
+    # Resolve the refs against the snapshot so a typo fails before any write
+    # (the closure re-resolves against the file it actually commits to).
+    for ref in (args.tag_add or []) + (args.tag_rm or []):
+        q.resolve_tag(d, ref)
+    if args.move_project:
+        q.resolve_project(d, args.move_project)
 
-    selected = _bulk_select(d, args)
+    selected = _bulk_select(d, args, parents_only)
     if not selected:
         print("bulk: no tasks matched", file=sys.stderr)
         return 1
     if args.dry_run:
-        entities = d["state"]["task"]["entities"]
         render.print_tasks(d, [entities[t] for t in selected])
         print(f"(dry run: {len(selected)} task(s), nothing written)")
         return 0
@@ -479,30 +517,36 @@ def cmd_bulk(args) -> int:
         print("aborted", file=sys.stderr)
         return 1
 
+    confirmed = set(selected)
     skipped: list[str] = []
+    written: list[str] = []
 
     def _apply(dd, b):
         # Selection is recomputed here, not reused from the snapshot above: on
-        # a 412 retry the closure runs against a freshly downloaded file.
-        state = dd["state"]
-        entities = state["task"]["entities"]
-        tids = _bulk_select(dd, args)
-        due_day = _parse_day(args.due, dd) if args.due else None
+        # a 412 retry the closure runs against a freshly downloaded file. What
+        # the user saw (and confirmed) is the ceiling — if tasks appeared under
+        # us the run is abandoned rather than silently applied to more tasks.
+        tids = _bulk_select(dd, args, parents_only)
+        grown = [t for t in tids if t not in confirmed]
+        if grown:
+            raise CliError(
+                f"bulk: {len(grown)} more task(s) match now than when the "
+                "selection was made (the file changed underneath) — nothing "
+                "was written, re-run the command"
+            )
+        due_day = _parse_day(due, dd) if due is not None else None
         add_ids = [q.resolve_tag(dd, ref) for ref in (args.tag_add or [])]
         rm_ids = [q.resolve_tag(dd, ref) for ref in (args.tag_rm or [])]
         target_project = (
             q.resolve_project(dd, args.move_project) if args.move_project else None
         )
+        dd_entities = dd["state"]["task"]["entities"]
         skipped.clear()
+        written.clear()
         for tid in tids:
-            task = entities[tid]
+            task = dd_entities[tid]
+            touched = False
             changes: dict = {}
-            if due_day is not None:
-                changes["dueDay"] = due_day
-            if args.clear_due:
-                changes["dueDay"] = None
-                changes["dueWithTime"] = None
-                changes["remindAt"] = None
             if est is not None:
                 changes["timeEstimate"] = est
             # Already-done / already-open tasks are left alone: a no-op HU
@@ -513,15 +557,35 @@ def cmd_bulk(args) -> int:
             if args.reopen and task.get("isDone"):
                 changes["isDone"] = False
                 changes["doneOn"] = None
+            # Tag removal is a tagIds rewrite — it rides the same HU as the
+            # other field edits instead of costing the task a second one.
+            drop = [t for t in rm_ids if t in task.get("tagIds", [])]
+            if drop:
+                changes["tagIds"] = [t for t in task["tagIds"] if t not in drop]
             if changes:
                 mut.update_task(dd, b, tid, changes)
-            if add_ids or rm_ids:
-                mut.tag_task(dd, b, tid, add=add_ids, remove=rm_ids)
+                touched = True
+            for tag_id in add_ids:
+                touched |= mut.add_tag_to_task(dd, b, tid, tag_id)
+            # Scheduling goes through the planner-aware ops, not a raw dueDay
+            # HU: LP keeps the planner day in sync, HSX is SP's canonical
+            # "unschedule" (it also purges the planner).
+            if due_day is not None:
+                mut.plan_for_day(dd, b, tid, due_day)
+                touched = True
+            elif clear_due and (
+                task.get("dueDay") is not None or task.get("dueWithTime") is not None
+            ):
+                mut.unschedule(dd, b, tid)
+                touched = True
             if target_project is not None:
                 if task.get("parentId"):
                     skipped.append(tid)  # a subtask follows its parent
                 elif task.get("projectId") != target_project:
                     mut.move_to_project(dd, b, tid, target_project)
+                    touched = True
+            if touched:
+                written.append(tid)
 
     store.commit([_apply], initial=d)
     for tid in skipped:
@@ -529,7 +593,13 @@ def cmd_bulk(args) -> int:
             f"skipped {render.short_id(tid)}: subtask, move its parent",
             file=sys.stderr,
         )
-    print(f"bulk: {len(selected)} task(s)")
+    if written:
+        print(f"bulk: wrote {len(written)} of {len(selected)} task(s)")
+    else:
+        print(
+            f"bulk: nothing to do ({len(selected)} task(s) already in "
+            "the requested state)"
+        )
     return 0
 
 
