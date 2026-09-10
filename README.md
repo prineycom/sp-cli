@@ -14,6 +14,7 @@ CLI (Python) → WebDAV (GET/PUT /superproductivity/sync-data.json) → теле
 
 ## Документация
 
+- [docs/final-report-2026-09-10.md](docs/final-report-2026-09-10.md) — **финальный отчёт**: что сделано, как проверено, ограничения, операционные факты
 - [.yoke/ai/sp-cli-mvp/research-sync-engine.md](.yoke/ai/sp-cli-mvp/research-sync-engine.md) — sync-слой: формат op, vectorClock, финализация файла
 - [.yoke/ai/sp-cli-mvp/research-data-model.md](.yoke/ai/sp-cli-mvp/research-data-model.md) — модель данных `state.*`
 - [.yoke/ai/sp-cli-mvp/plan.md](.yoke/ai/sp-cli-mvp/plan.md) — архитектура и матрица операций
