@@ -1700,3 +1700,73 @@ class TestProjectBacklogToggle:
             _args(["project", "edit", "inbox", "--title", "In", "--enable-backlog"])
         ) == 0
         assert [op["a"] for op in fake_ctx.ops] == ["PU", "PU"]
+
+
+def _seed_archived(d, task_id, title="archived", key="archiveYoung", **fields):
+    from sp_cli.model import make_task
+
+    task = make_task(task_id, title, "INBOX_PROJECT")
+    task["isDone"] = True
+    task["doneOn"] = 1_700_000_000_000
+    task.update(fields)
+    blob = d.setdefault(key, {"task": {"ids": [], "entities": {}}})
+    reg = blob.setdefault("task", {"ids": [], "entities": {}})
+    reg.setdefault("ids", []).append(task_id)
+    reg.setdefault("entities", {})[task_id] = task
+    return task
+
+
+class TestArchivedCommands:
+    def test_archived_lists_both_blobs(self, fake_ctx, sample, capsys):
+        _seed_archived(sample, "Y" * 21, "young one")
+        _seed_archived(sample, "O" * 21, "old one", key="archiveOld")
+        assert cli.cmd_archived(_args(["archived"])) == 0
+        out = capsys.readouterr().out
+        assert "young one" in out and "old one" in out
+        assert "young" in out and "old" in out
+
+    def test_archived_json_carries_age(self, fake_ctx, sample, capsys):
+        _seed_archived(sample, "Y" * 21, "young one")
+        assert cli.cmd_archived(_args(["archived", "--json"])) == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["age"] == "young"
+
+    def test_archived_search(self, fake_ctx, sample, capsys):
+        _seed_archived(sample, "A" * 21, "keep me")
+        _seed_archived(sample, "B" * 21, "other")
+        assert cli.cmd_archived(_args(["archived", "--search", "keep"])) == 0
+        out = capsys.readouterr().out
+        assert "keep me" in out and "other" not in out
+
+    def test_archived_empty(self, fake_ctx, sample, capsys):
+        assert cli.cmd_archived(_args(["archived"])) == 0
+        assert "(none)" in capsys.readouterr().out
+
+    def test_restore_emits_hr_and_prints_subtask_count(
+        self, fake_ctx, sample, capsys
+    ):
+        _seed_archived(sample, "R" * 21, "root", subTaskIds=["S" * 21])
+        _seed_archived(sample, "S" * 21, "sub", parentId="R" * 21)
+        assert cli.cmd_restore(_args(["restore", "RRR"])) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["HR"]
+        out = capsys.readouterr().out
+        assert "R" * 21 in out and "+1 subtask" in out
+        assert "R" * 21 in sample["state"]["task"]["entities"]
+        assert sample["archiveYoung"]["task"]["ids"] == []
+
+    def test_restore_today_flag(self, fake_ctx, sample, capsys):
+        _seed_archived(sample, "R" * 21, "root")
+        assert cli.cmd_restore(_args(["restore", "RRR", "--today"])) == 0
+        payload = fake_ctx.ops[-1]["p"]["actionPayload"]
+        assert payload["restoreToToday"]["today"] == today_str()
+        assert "to today" in capsys.readouterr().out
+
+    def test_restore_unknown_id_raises(self, fake_ctx, sample):
+        with pytest.raises(q.NotFoundError, match="no archived task"):
+            cli.cmd_restore(_args(["restore", "nope"]))
+
+    def test_restore_live_task_is_refused(self, fake_ctx, sample, add_task_entity):
+        t = add_task_entity(title="live")
+        with pytest.raises(q.NotFoundError):
+            cli.cmd_restore(_args(["restore", t["id"]]))
+        assert fake_ctx.ops == []

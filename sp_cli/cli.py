@@ -1849,6 +1849,35 @@ def cmd_archive(args) -> int:
     return 0
 
 
+def cmd_archived(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    tasks = q.archived_tasks(
+        d, search=args.search, include_subtasks=args.subtasks
+    )
+    if args.json:
+        render.print_json(tasks)
+    else:
+        render.print_archived_tasks(d, tasks)
+    return 0
+
+
+def cmd_restore(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_archived_task(d, args.id)
+    restored: list[str] = []
+
+    def _restore(dd, b):
+        restored.extend(mut.restore_task(dd, b, tid, to_today=args.today))
+
+    store.commit([_restore], initial=d)
+    subs = len(restored) - 1
+    extra = f" (+{subs} subtask(s))" if subs else ""
+    print(f"restored {tid}{extra}" + (" to today" if args.today else ""))
+    return 0
+
+
 def cmd_pull(args) -> int:
     client, _ = _ctx()
     d = client.get()
@@ -2390,6 +2419,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = add("archive", cmd_archive, "archive done tasks")
     s.add_argument("--yes", action="store_true")
+
+    s = add("archived", cmd_archived, "list archived tasks")
+    s.add_argument("--search")
+    s.add_argument(
+        "--subtasks", action="store_true", help="also list archived subtasks"
+    )
+    s.add_argument("--json", action="store_true")
+
+    s = add("restore", cmd_restore, "restore a task from the archive")
+    s.add_argument("id")
+    s.add_argument("--today", action="store_true", help="plan it for today")
 
     s = add("pull", cmd_pull, "download and summarize the sync file")
     s.add_argument("--raw", action="store_true")

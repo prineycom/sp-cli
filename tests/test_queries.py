@@ -725,3 +725,101 @@ class TestBacklogQueries:
     def test_doctor_clean_on_a_healthy_backlog(self, sample, add_task_entity):
         self._seed(sample, add_task_entity)
         assert q.doctor(sample) == []
+
+
+class TestArchivedQueries:
+    @staticmethod
+    def _archive(d, key, task, under_state=False):
+        target = d["state"] if under_state else d
+        blob = target.setdefault(key, {"task": {"ids": [], "entities": {}}})
+        reg = blob.setdefault("task", {"ids": [], "entities": {}})
+        reg.setdefault("ids", []).append(task["id"])
+        reg.setdefault("entities", {})[task["id"]] = task
+        return task
+
+    @classmethod
+    def _archived_task(cls, d, key, tid, title="archived", **fields):
+        task = make_task(tid, title, "INBOX_PROJECT")
+        task["isDone"] = True
+        task["doneOn"] = 1_700_000_000_000
+        task.update(fields)
+        return cls._archive(d, key, task)
+
+    def test_lists_both_blobs_with_age(self, sample):
+        self._archived_task(sample, "archiveYoung", "Y" * 21, "young one")
+        self._archived_task(sample, "archiveOld", "O" * 21, "old one")
+        rows = q.archived_tasks(sample)
+        assert {r["id"]: r["age"] for r in rows} == {
+            "Y" * 21: "young",
+            "O" * 21: "old",
+        }
+
+    def test_lists_state_level_blobs_too(self, sample):
+        self._archived_task(sample, "archiveOld", "S" * 21, "under state")
+        sample["archiveOld"] = None
+        self._archive(
+            sample,
+            "archiveOld",
+            make_task("S" * 21, "under state", "INBOX_PROJECT"),
+            under_state=True,
+        )
+        assert [t["id"] for t in q.archived_tasks(sample)] == ["S" * 21]
+
+    def test_dedupes_by_id_young_wins(self, sample):
+        self._archived_task(sample, "archiveYoung", "D" * 21, "dupe")
+        self._archived_task(sample, "archiveOld", "D" * 21, "dupe")
+        rows = q.archived_tasks(sample)
+        assert len(rows) == 1 and rows[0]["age"] == "young"
+
+    def test_subtasks_hidden_by_default(self, sample):
+        self._archived_task(sample, "archiveYoung", "P" * 21, "parent")
+        self._archived_task(
+            sample, "archiveYoung", "C" * 21, "child", parentId="P" * 21
+        )
+        assert [t["id"] for t in q.archived_tasks(sample)] == ["P" * 21]
+        assert len(q.archived_tasks(sample, include_subtasks=True)) == 2
+
+    def test_search_filters_by_title(self, sample):
+        self._archived_task(sample, "archiveYoung", "A" * 21, "Write REPORT")
+        self._archived_task(sample, "archiveYoung", "B" * 21, "other")
+        assert [t["id"] for t in q.archived_tasks(sample, search="report")] == [
+            "A" * 21
+        ]
+
+    def test_sorted_newest_done_first(self, sample):
+        self._archived_task(sample, "archiveYoung", "A" * 21, "older", doneOn=1000)
+        self._archived_task(sample, "archiveYoung", "B" * 21, "newer", doneOn=2000)
+        assert [t["id"] for t in q.archived_tasks(sample)] == ["B" * 21, "A" * 21]
+
+    def test_resolve_prefix(self, sample):
+        self._archived_task(sample, "archiveOld", "Z" * 21, "old one")
+        assert q.resolve_archived_task(sample, "ZZZ") == "Z" * 21
+        assert q.resolve_archived_task(sample, "Z" * 21) == "Z" * 21
+
+    def test_resolve_unknown_raises(self, sample):
+        with pytest.raises(q.NotFoundError, match="no archived task"):
+            q.resolve_archived_task(sample, "nope")
+
+    def test_resolve_ambiguous_within_archive(self, sample):
+        self._archived_task(sample, "archiveYoung", "AB" + "x" * 19)
+        self._archived_task(sample, "archiveYoung", "AB" + "y" * 19)
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_archived_task(sample, "AB")
+
+    def test_resolve_conflict_with_a_live_task(self, sample, add_task_entity):
+        self._archived_task(sample, "archiveYoung", "AB" + "x" * 19)
+        add_task_entity(task_id="AB" + "y" * 19, title="live")
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_archived_task(sample, "AB")
+
+    def test_resolve_full_id_wins_over_a_live_prefix_sibling(
+        self, sample, add_task_entity
+    ):
+        self._archived_task(sample, "archiveYoung", "AB" + "x" * 19)
+        add_task_entity(task_id="AB" + "y" * 19, title="live")
+        assert q.resolve_archived_task(sample, "AB" + "x" * 19) == "AB" + "x" * 19
+
+    def test_archived_task_lookup(self, sample):
+        self._archived_task(sample, "archiveOld", "Q" * 21, "look me up")
+        assert q.archived_task(sample, "Q" * 21)["title"] == "look me up"
+        assert q.archived_task(sample, "nope") is None

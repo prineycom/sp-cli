@@ -103,24 +103,35 @@ def logical_today_str(d: dict | None = None) -> str:
     return logical_day_of_ms(now_ms(), d)
 
 
-def archive_task_entity_maps(d: dict) -> list[dict]:
-    """Every archived-task `entities` map in the file.
+ARCHIVE_KEYS = ("archiveYoung", "archiveOld")
+
+
+def archive_task_blobs(d: dict) -> list[tuple[str, dict]]:
+    """Every archived-task registry in the file as `(archive key, registry)`.
 
     `archiveYoung` / `archiveOld` live at the TOP level in current files, but
     older (and partially-migrated) ones keep them under `state` — and a file
     can carry BOTH at once. Every blob is returned so a scan can never
     short-circuit on the first one it finds and miss the tasks in the other.
+
+    The registry itself is handed back (not a copy) so writers can prune both
+    its `ids` list and its `entities` map; young blobs come before old ones.
     """
     state = d.get("state") if isinstance(d.get("state"), dict) else {}
-    maps: list[dict] = []
-    for key in ("archiveYoung", "archiveOld"):
+    blobs: list[tuple[str, dict]] = []
+    for key in ARCHIVE_KEYS:
         for blob in (d.get(key), state.get(key)):
             if not isinstance(blob, dict):
                 continue
-            entities = (blob.get("task") or {}).get("entities")
-            if isinstance(entities, dict):
-                maps.append(entities)
-    return maps
+            reg = blob.get("task")
+            if isinstance(reg, dict) and isinstance(reg.get("entities"), dict):
+                blobs.append((key, reg))
+    return blobs
+
+
+def archive_task_entity_maps(d: dict) -> list[dict]:
+    """Every archived-task `entities` map in the file (see archive_task_blobs)."""
+    return [reg["entities"] for _key, reg in archive_task_blobs(d)]
 
 
 def default_theme(primary: str | None = None) -> dict:

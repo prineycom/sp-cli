@@ -120,6 +120,31 @@ def print_tasks(d: dict, tasks: list[dict]) -> None:
     print_table(["id", "✓", "title", "project", "due", "est/spent", "tags"], task_rows(d, tasks))
 
 
+def archived_task_rows(d: dict, tasks: list[dict]) -> list[list[str]]:
+    projects = d["state"]["project"]["entities"]
+    rows = []
+    for t in tasks:
+        rows.append(
+            [
+                short_id(t["id"]),
+                t.get("age", "-"),
+                truncate(t.get("title", ""), TITLE_WIDTH),
+                projects.get(t.get("projectId"), {}).get("title", "?"),
+                format_ts(t.get("doneOn")),
+                str(len(t.get("subTaskIds") or [])),
+                format_duration(t.get("timeSpent")),
+            ]
+        )
+    return rows
+
+
+def print_archived_tasks(d: dict, tasks: list[dict]) -> None:
+    print_table(
+        ["id", "age", "title", "project", "done", "subs", "spent"],
+        archived_task_rows(d, tasks),
+    )
+
+
 def first_line(text: str | None) -> str:
     for line in (text or "").splitlines():
         if line.strip():

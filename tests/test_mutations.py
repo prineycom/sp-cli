@@ -2135,3 +2135,219 @@ class TestIssueProviders:
         mut.provider_delete(sample, b, "P" * 21)
         assert [op["a"] for op in b.ops] == ["IA", "IU", "IS", "HID"]
         assert all(op["e"] == "ISSUE_PROVIDER" for op in b.ops)
+
+
+class TestRestore:
+    @staticmethod
+    def _blob(d, key, under_state=False):
+        target = d["state"] if under_state else d
+        blob = target.setdefault(key, {"task": {"ids": [], "entities": {}}})
+        reg = blob.setdefault("task", {"ids": [], "entities": {}})
+        reg.setdefault("ids", [])
+        reg.setdefault("entities", {})
+        return reg
+
+    @classmethod
+    def _archive(cls, d, key, task, under_state=False):
+        reg = cls._blob(d, key, under_state)
+        reg["ids"].append(task["id"])
+        reg["entities"][task["id"]] = task
+        return task
+
+    @staticmethod
+    def _done(tid, title="archived", project="INBOX_PROJECT", **fields):
+        task = make_task(tid, title, project)
+        task["isDone"] = True
+        task["doneOn"] = 1_700_000_000_000
+        task.update(fields)
+        return task
+
+    def _seed(self, d, key="archiveYoung", subs=1, **fields):
+        sub_ids = [chr(ord("S") + i) * 21 for i in range(subs)]
+        root = self._done("R" * 21, "root", subTaskIds=list(sub_ids), **fields)
+        self._archive(d, key, root)
+        for sid in sub_ids:
+            self._archive(d, key, self._done(sid, f"sub {sid[0]}", parentId="R" * 21))
+        return root, sub_ids
+
+    def test_restore_emits_hr_with_populated_subtasks(self, sample, b):
+        root, sub_ids = self._seed(sample, subs=2)
+        assert mut.restore_task(sample, b, "R" * 21) == ["R" * 21] + sub_ids
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("HR", "UPD", "TASK", "R" * 21)
+        assert "ds" not in op
+        payload = op["p"]["actionPayload"]
+        assert payload["task"]["subTaskIds"] == sub_ids
+        assert [s["id"] for s in payload["subTasks"]] == sub_ids
+        assert "restoreToToday" not in payload
+        # the payload carries the ARCHIVED task; normalization is the reducer's
+        assert payload["task"]["isDone"] is True
+        assert_doctor_clean(sample)
+
+    def test_state_is_normalized_and_archive_cleaned(self, sample, b):
+        root, sub_ids = self._seed(sample)
+        mut.restore_task(sample, b, "R" * 21)
+        live = _task(sample, "R" * 21)
+        assert live["isDone"] is False and "doneOn" not in live
+        assert sample["archiveYoung"]["task"]["ids"] == []
+        assert sample["archiveYoung"]["task"]["entities"] == {}
+        project = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        assert project["taskIds"].count("R" * 21) == 1
+        assert sub_ids[0] not in project["taskIds"]
+        sub = _task(sample, sub_ids[0])
+        assert sub["parentId"] == "R" * 21 and sub["projectId"] == "INBOX_PROJECT"
+        assert_doctor_clean(sample)
+
+    def test_restore_never_uses_the_backlog(self, sample, b):
+        project = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        project["isEnableBacklog"] = True
+        self._seed(sample, subs=0)
+        mut.restore_task(sample, b, "R" * 21)
+        assert project["backlogTaskIds"] == []
+        assert "R" * 21 in project["taskIds"]
+
+    def test_cleans_both_blobs_including_state_level(self, sample, b):
+        root, sub_ids = self._seed(sample, key="archiveYoung")
+        # the same ids also linger in archiveOld, top-level AND under state
+        self._archive(sample, "archiveOld", self._done("R" * 21, "root"))
+        self._archive(
+            sample, "archiveOld", self._done(sub_ids[0], "sub"), under_state=True
+        )
+        mut.restore_task(sample, b, "R" * 21)
+        for reg in (
+            sample["archiveYoung"]["task"],
+            sample["archiveOld"]["task"],
+            sample["state"]["archiveOld"]["task"],
+        ):
+            assert reg["ids"] == [] and reg["entities"] == {}
+        assert_doctor_clean(sample)
+
+    def test_unique_append_when_project_already_lists_it(self, sample, b):
+        self._seed(sample, subs=0)
+        sample["state"]["project"]["entities"]["INBOX_PROJECT"]["taskIds"].append(
+            "R" * 21
+        )
+        mut.restore_task(sample, b, "R" * 21)
+        assert sample["state"]["project"]["entities"]["INBOX_PROJECT"][
+            "taskIds"
+        ].count("R" * 21) == 1
+        assert_doctor_clean(sample)
+
+    def test_tags_get_unique_append_and_today_is_stripped(self, sample, b):
+        tag = make_tag("G" * 21, "work")
+        mut.tag_add(sample, b, tag)
+        root, sub_ids = self._seed(sample)
+        root["tagIds"] = ["G" * 21, "TODAY", "GONE" + "z" * 17]
+        sample["archiveYoung"]["task"]["entities"][sub_ids[0]]["tagIds"] = ["G" * 21]
+        mut.restore_task(sample, b, "R" * 21)
+        assert _task(sample, "R" * 21)["tagIds"] == ["G" * 21]
+        assert tag["taskIds"] == ["R" * 21, sub_ids[0]]
+        assert_doctor_clean(sample)
+
+    def test_unknown_project_falls_back_to_inbox(self, sample, b):
+        self._seed(sample, subs=1, projectId="GONE" + "p" * 17)
+        mut.restore_task(sample, b, "R" * 21)
+        assert _task(sample, "R" * 21)["projectId"] == "INBOX_PROJECT"
+        assert _task(sample, "S" * 21)["projectId"] == "INBOX_PROJECT"
+        assert_doctor_clean(sample)
+
+    def test_dangling_repeat_cfg_is_cleared(self, sample, b):
+        self._seed(sample, subs=0, repeatCfgId="C" * 21)
+        mut.restore_task(sample, b, "R" * 21)
+        assert "repeatCfgId" not in _task(sample, "R" * 21)
+
+    def test_live_repeat_cfg_is_kept(self, sample, b):
+        reg = sample["state"].setdefault(
+            "taskRepeatCfg", {"ids": [], "entities": {}}
+        )
+        reg["ids"].append("C" * 21)
+        reg["entities"]["C" * 21] = {"id": "C" * 21, "title": "weekly thing"}
+        self._seed(sample, subs=0, repeatCfgId="C" * 21)
+        mut.restore_task(sample, b, "R" * 21)
+        assert _task(sample, "R" * 21)["repeatCfgId"] == "C" * 21
+
+    def test_missing_subtask_reference_is_pruned(self, sample, b):
+        root = self._done("R" * 21, "root", subTaskIds=["X" * 21])
+        self._archive(sample, "archiveYoung", root)
+        mut.restore_task(sample, b, "R" * 21)
+        assert _last_op(b)["p"]["actionPayload"]["task"]["subTaskIds"] == []
+        assert _task(sample, "R" * 21)["subTaskIds"] == []
+        assert_doctor_clean(sample)
+
+    def test_restore_to_today_materializes_the_payload(self, sample, b):
+        root, sub_ids = self._seed(
+            sample, subs=1, dueDay="2020-01-01", remindAt=123
+        )
+        sample["archiveYoung"]["task"]["entities"][sub_ids[0]].update(
+            {"dueDay": "2020-01-02", "remindAt": 7}
+        )
+        mut.restore_task(sample, b, "R" * 21, to_today=True)
+        payload = _last_op(b)["p"]["actionPayload"]
+        today = today_str()
+        assert payload["task"]["dueDay"] == today
+        assert "remindAt" not in payload["task"]
+        assert "dueWithTime" not in payload["task"]
+        sub = payload["subTasks"][0]
+        assert not [f for f in ("dueDay", "dueWithTime", "remindAt") if f in sub]
+        assert payload["restoreToToday"] == {
+            "today": today,
+            "startOfNextDayDiffMs": 0,
+        }
+        assert _task(sample, "R" * 21)["dueDay"] == today
+        assert _today_order(sample)[0] == "R" * 21
+        assert_doctor_clean(sample)
+
+    def test_restore_to_today_keeps_a_due_with_time_of_today(self, sample, b):
+        ts = int(
+            datetime.datetime.combine(
+                datetime.date.today(), datetime.time(23, 30)
+            ).timestamp()
+            * 1000
+        )
+        self._seed(sample, subs=0, dueWithTime=ts)
+        mut.restore_task(sample, b, "R" * 21, to_today=True)
+        task = _task(sample, "R" * 21)
+        # XOR: dueWithTime survives, dueDay stays unset
+        assert task["dueWithTime"] == ts and "dueDay" not in task
+        assert_doctor_clean(sample)
+
+    def test_restore_to_today_purges_planner_days(self, sample, b):
+        root, sub_ids = self._seed(sample)
+        sample["state"]["planner"] = {
+            "days": {"2030-01-01": ["R" * 21, sub_ids[0]]}
+        }
+        mut.restore_task(sample, b, "R" * 21, to_today=True)
+        assert sample["state"]["planner"]["days"] == {}
+
+    def test_plain_restore_leaves_today_alone(self, sample, b):
+        self._seed(sample, subs=0)
+        mut.restore_task(sample, b, "R" * 21)
+        assert "R" * 21 not in _today_order(sample)
+
+    def test_already_active_is_refused(self, sample, b, add_task_entity):
+        self._seed(sample, subs=0)
+        add_task_entity(task_id="R" * 21, title="live already")
+        n_ops = len(b.ops)
+        with pytest.raises(mut.MutationError, match="already active"):
+            mut.restore_task(sample, b, "R" * 21)
+        assert len(b.ops) == n_ops
+
+    def test_active_subtask_is_refused(self, sample, b, add_task_entity):
+        root, sub_ids = self._seed(sample)
+        add_task_entity(task_id=sub_ids[0], title="live sub")
+        with pytest.raises(mut.MutationError, match="already active"):
+            mut.restore_task(sample, b, "R" * 21)
+
+    def test_unknown_id_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="not in the archive"):
+            mut.restore_task(sample, b, "N" * 21)
+
+    def test_restoring_a_subtask_directly_is_refused(self, sample, b):
+        root, sub_ids = self._seed(sample)
+        with pytest.raises(mut.MutationError, match="restore its parent"):
+            mut.restore_task(sample, b, sub_ids[0])
+
+    def test_no_archive_maintenance_ops_are_emitted(self, sample, b):
+        self._seed(sample, subs=1)
+        mut.restore_task(sample, b, "R" * 21)
+        assert [op["a"] for op in b.ops] == ["HR"]

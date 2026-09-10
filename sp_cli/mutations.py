@@ -9,12 +9,15 @@ import copy
 import datetime
 
 from sp_cli.model import (
+    INBOX_PROJECT_ID,
     ISSUE_TASK_FIELDS,
     METRIC_DEAD_FIELDS,
     METRIC_FIELDS,
     TODAY_TAG_ID,
+    archive_task_blobs,
     archive_task_entity_maps,
     day_of_ms,
+    logical_today_str,
     make_metric,
     make_repeat_cfg,
     now_ms,
@@ -1597,3 +1600,138 @@ def archive_done(d: dict, b: OpBuilder) -> list[str]:
     for tid in parent_ids:
         _cascade_remove_task(state, tid)
     return parent_ids
+
+
+def _archive_find(d: dict, task_id: str) -> dict | None:
+    for entities in archive_task_entity_maps(d):
+        task = entities.get(task_id)
+        if task is not None:
+            return task
+    return None
+
+
+def _archive_remove(d: dict, task_ids: list[str]) -> None:
+    """Drop the ids from EVERY archive blob (young and old, top-level and
+    under `state`) — a task can sit in more than one of them."""
+    for _key, reg in archive_task_blobs(d):
+        for tid in task_ids:
+            reg["entities"].pop(tid, None)
+            _list_remove(reg.setdefault("ids", []), tid)
+
+
+def _materialize_restore_today(root: dict, subs: list[dict], today: str) -> None:
+    """The `restoreToToday` transform SP's action creator applies BEFORE the
+    op leaves the device — so the payload must already carry it."""
+    root.pop("remindAt", None)
+    if (
+        root.get("dueWithTime") is not None
+        and day_of_ms(root["dueWithTime"]) == today
+    ):
+        # Already scheduled for today: keep dueWithTime and leave dueDay
+        # unset — the two are mutually exclusive (same rule as plan_today).
+        pass
+    else:
+        root.pop("dueWithTime", None)
+        root["dueDay"] = today
+    for sub in subs:
+        for field in ("dueDay", "dueWithTime", "remindAt"):
+            sub.pop(field, None)
+
+
+def _normalize_restored(state: dict, root: dict, subs: list[dict]) -> None:
+    """The receiver-side normalization of a restored task (HR reducer):
+    live again, no doneOn, a project that exists, no TODAY tag, no dangling
+    repeatCfgId, section-less; subtasks re-pointed at the parent."""
+    projects = state["project"]["entities"]
+    tags = state["tag"]["entities"]
+    cfgs = (state.get("taskRepeatCfg") or {}).get("entities") or {}
+
+    if root.get("projectId") not in projects:
+        root["projectId"] = INBOX_PROJECT_ID
+    root["isDone"] = False
+    root.pop("doneOn", None)
+    if root.get("repeatCfgId") and root["repeatCfgId"] not in cfgs:
+        root.pop("repeatCfgId", None)
+    for entity in [root] + subs:
+        # TODAY is never a stored tag, and a tag deleted while the task sat
+        # in the archive would leave a dangling reference.
+        entity["tagIds"] = [
+            t for t in entity.get("tagIds", []) if t != TODAY_TAG_ID and t in tags
+        ]
+        entity.pop("sectionId", None)
+    for sub in subs:
+        sub["parentId"] = root["id"]
+        sub["projectId"] = root["projectId"]
+
+
+def restore_task(
+    d: dict, b: OpBuilder, task_id: str, to_today: bool = False
+) -> list[str]:
+    """Bring an archived top-level task (with its subtasks) back to life.
+
+    Emits one HR whose payload is already materialized (`restoreToToday`
+    transforms applied), then reproduces the reducer's state effects:
+    the ids leave every archive blob, the normalized entities are added back,
+    the root is unique-appended to `project.taskIds` (NEVER the backlog) and
+    to each of its tags. Returns `[root, *subtasks]`.
+
+    Archive maintenance (young→old flush AF, compaction AC) is the app's job
+    and is deliberately never emitted here.
+    """
+    state = _state(d)
+    if task_id in state["task"]["entities"]:
+        raise MutationError(f"task {task_id} is already active")
+    archived = _archive_find(d, task_id)
+    if archived is None:
+        raise MutationError(f"task not in the archive: {task_id}")
+    if archived.get("parentId"):
+        raise MutationError(
+            f"{task_id} is an archived subtask; restore its parent "
+            f"{archived['parentId']} instead"
+        )
+
+    root = copy.deepcopy(archived)
+    root.pop("subTasks", None)
+    subs: list[dict] = []
+    for sid in list(root.get("subTaskIds") or []):
+        if sid in state["task"]["entities"]:
+            raise MutationError(f"subtask {sid} is already active")
+        sub = _archive_find(d, sid)
+        if sub is None:
+            continue  # gone from the archive: prune the dangling reference
+        sub = copy.deepcopy(sub)
+        sub.pop("subTasks", None)
+        subs.append(sub)
+    # The reducer reads task.subTaskIds to clean the archive — keep it exact.
+    root["subTaskIds"] = [s["id"] for s in subs]
+
+    today = logical_today_str(d)
+    if to_today:
+        _materialize_restore_today(root, subs, today)
+
+    payload = {"task": copy.deepcopy(root), "subTasks": copy.deepcopy(subs)}
+    if to_today:
+        payload["restoreToToday"] = {"today": today, "startOfNextDayDiffMs": 0}
+    b.op("HR", "UPD", "TASK", task_id, payload)
+
+    _normalize_restored(state, root, subs)
+    project = _project(state, root["projectId"])
+    all_ids = [task_id] + list(root["subTaskIds"])
+
+    _archive_remove(d, all_ids)
+    _reg_add(state["task"], root)
+    for sub in subs:
+        _reg_add(state["task"], sub)
+
+    if task_id not in project.setdefault("taskIds", []):
+        project["taskIds"].append(task_id)
+    _list_remove(project.setdefault("backlogTaskIds", []), task_id)
+    for entity in [root] + subs:
+        for tag_id in entity["tagIds"]:
+            tag = _tag(state, tag_id)
+            if entity["id"] not in tag.setdefault("taskIds", []):
+                tag["taskIds"].append(entity["id"])
+    if to_today:
+        _today_prepend(state, [task_id])
+        _planner_purge(state, all_ids)
+    return all_ids

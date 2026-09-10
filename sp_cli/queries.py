@@ -12,6 +12,7 @@ from sp_cli.model import (
     PANEL_SORT_BY,
     SIMPLE_COUNTER_TYPES,
     TODAY_TAG_ID,
+    archive_task_blobs,
     archive_task_entity_maps,
     day_of_ms,
     today_str,
@@ -49,6 +50,36 @@ def resolve_task(d: dict, ref: str) -> str:
         raise NotFoundError(f"no task with id (prefix) '{ref}'")
     if len(matches) > 1:
         raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
+def _prefix_matches(ids: list[str], ref: str) -> list[str]:
+    matches = [i for i in ids if i.startswith(ref)]
+    if not matches:
+        # Ids may start with '-'/'_' which is awkward to type as a CLI
+        # argument; allow a prefix with those leading chars omitted.
+        matches = [i for i in ids if i.lstrip("-_").startswith(ref)]
+    return matches
+
+
+def resolve_archived_task(d: dict, ref: str) -> str:
+    """Resolve an id (or prefix) against the ARCHIVE only.
+
+    Separate from `resolve_task` on purpose: the two id spaces are disjoint,
+    and a prefix that hits both is refused instead of silently picking the
+    archived one.
+    """
+    ids = archived_task_ids(d)
+    if ref in ids:
+        return ref
+    matches = _prefix_matches(ids, ref)
+    if not matches:
+        raise NotFoundError(f"no archived task with id (prefix) '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    live = _prefix_matches(d["state"]["task"]["ids"], ref)
+    if live:
+        raise AmbiguousIdError(ref, sorted(matches + live))
     return matches[0]
 
 
@@ -447,6 +478,65 @@ def _archive_tasks(d: dict) -> list[dict]:
             seen.add(tid)
             tasks.append(task)
     return tasks
+
+
+ARCHIVE_AGE = {"archiveYoung": "young", "archiveOld": "old"}
+
+
+def archived_task_ids(d: dict) -> list[str]:
+    """Every archived task id, deduped, young blobs first."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for entities in archive_task_entity_maps(d):
+        for tid in entities:
+            if tid not in seen:
+                seen.add(tid)
+                ids.append(tid)
+    return ids
+
+
+def archived_task(d: dict, task_id: str) -> dict | None:
+    """The archived entity for `task_id` (first blob wins), or None."""
+    for entities in archive_task_entity_maps(d):
+        task = entities.get(task_id)
+        if task is not None:
+            return task
+    return None
+
+
+def archived_tasks(
+    d: dict, search: str | None = None, include_subtasks: bool = False
+) -> list[dict]:
+    """Archived tasks as shallow copies carrying an extra 'age' field
+    ('young'/'old'), newest-done first.
+
+    Deduped by id across blobs; the young blob wins the age label because it
+    comes first (a task present in both is on its way to being flushed).
+    Subtasks are hidden by default — they are restored with their parent, so
+    as standalone rows they are only noise.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    needle = (search or "").lower()
+    for key, reg in archive_task_blobs(d):
+        for tid, task in reg["entities"].items():
+            if tid in seen:
+                continue
+            seen.add(tid)
+            if not include_subtasks and task.get("parentId"):
+                continue
+            if needle and needle not in (task.get("title") or "").lower():
+                continue
+            entry = dict(task)
+            entry["age"] = ARCHIVE_AGE[key]
+            out.append(entry)
+    out.sort(
+        key=lambda t: (
+            -int(t.get("doneOn") or t.get("created") or 0),
+            (t.get("title") or "").lower(),
+        )
+    )
+    return out
 
 
 def worklog(d: dict, date_from: str | None = None, date_to: str | None = None) -> dict:
