@@ -48,6 +48,16 @@ def _project(state: dict, project_id: str) -> dict:
         raise MutationError(f"project not found: {project_id}") from None
 
 
+def _require_backlog(project: dict) -> None:
+    """PRB/PAB and the isAddToBacklog flag are SILENT no-ops on devices when
+    the project has no backlog — refuse instead of shipping a dead op."""
+    if not project.get("isEnableBacklog"):
+        raise MutationError(
+            f"project {project['id']} has no backlog "
+            f"(enable it: sp project edit {project['id']} --enable-backlog)"
+        )
+
+
 def _tag(state: dict, tag_id: str) -> dict:
     try:
         return state["tag"]["entities"][tag_id]
@@ -72,6 +82,23 @@ def _reg_remove(registry: dict, entity_id: str) -> None:
 def _list_remove(lst: list, value) -> None:
     while value in lst:
         lst.remove(value)
+
+
+def _move_item_after_anchor(lst: list, item_id: str, after_id: str | None) -> None:
+    """SP's `moveItemAfterAnchor`: filter the id out, then insert after the
+    anchor. `after_id` None prepends; a missing anchor is a no-op when the
+    item was already in the list, an append otherwise. Replay-idempotent."""
+    if after_id is None:
+        _list_remove(lst, item_id)
+        lst.insert(0, item_id)
+        return
+    if after_id not in lst:
+        if item_id in lst:
+            return
+        lst.append(item_id)
+        return
+    _list_remove(lst, item_id)
+    lst.insert(lst.index(after_id) + 1, item_id)
 
 
 def _today_order(state: dict) -> list:
@@ -109,14 +136,20 @@ def _clear_due_with_time(task: dict, changes: dict | None = None) -> None:
 
 # ---------------------------------------------------------------- tasks
 
-def add_task(d: dict, b: OpBuilder, task: dict) -> str:
-    """Create a top-level task (already built via model.make_task)."""
+def add_task(d: dict, b: OpBuilder, task: dict, to_backlog: bool = False) -> str:
+    """Create a top-level task (already built via model.make_task).
+
+    `to_backlog` puts it straight into the project's backlog — SP's reducer
+    silently ignores that flag when the project has no backlog enabled, so
+    the guard is enforced here instead."""
     state = _state(d)
     if TODAY_TAG_ID in task.get("tagIds", []):
         raise MutationError("'TODAY' must never appear in task.tagIds")
     if task.get("dueDay") is not None and task.get("dueWithTime") is not None:
         raise MutationError("dueDay and dueWithTime are mutually exclusive")
     project = _project(state, task["projectId"])
+    if to_backlog:
+        _require_backlog(project)
     for tag_id in task.get("tagIds", []):
         _tag(state, tag_id)  # validate existence
 
@@ -129,13 +162,16 @@ def add_task(d: dict, b: OpBuilder, task: dict) -> str:
             "task": copy.deepcopy(task),
             "workContextId": task["projectId"],
             "workContextType": "PROJECT",
-            "isAddToBacklog": False,
+            "isAddToBacklog": bool(to_backlog),
             "isAddToBottom": True,
         },
     )
 
     _reg_add(state["task"], task)
-    project["taskIds"].append(task["id"])
+    if to_backlog:
+        project.setdefault("backlogTaskIds", []).append(task["id"])
+    else:
+        project["taskIds"].append(task["id"])
     for tag_id in task.get("tagIds", []):
         tag = _tag(state, tag_id)
         if task["id"] not in tag["taskIds"]:
@@ -317,6 +353,108 @@ def reorder_project(d: dict, b: OpBuilder, project_id: str, ordered: list[str]) 
         {"project": {"id": project_id, "changes": {"taskIds": list(ordered)}}},
     )
     project["taskIds"] = list(ordered)
+
+
+# ---------------------------------------------------------------- backlog
+
+def backlog_add(
+    d: dict, b: OpBuilder, task_id: str, after_task_id: str | None = None
+) -> str:
+    """PRB: move a top-level task from the project list into its backlog."""
+    state = _state(d)
+    task = _task(state, task_id)
+    if task.get("parentId"):
+        raise MutationError(
+            "cannot move a subtask to the backlog; move its parent instead"
+        )
+    project = _project(state, task["projectId"])
+    _require_backlog(project)
+    project_id = project["id"]
+
+    b.op(
+        "PRB",
+        "MOV",
+        "TASK",
+        task_id,
+        {
+            "taskId": task_id,
+            "afterTaskId": after_task_id,
+            "workContextId": project_id,
+        },
+    )
+
+    _list_remove(project.setdefault("taskIds", []), task_id)
+    _move_item_after_anchor(
+        project.setdefault("backlogTaskIds", []), task_id, after_task_id
+    )
+    return project_id
+
+
+def backlog_remove(
+    d: dict, b: OpBuilder, task_id: str, after_task_id: str | None = None
+) -> str:
+    """PBR: move a task back out of the backlog into the project list."""
+    state = _state(d)
+    task = _task(state, task_id)
+    project = _project(state, task["projectId"])
+    project_id = project["id"]
+    if task_id not in project.get("backlogTaskIds", []):
+        raise MutationError(
+            f"task {task_id} is not in the backlog of project {project_id}"
+        )
+
+    b.op(
+        "PBR",
+        "MOV",
+        "TASK",
+        task_id,
+        {
+            "taskId": task_id,
+            "afterTaskId": after_task_id,
+            "workContextId": project_id,
+            "src": "BACKLOG",
+            "target": "UNDONE",
+        },
+    )
+
+    _list_remove(project.setdefault("backlogTaskIds", []), task_id)
+    _move_item_after_anchor(
+        project.setdefault("taskIds", []), task_id, after_task_id
+    )
+    return project_id
+
+
+def backlog_clear(d: dict, b: OpBuilder, project_id: str) -> list[str]:
+    """PBA: move the WHOLE backlog back into the project list. Returns the
+    moved ids ([] when the backlog was already empty — the op is emitted
+    either way, it is an idempotent no-op on the receivers)."""
+    state = _state(d)
+    project = _project(state, project_id)
+    moved = list(project.get("backlogTaskIds", []))
+
+    b.op("PBA", "UPD", "PROJECT", project_id, {"projectId": project_id})
+
+    task_ids = project.setdefault("taskIds", [])
+    for tid in moved:
+        if tid not in task_ids:
+            task_ids.append(tid)
+    project["backlogTaskIds"] = []
+    return moved
+
+
+def project_set_backlog(
+    d: dict, b: OpBuilder, project_id: str, enabled: bool
+) -> list[str]:
+    """Toggle project.isEnableBacklog. Disabling emits PU **and** PBA: SP's
+    own effect flushes the backlog when the setting goes off, so the file has
+    to carry the same pair or the tasks would be stranded in a list the app
+    no longer shows."""
+    state = _state(d)
+    _project(state, project_id)
+    project_update(d, b, project_id, {"isEnableBacklog": bool(enabled)})
+    if enabled:
+        return []
+    return backlog_clear(d, b, project_id)
 
 
 # ---------------------------------------------------------------- planning

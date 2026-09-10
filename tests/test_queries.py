@@ -636,3 +636,49 @@ class TestIssueProviderQueries:
         assert q.doctor(sample) == []
         sample["state"]["issueProvider"]["ids"] = []
         assert any("issueProvider" in p for p in q.doctor(sample))
+
+
+class TestBacklogQueries:
+    def _seed(self, d, add_task_entity, n=2):
+        project = d["state"]["project"]["entities"]["INBOX_PROJECT"]
+        project["isEnableBacklog"] = True
+        ids = []
+        for i in range(n):
+            task = add_task_entity(title=f"b{i}")
+            project["taskIds"].remove(task["id"])
+            project.setdefault("backlogTaskIds", []).append(task["id"])
+            ids.append(task["id"])
+        return project, ids
+
+    def test_backlog_list_follows_backlog_order(self, sample, add_task_entity):
+        project, ids = self._seed(sample, add_task_entity)
+        project["backlogTaskIds"] = list(reversed(ids))
+        assert [t["id"] for t in q.backlog_list(sample, "INBOX_PROJECT")] == list(
+            reversed(ids)
+        )
+
+    def test_backlog_list_empty(self, sample):
+        assert q.backlog_list(sample, "INBOX_PROJECT") == []
+
+    def test_backlog_list_unknown_project(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.backlog_list(sample, "NOPE")
+
+    def test_doctor_flags_a_task_in_both_lists(self, sample, add_task_entity):
+        project, ids = self._seed(sample, add_task_entity, n=1)
+        project["taskIds"].append(ids[0])
+        assert any("both taskIds and backlogTaskIds" in p for p in q.doctor(sample))
+
+    def test_doctor_flags_a_subtask_in_the_backlog(self, sample, add_task_entity):
+        project = sample["state"]["project"]["entities"]["INBOX_PROJECT"]
+        parent = add_task_entity(title="parent")
+        sub = add_task_entity(title="sub", parent_id=parent["id"])
+        parent["subTaskIds"].append(sub["id"])
+        project.setdefault("backlogTaskIds", []).append(sub["id"])
+        assert any(
+            "listed in project.backlogTaskIds" in p for p in q.doctor(sample)
+        )
+
+    def test_doctor_clean_on_a_healthy_backlog(self, sample, add_task_entity):
+        self._seed(sample, add_task_entity)
+        assert q.doctor(sample) == []

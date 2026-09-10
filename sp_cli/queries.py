@@ -232,6 +232,20 @@ def today_list(d: dict) -> list[dict]:
     return [entities[tid] for tid in ordered]
 
 
+def backlog_list(d: dict, project_id: str) -> list[dict]:
+    """The project's backlog tasks, in backlogTaskIds order."""
+    state = d["state"]
+    project = state["project"]["entities"].get(project_id)
+    if project is None:
+        raise NotFoundError(f"no project with id '{project_id}'")
+    entities = state["task"]["entities"]
+    return [
+        entities[tid]
+        for tid in project.get("backlogTaskIds", [])
+        if tid in entities
+    ]
+
+
 # ---------------------------------------------------------------- notes
 
 def all_notes(d: dict) -> list[dict]:
@@ -501,10 +515,20 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"project {pid}: taskIds references missing task {tid}")
             elif tasks[tid].get("parentId"):
                 problems.append(f"project {pid}: subtask {tid} listed in project.taskIds")
+        listed = set(project.get("taskIds", []))
         for tid in project.get("backlogTaskIds", []):
             if tid not in task_ids:
                 problems.append(
                     f"project {pid}: backlogTaskIds references missing task {tid}"
+                )
+            elif tasks[tid].get("parentId"):
+                problems.append(
+                    f"project {pid}: subtask {tid} listed in project.backlogTaskIds"
+                )
+            # A task lives in exactly one of the two lists.
+            if tid in listed:
+                problems.append(
+                    f"project {pid}: task {tid} is in both taskIds and backlogTaskIds"
                 )
 
     tags = state["tag"]["entities"]

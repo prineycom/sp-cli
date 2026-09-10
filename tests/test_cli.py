@@ -1316,3 +1316,148 @@ class TestUntrackCommand:
             "duration": 600000,
         }
         assert "untracked" in capsys.readouterr().out
+
+
+class TestBacklogArgvRewrites:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["backlog", "add", "abc"], "backlog-add"),
+            (["backlog", "rm", "abc"], "backlog-rm"),
+            (["backlog", "clear", "--project", "inbox"], "backlog-clear"),
+        ],
+    )
+    def test_rewritten(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_bare_backlog_is_the_listing(self):
+        assert cli._rewrite_argv(["backlog", "--project", "inbox"]) == [
+            "backlog",
+            "--project",
+            "inbox",
+        ]
+
+
+def _enable_project_backlog(d, project_id="INBOX_PROJECT"):
+    project = d["state"]["project"]["entities"][project_id]
+    project["isEnableBacklog"] = True
+    project.setdefault("backlogTaskIds", [])
+    return project
+
+
+class TestBacklogCommands:
+    def test_list_shows_backlog_order(self, fake_ctx, sample, add_task_entity, capsys):
+        proj = _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="in the backlog")
+        proj["taskIds"].remove(t["id"])
+        proj["backlogTaskIds"].append(t["id"])
+        assert cli.cmd_backlog(_args(["backlog", "--project", "inbox"])) == 0
+        assert "in the backlog" in capsys.readouterr().out
+
+    def test_list_json(self, fake_ctx, sample, add_task_entity, capsys):
+        proj = _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="json me")
+        proj["taskIds"].remove(t["id"])
+        proj["backlogTaskIds"].append(t["id"])
+        assert cli.cmd_backlog(_args(["backlog", "--project", "inbox", "--json"])) == 0
+        assert json.loads(capsys.readouterr().out)[0]["id"] == t["id"]
+
+    def test_add_emits_prb(self, fake_ctx, sample, add_task_entity):
+        _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="later")
+        assert cli.cmd_backlog_add(_args(["backlog", "add", t["id"]])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "PRB"
+        assert op["p"]["actionPayload"]["workContextId"] == "INBOX_PROJECT"
+
+    def test_add_without_backlog_enabled_errors(self, fake_ctx, add_task_entity):
+        t = add_task_entity(task_id="K" * 21, title="later")
+        with pytest.raises(cli.mut.MutationError, match="--enable-backlog"):
+            cli.cmd_backlog_add(_args(["backlog", "add", t["id"]]))
+        assert fake_ctx.ops == []
+
+    def test_rm_emits_pbr(self, fake_ctx, sample, add_task_entity):
+        proj = _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="back")
+        proj["taskIds"].remove(t["id"])
+        proj["backlogTaskIds"].append(t["id"])
+        assert cli.cmd_backlog_rm(_args(["backlog", "rm", t["id"]])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "PBR"
+        assert op["p"]["actionPayload"]["src"] == "BACKLOG"
+        assert proj["backlogTaskIds"] == []
+
+    def test_clear_emits_pba(self, fake_ctx, sample, add_task_entity, capsys):
+        proj = _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="back")
+        proj["taskIds"].remove(t["id"])
+        proj["backlogTaskIds"].append(t["id"])
+        assert cli.cmd_backlog_clear(_args(["backlog", "clear", "--project", "inbox"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "PBA"
+        assert proj["backlogTaskIds"] == []
+        assert "1 task(s)" in capsys.readouterr().out
+
+    def test_clear_on_empty_backlog_errors(self, fake_ctx, sample):
+        _enable_project_backlog(sample)
+        with pytest.raises(cli.CliError, match="already empty"):
+            cli.cmd_backlog_clear(_args(["backlog", "clear", "--project", "inbox"]))
+        assert fake_ctx.ops == []
+
+
+class TestAddToBacklogCommand:
+    def test_add_backlog_flag(self, fake_ctx, sample, capsys):
+        proj = _enable_project_backlog(sample)
+        listed_before = list(proj["taskIds"])
+        assert cli.cmd_add(_args(["add", "later", "--project", "inbox", "--backlog"])) == 0
+        task_id = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "HA"
+        assert op["p"]["actionPayload"]["isAddToBacklog"] is True
+        assert proj["backlogTaskIds"] == [task_id]
+        assert proj["taskIds"] == listed_before
+
+    def test_add_backlog_with_due_is_rejected(self, fake_ctx, sample):
+        _enable_project_backlog(sample)
+        args = _args(["add", "later", "--backlog", "--due", "today"])
+        with pytest.raises(cli.CliError, match="--backlog is incompatible"):
+            cli.cmd_add(args)
+
+    def test_add_backlog_with_parent_is_rejected(self):
+        assert cli.main(["add", "sub", "--parent", "abc123", "--backlog"]) == 2
+
+
+class TestProjectBacklogToggle:
+    def test_enable_emits_pu_only(self, fake_ctx, sample):
+        assert cli.cmd_project_edit(
+            _args(["project", "edit", "inbox", "--enable-backlog"])
+        ) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["PU"]
+        assert sample["state"]["project"]["entities"]["INBOX_PROJECT"][
+            "isEnableBacklog"
+        ] is True
+
+    def test_disable_emits_pu_and_pba(self, fake_ctx, sample, add_task_entity):
+        proj = _enable_project_backlog(sample)
+        t = add_task_entity(task_id="K" * 21, title="stranded")
+        proj["taskIds"].remove(t["id"])
+        proj["backlogTaskIds"].append(t["id"])
+        assert cli.cmd_project_edit(
+            _args(["project", "edit", "inbox", "--disable-backlog"])
+        ) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["PU", "PBA"]
+        assert proj["isEnableBacklog"] is False
+        assert proj["backlogTaskIds"] == []
+        assert t["id"] in proj["taskIds"]
+
+    def test_enable_and_disable_conflict(self, fake_ctx):
+        args = _args(
+            ["project", "edit", "inbox", "--enable-backlog", "--disable-backlog"]
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_project_edit(args)
+
+    def test_title_and_toggle_together(self, fake_ctx, sample):
+        assert cli.cmd_project_edit(
+            _args(["project", "edit", "inbox", "--title", "In", "--enable-backlog"])
+        ) == 0
+        assert [op["a"] for op in fake_ctx.ops] == ["PU", "PU"]

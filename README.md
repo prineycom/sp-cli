@@ -62,7 +62,7 @@ pip install requests
 ./sp show <id> [--json]
 ./sp add "Title" [--project P] [--tag T ...] [--create-tags] \
          [--due today|tomorrow|+N|YYYY-MM-DD] [--at "YYYY-MM-DD HH:MM"] \
-         [--remind 10m] [--est 30m] [--notes "..."] [--parent ID]
+         [--remind 10m] [--est 30m] [--notes "..."] [--parent ID] [--backlog]
 ./sp edit <id> [--title T] [--notes N] [--append-notes N] [--est 1h] [--due DAY]  # --due "" очищает
 ./sp complete <id...>          # отметить сделанным
 ./sp reopen <id...>            # вернуть в работу
@@ -85,6 +85,21 @@ pip install requests
 ./sp agenda [--json]           # overdue / today / scheduled / deadlines (7d)
 ```
 
+### Бэклог проекта
+
+Бэклог — второй список задач проекта; включается флагом проекта. Задача всегда ровно в одном из списков.
+
+```sh
+./sp backlog --project P [--json]     # задачи в бэклоге, в порядке backlogTaskIds
+./sp backlog add <id...>              # из списка проекта в бэклог (наверх)
+./sp backlog rm <id...>               # обратно в список проекта
+./sp backlog clear --project P        # весь бэклог обратно в список
+./sp project edit <id> --enable-backlog | --disable-backlog
+./sp add "Title" --project P --backlog   # создать сразу в бэклоге
+```
+
+Бэклог должен быть включён (`--enable-backlog`), иначе `backlog add` и `add --backlog` завершатся ошибкой: приложение молча игнорирует такие операции. `--disable-backlog` сливает бэклог обратно в список проекта (как и в приложении). Сабтаск в бэклог не кладётся — переносите родителя.
+
 ### Календарь и расписание
 
 ```sh
@@ -102,7 +117,8 @@ pip install requests
 ```sh
 ./sp projects [--all] [--json]
 ./sp project add "Title" [--color '#a05db1']
-./sp project edit <id> [--title T] [--color C] [--hide]
+./sp project edit <id> [--title T] [--color C] [--hide] \
+                       [--enable-backlog|--disable-backlog]
 ./sp project archive <id>
 ./sp tags [--json]
 ./sp tag new "Title" [--color C]

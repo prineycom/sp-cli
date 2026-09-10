@@ -274,6 +274,167 @@ class TestReorder:
             mut.reorder_project(sample, b, "INBOX_PROJECT", ["nope"])
 
 
+def _enable_backlog(d, project_id="INBOX_PROJECT"):
+    project = d["state"]["project"]["entities"][project_id]
+    project["isEnableBacklog"] = True
+    project.setdefault("backlogTaskIds", [])
+    return project
+
+
+class TestBacklog:
+    def test_add_emits_prb_and_moves_the_task(self, sample, b, add_task_entity):
+        proj = _enable_backlog(sample)
+        task = add_task_entity(title="later")
+        mut.backlog_add(sample, b, task["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "PRB", "MOV", "TASK", task["id"],
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": task["id"],
+            "afterTaskId": None,
+            "workContextId": "INBOX_PROJECT",
+        }
+        assert task["id"] not in proj["taskIds"]
+        assert proj["backlogTaskIds"] == [task["id"]]
+        assert_doctor_clean(sample)
+
+    def test_add_prepends_null_anchor(self, sample, b, add_task_entity):
+        proj = _enable_backlog(sample)
+        first = add_task_entity(title="first")
+        second = add_task_entity(title="second")
+        mut.backlog_add(sample, b, first["id"])
+        mut.backlog_add(sample, b, second["id"])
+        assert proj["backlogTaskIds"] == [second["id"], first["id"]]
+        assert_doctor_clean(sample)
+
+    def test_add_after_anchor(self, sample, b, add_task_entity):
+        proj = _enable_backlog(sample)
+        first = add_task_entity(title="first")
+        second = add_task_entity(title="second")
+        mut.backlog_add(sample, b, first["id"])
+        mut.backlog_add(sample, b, second["id"], after_task_id=first["id"])
+        assert proj["backlogTaskIds"] == [first["id"], second["id"]]
+        assert _last_op(b)["p"]["actionPayload"]["afterTaskId"] == first["id"]
+
+    def test_add_requires_is_enable_backlog(self, sample, b, add_task_entity):
+        task = add_task_entity(title="nope")
+        with pytest.raises(mut.MutationError, match="--enable-backlog"):
+            mut.backlog_add(sample, b, task["id"])
+        assert b.ops == []
+
+    def test_add_rejects_subtask(self, sample, b, add_task_entity):
+        _enable_backlog(sample)
+        parent = add_task_entity(title="parent")
+        sub = add_task_entity(title="sub", parent_id=parent["id"])
+        parent["subTaskIds"].append(sub["id"])
+        with pytest.raises(mut.MutationError, match="subtask"):
+            mut.backlog_add(sample, b, sub["id"])
+        assert b.ops == []
+
+    def test_remove_emits_pbr_and_moves_back(self, sample, b, add_task_entity):
+        proj = _enable_backlog(sample)
+        task = add_task_entity(title="back")
+        mut.backlog_add(sample, b, task["id"])
+        mut.backlog_remove(sample, b, task["id"])
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "PBR", "MOV", "TASK", task["id"],
+        )
+        assert op["p"]["actionPayload"] == {
+            "taskId": task["id"],
+            "afterTaskId": None,
+            "workContextId": "INBOX_PROJECT",
+            "src": "BACKLOG",
+            "target": "UNDONE",
+        }
+        assert proj["backlogTaskIds"] == []
+        assert proj["taskIds"][0] == task["id"]  # null anchor prepends
+        assert_doctor_clean(sample)
+
+    def test_remove_rejects_task_not_in_backlog(self, sample, b, add_task_entity):
+        _enable_backlog(sample)
+        task = add_task_entity(title="listed")
+        with pytest.raises(mut.MutationError, match="not in the backlog"):
+            mut.backlog_remove(sample, b, task["id"])
+        assert b.ops == []
+
+    def test_clear_emits_pba_and_merges(self, sample, b, add_task_entity):
+        proj = _enable_backlog(sample)
+        t1 = add_task_entity(title="b1")
+        t2 = add_task_entity(title="b2")
+        mut.backlog_add(sample, b, t1["id"])
+        mut.backlog_add(sample, b, t2["id"])
+        listed_before = list(proj["taskIds"])
+
+        moved = mut.backlog_clear(sample, b, "INBOX_PROJECT")
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "PBA", "UPD", "PROJECT", "INBOX_PROJECT",
+        )
+        assert op["p"]["actionPayload"] == {"projectId": "INBOX_PROJECT"}
+        assert moved == [t2["id"], t1["id"]]
+        assert proj["backlogTaskIds"] == []
+        assert proj["taskIds"] == listed_before + [t2["id"], t1["id"]]
+        assert_doctor_clean(sample)
+
+    def test_clear_on_empty_backlog_is_a_no_op_op(self, sample, b):
+        _enable_backlog(sample)
+        assert mut.backlog_clear(sample, b, "INBOX_PROJECT") == []
+        assert _last_op(b)["a"] == "PBA"
+
+    def test_enable_backlog_emits_only_pu(self, sample, b):
+        mut.project_set_backlog(sample, b, "INBOX_PROJECT", True)
+        assert [op["a"] for op in b.ops] == ["PU"]
+        assert _last_op(b)["p"]["actionPayload"]["project"]["changes"] == {
+            "isEnableBacklog": True
+        }
+        assert sample["state"]["project"]["entities"]["INBOX_PROJECT"][
+            "isEnableBacklog"
+        ] is True
+
+    def test_disable_backlog_emits_pu_then_pba_and_merges(
+        self, sample, b, add_task_entity
+    ):
+        proj = _enable_backlog(sample)
+        task = add_task_entity(title="stranded")
+        mut.backlog_add(sample, b, task["id"])
+        b.ops.clear()
+
+        mut.project_set_backlog(sample, b, "INBOX_PROJECT", False)
+        assert [op["a"] for op in b.ops] == ["PU", "PBA"]
+        assert b.ops[0]["p"]["actionPayload"]["project"]["changes"] == {
+            "isEnableBacklog": False
+        }
+        assert b.ops[1]["p"]["actionPayload"] == {"projectId": "INBOX_PROJECT"}
+        assert proj["isEnableBacklog"] is False
+        assert proj["backlogTaskIds"] == []
+        assert task["id"] in proj["taskIds"]
+        assert_doctor_clean(sample)
+
+
+class TestAddTaskToBacklog:
+    def test_add_to_backlog_payload_and_state(self, sample, b):
+        proj = _enable_backlog(sample)
+        task = make_task("B" * 21, "later", "INBOX_PROJECT")
+        listed_before = list(proj["taskIds"])
+
+        mut.add_task(sample, b, task, to_backlog=True)
+        op = _last_op(b)
+        assert op["a"] == "HA"
+        assert op["p"]["actionPayload"]["isAddToBacklog"] is True
+        assert proj["backlogTaskIds"] == ["B" * 21]
+        assert proj["taskIds"] == listed_before
+        assert_doctor_clean(sample)
+
+    def test_add_to_backlog_requires_is_enable_backlog(self, sample, b):
+        task = make_task("B" * 21, "later", "INBOX_PROJECT")
+        with pytest.raises(mut.MutationError, match="--enable-backlog"):
+            mut.add_task(sample, b, task, to_backlog=True)
+        assert b.ops == []
+        assert "B" * 21 not in sample["state"]["task"]["ids"]
+
+
 class TestPlanning:
     def test_plan_today(self, sample, b, add_task_entity):
         t1 = add_task_entity(title="p1", due_with_time=1800000000000)

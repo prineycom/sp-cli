@@ -186,6 +186,7 @@ def cmd_add(args) -> int:
                 ("--at", args.at),
                 ("--remind", args.remind),
                 ("--tag", args.tag),
+                ("--backlog", args.backlog),
             )
             if value
         ]
@@ -228,6 +229,11 @@ def cmd_add(args) -> int:
         at_ts = _parse_dt(args.at) if args.at else None
         if due_day and at_ts:
             raise CliError("--due and --at are mutually exclusive")
+        if args.backlog and (due_day or at_ts):
+            raise CliError(
+                "--backlog is incompatible with --due / --at: a backlog task "
+                "is explicitly not scheduled"
+            )
 
         def _add(dd, b):
             task = make_task(
@@ -239,7 +245,7 @@ def cmd_add(args) -> int:
                 notes=args.notes,
                 due_day=due_day,
             )
-            mut.add_task(dd, b, task)
+            mut.add_task(dd, b, task, to_backlog=bool(args.backlog))
             if at_ts is not None:
                 offset = render.parse_offset(args.remind) if args.remind else 0
                 mut.schedule_task(dd, b, task_id, at_ts, remind_at=at_ts - offset)
@@ -394,6 +400,54 @@ def cmd_reorder(args) -> int:
 
     store.commit([_reorder], initial=d)
     print(f"reordered {pid}")
+    return 0
+
+
+def cmd_backlog(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    pid = q.resolve_project(d, args.project)
+    tasks = q.backlog_list(d, pid)
+    if args.json:
+        render.print_json(tasks)
+    else:
+        render.print_tasks(d, tasks)
+    return 0
+
+
+def cmd_backlog_add(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tids = _resolve_tasks(d, args.ids)
+    muts = [(lambda dd, b, _t=tid: mut.backlog_add(dd, b, _t)) for tid in tids]
+    store.commit(muts, initial=d)
+    print(f"moved to backlog: {', '.join(render.short_id(t) for t in tids)}")
+    return 0
+
+
+def cmd_backlog_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tids = _resolve_tasks(d, args.ids)
+    muts = [(lambda dd, b, _t=tid: mut.backlog_remove(dd, b, _t)) for tid in tids]
+    store.commit(muts, initial=d)
+    print(f"moved out of backlog: {', '.join(render.short_id(t) for t in tids)}")
+    return 0
+
+
+def cmd_backlog_clear(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    pid = q.resolve_project(d, args.project)
+    if not d["state"]["project"]["entities"][pid].get("backlogTaskIds"):
+        raise CliError(f"project {pid}: the backlog is already empty")
+    moved: list[str] = []
+
+    def _clear(dd, b):
+        moved[:] = mut.backlog_clear(dd, b, pid)
+
+    store.commit([_clear], initial=d)
+    print(f"backlog cleared: {len(moved)} task(s) back in {pid}")
     return 0
 
 
@@ -795,6 +849,11 @@ def cmd_project_edit(args) -> int:
     client, store = _ctx()
     d = client.get()
     pid = q.resolve_project(d, args.id)
+    if args.enable_backlog and args.disable_backlog:
+        raise CliError(
+            "--enable-backlog and --disable-backlog are mutually exclusive"
+        )
+    backlog = True if args.enable_backlog else (False if args.disable_backlog else None)
 
     def _edit(dd, b):
         project = dd["state"]["project"]["entities"][pid]
@@ -805,9 +864,12 @@ def cmd_project_edit(args) -> int:
             changes["theme"] = {**project["theme"], "primary": args.color}
         if args.hide:
             changes["isHiddenFromMenu"] = True
-        if not changes:
+        if changes:
+            mut.project_update(dd, b, pid, changes)
+        if backlog is not None:
+            mut.project_set_backlog(dd, b, pid, backlog)
+        elif not changes:
             raise CliError("project edit: nothing to change")
-        mut.project_update(dd, b, pid, changes)
 
     store.commit([_edit], initial=d)
     print(f"updated {pid}")
@@ -1738,6 +1800,9 @@ _SUBCOMMAND_REWRITES = {
     ("project", "archive"): "project-archive",
     ("tag", "new"): "tag-new",
     ("tag", "edit"): "tag-edit",
+    ("backlog", "add"): "backlog-add",
+    ("backlog", "rm"): "backlog-rm",
+    ("backlog", "clear"): "backlog-clear",
     ("note", "add"): "note-add",
     ("note", "show"): "note-show",
     ("note", "edit"): "note-edit",
@@ -1892,6 +1957,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--est", help="e.g. 30m, 1.5h")
     s.add_argument("--notes")
     s.add_argument("--parent", help="create as subtask of this task")
+    s.add_argument(
+        "--backlog",
+        action="store_true",
+        help="create in the project's backlog (needs --enable-backlog)",
+    )
 
     s = add("edit", cmd_edit, "edit a task")
     s.add_argument("id")
@@ -1928,6 +1998,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("reorder", cmd_reorder, "reorder tasks in a project")
     s.add_argument("--project", required=True)
     s.add_argument("ids", nargs="+")
+
+    s = add("backlog", cmd_backlog, "list a project's backlog")
+    s.add_argument("--project", required=True)
+    s.add_argument("--json", action="store_true")
+    s = add("backlog-add", cmd_backlog_add, "move tasks into their backlog")
+    s.add_argument("ids", nargs="+")
+    s = add("backlog-rm", cmd_backlog_rm, "move tasks out of the backlog")
+    s.add_argument("ids", nargs="+")
+    s = add("backlog-clear", cmd_backlog_clear, "move the whole backlog back")
+    s.add_argument("--project", required=True)
 
     s = add("today", cmd_today, "list today's tasks")
     s.add_argument("--json", action="store_true")
@@ -2006,6 +2086,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--title")
     s.add_argument("--color")
     s.add_argument("--hide", action="store_true")
+    s.add_argument("--enable-backlog", action="store_true")
+    s.add_argument(
+        "--disable-backlog",
+        action="store_true",
+        help="turn the backlog off; its tasks move back into the project list",
+    )
     s = add("project-archive", cmd_project_archive, "archive a project")
     s.add_argument("id")
 
