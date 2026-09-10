@@ -167,6 +167,54 @@ def note_card(d: dict, note: dict) -> str:
     return "\n".join(lines)
 
 
+_COUNTER_TYPE_LABEL = {
+    "ClickCounter": "click",
+    "StopWatch": "stopwatch",
+    "RepeatedCountdownReminder": "countdown",
+}
+
+_WEEK_DAY_LABEL = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+
+def counter_value_str(counter: dict, value: int) -> str:
+    """StopWatch counts milliseconds; everything else counts clicks."""
+    if counter.get("type") == "StopWatch":
+        return format_duration(value) if value else "0"
+    return str(value)
+
+
+def counter_streak_str(counter: dict) -> str:
+    if not counter.get("isTrackStreaks"):
+        return "-"
+    week = counter.get("streakWeekDays") or {}
+    days = ",".join(
+        _WEEK_DAY_LABEL[i] for i in range(7) if week.get(str(i)) or week.get(i)
+    )
+    minimum = counter_value_str(counter, int(counter.get("streakMinValue") or 0))
+    return f">={minimum} on {days or '-'}"
+
+
+def counter_rows(counters: list[dict], values: list[int]) -> list[list[str]]:
+    return [
+        [
+            c["id"],
+            truncate(c.get("title", ""), TITLE_WIDTH),
+            _COUNTER_TYPE_LABEL.get(c.get("type"), c.get("type") or "?"),
+            "on" if c.get("isEnabled") else "off",
+            counter_value_str(c, value),
+            counter_streak_str(c),
+        ]
+        for c, value in zip(counters, values)
+    ]
+
+
+def print_counters(counters: list[dict], values: list[int]) -> None:
+    print_table(
+        ["id", "title", "type", "enabled", "today", "streak"],
+        counter_rows(counters, values),
+    )
+
+
 _DONE_STATE = {1: "", 2: "done", 3: "undone"}
 _SCHEDULED_STATE = {1: "", 2: "scheduled", 3: "not-scheduled"}
 _BACKLOG_STATE = {1: "", 2: "no-backlog", 3: "only-backlog"}

@@ -910,6 +910,168 @@ def boards_sort(d: dict, b: OpBuilder, board_ids: list[str]) -> None:
     ]
 
 
+# ---------------------------------------------------------------- counters
+
+def _counter_reg(state: dict) -> dict:
+    reg = state.setdefault("simpleCounter", {"ids": [], "entities": {}})
+    reg.setdefault("ids", [])
+    reg.setdefault("entities", {})
+    return reg
+
+
+def _counter(state: dict, counter_id: str) -> dict:
+    try:
+        return state["simpleCounter"]["entities"][counter_id]
+    except KeyError:
+        raise MutationError(f"counter not found: {counter_id}") from None
+
+
+def counter_add(d: dict, b: OpBuilder, counter: dict) -> str:
+    """Create a simple counter (already built via model.make_simple_counter)."""
+    state = _state(d)
+    reg = _counter_reg(state)
+    counter = dict(counter)
+    counter["isOn"] = False  # device-local, never synced as True
+    if counter["id"] in reg["entities"]:
+        raise MutationError(f"entity already exists: {counter['id']}")
+
+    b.op(
+        "SA",
+        "CRT",
+        "SIMPLE_COUNTER",
+        counter["id"],
+        {"simpleCounter": copy.deepcopy(counter)},
+    )
+
+    _reg_add(reg, counter)
+    return counter["id"]
+
+
+def counter_update(d: dict, b: OpBuilder, counter_id: str, changes: dict) -> None:
+    state = _state(d)
+    _counter_reg(state)
+    counter = _counter(state, counter_id)
+    changes = dict(changes)
+    if "isOn" in changes:
+        raise MutationError("isOn is device-local and must not be synced")
+    if "countOnDay" in changes:
+        raise MutationError("use counter_set / counter_log_time to change countOnDay")
+    if not changes:
+        return
+
+    b.op(
+        "SU",
+        "UPD",
+        "SIMPLE_COUNTER",
+        counter_id,
+        {"simpleCounter": {"id": counter_id, "changes": copy.deepcopy(changes)}},
+    )
+
+    counter.update(changes)
+
+
+def counter_delete(d: dict, b: OpBuilder, counter_id: str) -> None:
+    state = _state(d)
+    reg = _counter_reg(state)
+    _counter(state, counter_id)
+    b.op("SD", "DEL", "SIMPLE_COUNTER", counter_id, {"id": counter_id})
+    _reg_remove(reg, counter_id)
+
+
+def counter_set(
+    d: dict, b: OpBuilder, counter_id: str, value: int, date: str | None = None
+) -> int:
+    """Absolute value for a day: ST for today, SFD otherwise. Clamped to >= 0."""
+    state = _state(d)
+    _counter_reg(state)
+    counter = _counter(state, counter_id)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise MutationError("counter set: value must be an integer")
+    new_val = max(0, value)
+    date = date or today_str()
+
+    if date == today_str():
+        b.op(
+            "ST",
+            "UPD",
+            "SIMPLE_COUNTER",
+            counter_id,
+            {"id": counter_id, "newVal": new_val, "today": date},
+        )
+    else:
+        b.op(
+            "SFD",
+            "UPD",
+            "SIMPLE_COUNTER",
+            counter_id,
+            {"id": counter_id, "date": date, "newVal": new_val},
+        )
+
+    counter.setdefault("countOnDay", {})[date] = new_val
+    return new_val
+
+
+def counter_inc(
+    d: dict, b: OpBuilder, counter_id: str, by: int = 1, date: str | None = None
+) -> int:
+    """Increment by reading the current value and emitting an ABSOLUTE ST/SFD
+    (SI/SX are not persistent and must never be emitted)."""
+    state = _state(d)
+    _counter_reg(state)
+    counter = _counter(state, counter_id)
+    date = date or today_str()
+    current = int((counter.get("countOnDay") or {}).get(date, 0))
+    return counter_set(d, b, counter_id, current + int(by), date)
+
+
+def counter_log_time(
+    d: dict, b: OpBuilder, counter_id: str, date: str, duration: int
+) -> int:
+    """SC: an ADDITIVE delta (ms) for StopWatch counters. SP's reducer is
+    isRemote-gated, so the CLI applies the += to its own state copy itself."""
+    state = _state(d)
+    _counter_reg(state)
+    counter = _counter(state, counter_id)
+    if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
+        raise MutationError("counter log: duration must be a non-negative integer (ms)")
+
+    b.op(
+        "SC",
+        "UPD",
+        "SIMPLE_COUNTER",
+        counter_id,
+        {"id": counter_id, "date": date, "duration": duration},
+    )
+
+    per_day = counter.setdefault("countOnDay", {})
+    per_day[date] = int(per_day.get(date, 0)) + duration
+    return per_day[date]
+
+
+def counter_order(d: dict, b: OpBuilder, counter_ids: list[str]) -> None:
+    """SM: the payload replaces the whole ids array, so it must list every
+    counter exactly once."""
+    state = _state(d)
+    reg = _counter_reg(state)
+    if len(set(counter_ids)) != len(counter_ids):
+        raise MutationError("counter order: duplicate ids")
+    if sorted(counter_ids) != sorted(reg["ids"]):
+        raise MutationError(
+            "counter order: id list must be a permutation of all counter ids"
+        )
+
+    b.op(
+        "SM",
+        "MOV",
+        "SIMPLE_COUNTER",
+        counter_ids[0],
+        {"ids": list(counter_ids)},
+        ds=list(counter_ids),
+    )
+
+    reg["ids"] = list(counter_ids)
+
+
 # ---------------------------------------------------------------- archive
 
 def archive_done(d: dict, b: OpBuilder) -> list[str]:

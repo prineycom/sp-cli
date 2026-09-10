@@ -407,3 +407,45 @@ class TestBoardsQueries:
         panel = sample["state"]["boards"]["boardCfgs"][0]["panels"][0]
         panel["includedTagIds"] = ["TODAY"]
         assert any("'TODAY' in includedTagIds" in p for p in q.doctor(sample))
+
+
+class TestCounters:
+    def test_all_counters_in_state_order(self, sample):
+        assert [c["id"] for c in q.all_counters(sample)] == [
+            "STANDING_DESK_ID",
+            "COFFEE_COUNTER",
+            "STRETCHING_COUNTER",
+        ]
+
+    def test_resolve_by_id_title_and_prefix(self, sample):
+        assert q.resolve_counter(sample, "COFFEE_COUNTER") == "COFFEE_COUNTER"
+        assert q.resolve_counter(sample, "coffee counter") == "COFFEE_COUNTER"
+        assert q.resolve_counter(sample, "STAND") == "STANDING_DESK_ID"
+
+    def test_resolve_unknown_raises(self, sample):
+        with pytest.raises(q.NotFoundError):
+            q.resolve_counter(sample, "zzz")
+
+    def test_resolve_ambiguous_prefix_raises(self, sample):
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_counter(sample, "ST")
+
+    def test_counter_value_defaults_to_zero(self, sample):
+        counter = sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]
+        assert q.counter_value(counter) == 0
+        counter["countOnDay"][today_str()] = 4
+        assert q.counter_value(counter) == 4
+        assert q.counter_value(counter, "1999-01-01") == 0
+
+    def test_doctor_detects_is_on(self, sample):
+        sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]["isOn"] = True
+        assert any("isOn is true" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_negative_count(self, sample):
+        counter = sample["state"]["simpleCounter"]["entities"]["COFFEE_COUNTER"]
+        counter["countOnDay"]["2024-01-01"] = -3
+        assert any("countOnDay" in p for p in q.doctor(sample))
+
+    def test_doctor_detects_registry_desync(self, sample):
+        sample["state"]["simpleCounter"]["ids"].remove("COFFEE_COUNTER")
+        assert any("COFFEE_COUNTER" in p for p in q.doctor(sample))

@@ -17,15 +17,19 @@ from sp_cli.model import (
     INBOX_PROJECT_ID,
     PANEL_SORT_BY,
     SCHEDULED_STATE,
+    SIMPLE_COUNTER_TYPES,
+    STREAK_DAY_KEYS,
     TASK_DONE_STATE,
     TODAY_TAG_ID,
     make_board,
     make_note,
     make_panel,
     make_project,
+    make_simple_counter,
     make_tag,
     make_task,
     now_ms,
+    streak_week_days,
     today_str,
 )
 from sp_cli.store import SyncStore
@@ -1050,6 +1054,200 @@ def cmd_board_panel_order(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- counters
+
+def _counter_amount(counter: dict, text: str, what: str = "value") -> int:
+    """StopWatch counters count milliseconds (durations), the rest clicks."""
+    if counter.get("type") == "StopWatch":
+        return render.parse_duration(text)
+    try:
+        return int(text)
+    except ValueError:
+        raise CliError(
+            f"counter {what} must be a whole number for this counter type "
+            f"(got {text!r})"
+        ) from None
+
+
+def _streak_days(text: str) -> list[str]:
+    keys = []
+    for part in text.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part not in STREAK_DAY_KEYS:
+            raise CliError(f"invalid weekday '{part}' (use mon,tue,...)")
+        keys.append(STREAK_DAY_KEYS[part])
+    return keys
+
+
+def cmd_counters(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    counters = q.all_counters(d)
+    if args.json:
+        render.print_json(counters)
+        return 0
+    values = [q.counter_value(c) for c in counters]
+    render.print_counters(counters, values)
+    return 0
+
+
+def cmd_counter_add(args) -> int:
+    counter_type = SIMPLE_COUNTER_TYPES[args.type]
+    if args.countdown and counter_type != "RepeatedCountdownReminder":
+        raise CliError("--countdown only applies to --type countdown")
+    countdown = render.parse_duration(args.countdown) if args.countdown else None
+    days = _streak_days(args.streak_days) if args.streak_days else None
+    if args.streak_min is not None:
+        streak_min = (
+            render.parse_duration(args.streak_min)
+            if counter_type == "StopWatch"
+            else int(args.streak_min)
+        )
+    else:
+        streak_min = 1
+    client, store = _ctx()
+    d = client.get()
+    counter_id = nanoid()
+
+    def _add(dd, b):
+        counter = make_simple_counter(
+            counter_id,
+            args.title,
+            counter_type=counter_type,
+            icon=args.icon,
+            is_track_streaks=not args.no_streak,
+            streak_min_value=streak_min,
+            week_days=days,
+            countdown_duration=countdown,
+        )
+        mut.counter_add(dd, b, counter)
+
+    store.commit([_add], initial=d)
+    print(counter_id)
+    return 0
+
+
+def cmd_counter_edit(args) -> int:
+    if args.enable and args.disable:
+        raise CliError("counter edit: --enable and --disable are mutually exclusive")
+    if args.streak and args.no_streak:
+        raise CliError("counter edit: --streak and --no-streak are mutually exclusive")
+    client, store = _ctx()
+    d = client.get()
+    cid = q.resolve_counter(d, args.id)
+    counter = d["state"]["simpleCounter"]["entities"][cid]
+
+    changes: dict = {}
+    if args.title is not None:
+        changes["title"] = args.title
+    if args.icon is not None:
+        changes["icon"] = args.icon or None
+    if args.enable:
+        changes["isEnabled"] = True
+    if args.disable:
+        changes["isEnabled"] = False
+    if args.streak:
+        changes["isTrackStreaks"] = True
+    if args.no_streak:
+        changes["isTrackStreaks"] = False
+    if args.streak_min is not None:
+        changes["streakMinValue"] = _counter_amount(
+            counter, args.streak_min, "--streak-min"
+        )
+    if args.streak_days is not None:
+        changes["streakWeekDays"] = streak_week_days(_streak_days(args.streak_days))
+    if args.countdown is not None:
+        if counter.get("type") != "RepeatedCountdownReminder":
+            raise CliError("--countdown only applies to countdown counters")
+        changes["countdownDuration"] = render.parse_duration(args.countdown)
+    if not changes:
+        raise CliError("counter edit: nothing to change")
+
+    store.commit([lambda dd, b: mut.counter_update(dd, b, cid, changes)], initial=d)
+    print(f"updated {cid}")
+    return 0
+
+
+def cmd_counter_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cid = q.resolve_counter(d, args.id)
+    title = d["state"]["simpleCounter"]["entities"][cid].get("title", "")
+    if not _confirm(f"delete counter '{title}'?", args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    store.commit([lambda dd, b: mut.counter_delete(dd, b, cid)], initial=d)
+    print(f"deleted {cid}")
+    return 0
+
+
+def cmd_counter_set(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cid = q.resolve_counter(d, args.id)
+    counter = d["state"]["simpleCounter"]["entities"][cid]
+    value = _counter_amount(counter, args.value)
+    date = _parse_day(args.date) if args.date else today_str()
+    store.commit([lambda dd, b: mut.counter_set(dd, b, cid, value, date)], initial=d)
+    print(f"{cid} {date}: {render.counter_value_str(counter, max(0, value))}")
+    return 0
+
+
+def cmd_counter_inc(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cid = q.resolve_counter(d, args.id)
+    counter = d["state"]["simpleCounter"]["entities"][cid]
+    by = _counter_amount(counter, args.by, "--by") if args.by else 1
+    date = _parse_day(args.date) if args.date else today_str()
+    result: list[int] = []
+
+    def _inc(dd, b):
+        result.append(mut.counter_inc(dd, b, cid, by, date))
+
+    store.commit([_inc], initial=d)
+    print(f"{cid} {date}: {render.counter_value_str(counter, result[0])}")
+    return 0
+
+
+def cmd_counter_log(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    cid = q.resolve_counter(d, args.id)
+    counter = d["state"]["simpleCounter"]["entities"][cid]
+    if counter.get("type") != "StopWatch":
+        raise CliError(
+            f"counter log: '{counter.get('title')}' is not a stopwatch counter; "
+            "use 'sp counter inc' / 'sp counter set'"
+        )
+    ms = render.parse_duration(args.duration)
+    date = _parse_day(args.date) if args.date else today_str()
+    total: list[int] = []
+
+    def _log(dd, b):
+        total.append(mut.counter_log_time(dd, b, cid, date, ms))
+
+    store.commit([_log], initial=d)
+    print(
+        f"logged {render.format_duration(ms)} on {cid} ({date}), "
+        f"total {render.format_duration(total[0])}"
+    )
+    return 0
+
+
+def cmd_counter_order(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    listed = [q.resolve_counter(d, ref) for ref in args.ids]
+    current = [c["id"] for c in q.all_counters(d)]
+    ordered = listed + [cid for cid in current if cid not in listed]
+    store.commit([lambda dd, b: mut.counter_order(dd, b, ordered)], initial=d)
+    print(f"reordered counters: {', '.join(ordered)}")
+    return 0
+
+
 def cmd_archive(args) -> int:
     client, store = _ctx()
     d = client.get()
@@ -1092,6 +1290,7 @@ def cmd_pull(args) -> int:
     print(f"tags:         {len(state['tag']['ids'])}")
     print(f"notes:        {len(q.all_notes(d))}")
     print(f"boards:       {len(q.all_boards(d))}")
+    print(f"counters:     {len(q.all_counters(d))}")
     return 0
 
 
@@ -1135,6 +1334,13 @@ _SUBCOMMAND_REWRITES = {
     ("board", "edit"): "board-edit",
     ("board", "rm"): "board-rm",
     ("board", "sort"): "board-sort",
+    ("counter", "add"): "counter-add",
+    ("counter", "edit"): "counter-edit",
+    ("counter", "rm"): "counter-rm",
+    ("counter", "set"): "counter-set",
+    ("counter", "inc"): "counter-inc",
+    ("counter", "log"): "counter-log",
+    ("counter", "order"): "counter-order",
 }
 
 _SUBCOMMAND_REWRITES_3 = {
@@ -1153,6 +1359,9 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
     # bare `sp note [--flags]` == `sp notes`
     if argv[:1] == ["note"] and (len(argv) == 1 or argv[1].startswith("-")):
         return ["notes"] + argv[1:]
+    # bare `sp counter [--flags]` == `sp counters`
+    if argv[:1] == ["counter"] and (len(argv) == 1 or argv[1].startswith("-")):
+        return ["counters"] + argv[1:]
     return argv
 
 
@@ -1374,6 +1583,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("id")
     s.add_argument("ids", nargs="+", help="task ids in the desired order")
+
+    s = add("counters", cmd_counters, "list simple counters / habits")
+    s.add_argument("--json", action="store_true")
+    s = add("counter-add", cmd_counter_add, "create a simple counter")
+    s.add_argument("title")
+    s.add_argument(
+        "--type", choices=["click", "stopwatch", "countdown"], default="click"
+    )
+    s.add_argument("--icon", help="material icon name")
+    s.add_argument("--countdown", help="countdown duration, e.g. 30m")
+    s.add_argument("--no-streak", action="store_true", help="do not track streaks")
+    s.add_argument("--streak-min", help="streak minimum (number, or duration)")
+    s.add_argument("--streak-days", help="mon,tue,... (default mon-fri)")
+    s = add("counter-edit", cmd_counter_edit, "edit a simple counter")
+    s.add_argument("id")
+    s.add_argument("--title")
+    s.add_argument("--icon")
+    s.add_argument("--enable", action="store_true")
+    s.add_argument("--disable", action="store_true")
+    s.add_argument("--streak", action="store_true")
+    s.add_argument("--no-streak", action="store_true")
+    s.add_argument("--streak-min")
+    s.add_argument("--streak-days", help="mon,tue,...")
+    s.add_argument("--countdown", help="countdown duration, e.g. 30m")
+    s = add("counter-rm", cmd_counter_rm, "delete a simple counter")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+    s = add("counter-set", cmd_counter_set, "set a counter's value for a day")
+    s.add_argument("id")
+    s.add_argument("value", help="clicks, or a duration for stopwatch counters")
+    s.add_argument("--date", help="YYYY-MM-DD (default today)")
+    s = add("counter-inc", cmd_counter_inc, "increment a counter")
+    s.add_argument("id")
+    s.add_argument("--by", help="amount (default 1; duration for stopwatch)")
+    s.add_argument("--date", help="YYYY-MM-DD (default today)")
+    s = add("counter-log", cmd_counter_log, "add time to a stopwatch counter")
+    s.add_argument("id")
+    s.add_argument("duration", help="e.g. 30m, 1.5h")
+    s.add_argument("--date", help="YYYY-MM-DD (default today)")
+    s = add("counter-order", cmd_counter_order, "reorder counters (listed first)")
+    s.add_argument("ids", nargs="+")
 
     s = add("archive", cmd_archive, "archive done tasks")
     s.add_argument("--yes", action="store_true")

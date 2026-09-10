@@ -152,6 +152,27 @@ pip install requests
 нельзя. Панели редактируются перезаписью всего массива панелей доски
 (SP не имеет рабочей операции правки одной панели).
 
+### Счётчики / привычки (simple counters)
+
+```sh
+./sp counters [--json]                        # id, тип, вкл/выкл, значение за сегодня, стрик
+                                              # `./sp counter` без подкоманды = ./sp counters
+./sp counter add "Title" [--type click|stopwatch|countdown] [--icon name] \
+    [--countdown 30m] [--no-streak] [--streak-min N] [--streak-days mon,tue,...]
+./sp counter edit <id> [--title T] [--icon name] [--enable|--disable] \
+    [--streak|--no-streak] [--streak-min N] [--streak-days mon,...] [--countdown 30m]
+./sp counter rm <id> [--yes]                  # с подтверждением
+./sp counter set <id> <value> [--date DAY]    # абсолютное значение за день
+./sp counter inc <id> [--by N] [--date DAY]   # +1 по умолчанию
+./sp counter log <id> 30m [--date DAY]        # добавить время в stopwatch-счётчик
+./sp counter order <id>...                    # перечисленные — первыми
+```
+
+У `stopwatch`-счётчиков значение — длительность (`45m`, `1.5h`), у остальных — число
+кликов; то же правило действует для `--streak-min` и `--by`. `set`/`inc` всегда шлют
+абсолютное значение (клампится до ≥0), `log` — дельту. Флаг «счётчик сейчас запущен»
+(`isOn`) device-local: CLI всегда пишет `false` и не умеет запускать/останавливать таймер.
+
 ### Время / worklog
 
 ```sh
@@ -177,7 +198,7 @@ pip install requests
 ## Тестирование
 
 ```sh
-python3 -m pytest tests/ -q    # 216 unit-тестов, без сети
+python3 -m pytest tests/ -q    # 305 unit-тестов, без сети
 ```
 
 Плюс интеграционный свип против тестового WebDAV-сервера (копия live-файла) и проверка, что настоящий SP подхватывает изменения синком.
@@ -189,11 +210,12 @@ python3 -m pytest tests/ -q    # 216 unit-тестов, без сети
 - [x] Sync-слой (vectorClock, recentOps, optimistic locking + retry)
 - [x] Заметки: CRUD, закрепление на сегодня, привязка к проекту
 - [x] Доски: CRUD досок и панелей, фильтры панелей, порядок задач и досок
+- [x] Счётчики/привычки: CRUD, set/inc, лог времени stopwatch, порядок
 - [ ] YouTrack-мост (опционально)
 
 ## Известные ограничения
 
-- Нет live-таймера (`start`/`stop`) — только пост-фактум `track`.
+- Нет live-таймера (`start`/`stop`) — только пост-фактум `track`; у счётчиков по той же причине нет старта/остановки (`isOn` не синхронизируется).
 - У заметок нет переупорядочивания (`NO`) и вложений.
 - У досок нет отдельной операции правки панели (`BP` — мёртвый редьюсер в SP): любая правка панели переписывает весь массив панелей доски.
 - Конфликт с одновременной записью телефона решается retry (re-read + re-apply); при исчерпании попыток команда завершается ошибкой, данные не теряются.

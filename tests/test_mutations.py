@@ -9,6 +9,7 @@ from sp_cli.model import (
     make_note,
     make_panel,
     make_project,
+    make_simple_counter,
     make_tag,
     make_task,
     today_str,
@@ -1077,3 +1078,250 @@ class TestBoards:
         assert "BP" not in actions
         assert set(actions) <= {"BA", "BU", "BD", "BT", "BS"}
         assert all(op["e"] == "BOARD" for op in b.ops)
+
+
+class TestSimpleCounters:
+    @staticmethod
+    def _reg(d):
+        return d["state"]["simpleCounter"]
+
+    @staticmethod
+    def _counter(d, cid):
+        return d["state"]["simpleCounter"]["entities"][cid]
+
+    def test_add_full_default_object(self, sample, b):
+        counter = make_simple_counter("C" * 21, "Pushups")
+        mut.counter_add(sample, b, counter)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "SA",
+            "CRT",
+            "SIMPLE_COUNTER",
+            "C" * 21,
+        )
+        assert op["p"]["actionPayload"] == {
+            "simpleCounter": {
+                "id": "C" * 21,
+                "title": "Pushups",
+                "isEnabled": True,
+                "icon": None,
+                "type": "ClickCounter",
+                "countOnDay": {},
+                "isOn": False,
+                "isTrackStreaks": True,
+                "streakMinValue": 1,
+                "streakMode": "specific-days",
+                "streakWeekDays": {
+                    "0": False,
+                    "1": True,
+                    "2": True,
+                    "3": True,
+                    "4": True,
+                    "5": True,
+                    "6": False,
+                },
+            }
+        }
+        assert op["p"]["entityChanges"] == []
+        assert self._reg(sample)["ids"][-1] == "C" * 21
+        assert_doctor_clean(sample)
+
+    def test_add_forces_is_on_false(self, sample, b):
+        counter = make_simple_counter("C" * 21, "x")
+        counter["isOn"] = True
+        mut.counter_add(sample, b, counter)
+        payload = _last_op(b)["p"]["actionPayload"]["simpleCounter"]
+        assert payload["isOn"] is False
+        assert self._counter(sample, "C" * 21)["isOn"] is False
+
+    def test_add_countdown_carries_duration(self, sample, b):
+        counter = make_simple_counter(
+            "C" * 21,
+            "Stretch",
+            counter_type="RepeatedCountdownReminder",
+            countdown_duration=1800000,
+        )
+        mut.counter_add(sample, b, counter)
+        payload = _last_op(b)["p"]["actionPayload"]["simpleCounter"]
+        assert payload["countdownDuration"] == 1800000
+
+    def test_add_duplicate_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="already exists"):
+            mut.counter_add(sample, b, make_simple_counter("COFFEE_COUNTER", "dup"))
+
+    def test_update(self, sample, b):
+        mut.counter_update(
+            sample, b, "COFFEE_COUNTER", {"title": "Coffee", "isEnabled": True}
+        )
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "SU",
+            "UPD",
+            "SIMPLE_COUNTER",
+            "COFFEE_COUNTER",
+        )
+        assert op["p"]["actionPayload"] == {
+            "simpleCounter": {
+                "id": "COFFEE_COUNTER",
+                "changes": {"title": "Coffee", "isEnabled": True},
+            }
+        }
+        counter = self._counter(sample, "COFFEE_COUNTER")
+        assert (counter["title"], counter["isEnabled"]) == ("Coffee", True)
+        assert_doctor_clean(sample)
+
+    def test_update_is_on_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="device-local"):
+            mut.counter_update(sample, b, "COFFEE_COUNTER", {"isOn": True})
+        assert b.ops == []
+
+    def test_update_count_on_day_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="countOnDay"):
+            mut.counter_update(sample, b, "COFFEE_COUNTER", {"countOnDay": {}})
+
+    def test_update_unknown_raises(self, sample, b):
+        with pytest.raises(mut.MutationError, match="counter not found"):
+            mut.counter_update(sample, b, "nope", {"title": "x"})
+
+    def test_delete(self, sample, b):
+        mut.counter_delete(sample, b, "COFFEE_COUNTER")
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "SD",
+            "DEL",
+            "SIMPLE_COUNTER",
+            "COFFEE_COUNTER",
+        )
+        assert op["p"]["actionPayload"] == {"id": "COFFEE_COUNTER"}
+        assert "COFFEE_COUNTER" not in self._reg(sample)["ids"]
+        assert "COFFEE_COUNTER" not in self._reg(sample)["entities"]
+        assert_doctor_clean(sample)
+
+    def test_set_today_emits_st(self, sample, b):
+        today = today_str()
+        mut.counter_set(sample, b, "COFFEE_COUNTER", 3)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "ST",
+            "UPD",
+            "SIMPLE_COUNTER",
+            "COFFEE_COUNTER",
+        )
+        assert op["p"]["actionPayload"] == {
+            "id": "COFFEE_COUNTER",
+            "newVal": 3,
+            "today": today,
+        }
+        assert self._counter(sample, "COFFEE_COUNTER")["countOnDay"] == {today: 3}
+
+    def test_set_other_date_emits_sfd(self, sample, b):
+        mut.counter_set(sample, b, "COFFEE_COUNTER", 5, "2020-01-02")
+        op = _last_op(b)
+        assert op["a"] == "SFD"
+        assert op["p"]["actionPayload"] == {
+            "id": "COFFEE_COUNTER",
+            "date": "2020-01-02",
+            "newVal": 5,
+        }
+        assert self._counter(sample, "COFFEE_COUNTER")["countOnDay"]["2020-01-02"] == 5
+
+    def test_set_clamps_to_zero(self, sample, b):
+        mut.counter_set(sample, b, "COFFEE_COUNTER", -7)
+        assert _last_op(b)["p"]["actionPayload"]["newVal"] == 0
+        assert self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today_str()] == 0
+
+    def test_set_rejects_non_integer(self, sample, b):
+        with pytest.raises(mut.MutationError, match="integer"):
+            mut.counter_set(sample, b, "COFFEE_COUNTER", 1.5)
+
+    def test_inc_emits_absolute_value(self, sample, b):
+        today = today_str()
+        self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today] = 4
+        assert mut.counter_inc(sample, b, "COFFEE_COUNTER", 2) == 6
+        op = _last_op(b)
+        assert op["a"] == "ST"
+        assert op["p"]["actionPayload"]["newVal"] == 6
+        assert self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today] == 6
+
+    def test_inc_from_missing_day_starts_at_zero(self, sample, b):
+        assert mut.counter_inc(sample, b, "COFFEE_COUNTER", 1, "2020-03-04") == 1
+        op = _last_op(b)
+        assert op["a"] == "SFD"
+        assert op["p"]["actionPayload"]["newVal"] == 1
+
+    def test_inc_negative_clamps_at_zero(self, sample, b):
+        today = today_str()
+        self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today] = 1
+        assert mut.counter_inc(sample, b, "COFFEE_COUNTER", -5) == 0
+        assert _last_op(b)["p"]["actionPayload"]["newVal"] == 0
+
+    def test_log_time_emits_sc_delta(self, sample, b):
+        mut.counter_log_time(sample, b, "STANDING_DESK_ID", "2024-05-01", 60000)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "SC",
+            "UPD",
+            "SIMPLE_COUNTER",
+            "STANDING_DESK_ID",
+        )
+        assert op["p"]["actionPayload"] == {
+            "id": "STANDING_DESK_ID",
+            "date": "2024-05-01",
+            "duration": 60000,
+        }
+        assert self._counter(sample, "STANDING_DESK_ID")["countOnDay"] == {
+            "2024-05-01": 60000
+        }
+
+    def test_log_time_accumulates_locally(self, sample, b):
+        mut.counter_log_time(sample, b, "STANDING_DESK_ID", "2024-05-01", 60000)
+        total = mut.counter_log_time(sample, b, "STANDING_DESK_ID", "2024-05-01", 30000)
+        assert total == 90000
+        # each op still carries only its own DELTA
+        assert [op["p"]["actionPayload"]["duration"] for op in b.ops] == [60000, 30000]
+        assert (
+            self._counter(sample, "STANDING_DESK_ID")["countOnDay"]["2024-05-01"] == 90000
+        )
+
+    def test_log_time_negative_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="non-negative"):
+            mut.counter_log_time(sample, b, "STANDING_DESK_ID", "2024-05-01", -1)
+        assert b.ops == []
+
+    def test_order_emits_sm(self, sample, b):
+        ids = ["COFFEE_COUNTER", "STRETCHING_COUNTER", "STANDING_DESK_ID"]
+        mut.counter_order(sample, b, ids)
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"]) == ("SM", "MOV", "SIMPLE_COUNTER")
+        assert op["d"] == "COFFEE_COUNTER"
+        assert op["ds"] == ids
+        assert op["p"]["actionPayload"] == {"ids": ids}
+        assert self._reg(sample)["ids"] == ids
+        assert_doctor_clean(sample)
+
+    def test_order_partial_list_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="permutation"):
+            mut.counter_order(sample, b, ["COFFEE_COUNTER"])
+
+    def test_order_duplicates_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="duplicate"):
+            mut.counter_order(sample, b, ["COFFEE_COUNTER", "COFFEE_COUNTER"])
+
+    def test_only_persistent_actions_are_emitted(self, sample, b):
+        mut.counter_add(sample, b, make_simple_counter("C" * 21, "New"))
+        mut.counter_update(sample, b, "C" * 21, {"title": "New!"})
+        mut.counter_set(sample, b, "C" * 21, 2)
+        mut.counter_inc(sample, b, "C" * 21, 1)
+        mut.counter_set(sample, b, "C" * 21, 1, "2020-01-01")
+        mut.counter_log_time(sample, b, "STANDING_DESK_ID", today_str(), 1000)
+        mut.counter_order(
+            sample,
+            b,
+            ["C" * 21, "COFFEE_COUNTER", "STRETCHING_COUNTER", "STANDING_DESK_ID"],
+        )
+        mut.counter_delete(sample, b, "C" * 21)
+        actions = [op["a"] for op in b.ops]
+        assert set(actions) <= {"SA", "SU", "SD", "ST", "SFD", "SM", "SC"}
+        for forbidden in ("SI", "SX", "SG", "SO", "SF", "SN", "SUS", "SDM", "SUA"):
+            assert forbidden not in actions
+        assert all(op["e"] == "SIMPLE_COUNTER" for op in b.ops)

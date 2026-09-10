@@ -256,6 +256,43 @@ def list_notes(
     return notes
 
 
+# ---------------------------------------------------------------- counters
+
+def all_counters(d: dict) -> list[dict]:
+    reg = d["state"].get("simpleCounter") or {}
+    entities = reg.get("entities") or {}
+    return [entities[cid] for cid in reg.get("ids", []) if cid in entities]
+
+
+def resolve_counter(d: dict, ref: str) -> str:
+    """Counter by exact id, exact title (case-insensitive) or id prefix."""
+    counters = all_counters(d)
+    ids = [c["id"] for c in counters]
+    if ref in ids:
+        return ref
+    by_title = [
+        c["id"] for c in counters if (c.get("title") or "").lower() == ref.lower()
+    ]
+    if len(by_title) == 1:
+        return by_title[0]
+    if len(by_title) > 1:
+        raise AmbiguousIdError(ref, by_title)
+    matches = [cid for cid in ids if cid.startswith(ref)]
+    if not matches:
+        matches = [cid for cid in ids if cid.lstrip("-_").startswith(ref)]
+    if not matches:
+        raise NotFoundError(f"no counter with id or title '{ref}'")
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
+def counter_value(counter: dict, date: str | None = None) -> int:
+    """Clicks (or ms for StopWatch) counted on `date` (default today)."""
+    date = date or today_str()
+    return int((counter.get("countOnDay") or {}).get(date, 0))
+
+
 def agenda(d: dict) -> dict:
     today_s = today_str()
     now = int(datetime.datetime.now().timestamp() * 1000)
@@ -346,7 +383,7 @@ def doctor(d: dict) -> list[str]:
     problems: list[str] = []
     state = d["state"]
 
-    for name in ("task", "project", "tag", "taskRepeatCfg", "note"):
+    for name in ("task", "project", "tag", "taskRepeatCfg", "note", "simpleCounter"):
         reg = state.get(name)
         if not reg:
             continue
@@ -469,6 +506,14 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"panel {pid}: projectIds mixes '' with real ids")
             if TODAY_TAG_ID in (panel.get("includedTagIds") or []):
                 problems.append(f"panel {pid}: 'TODAY' in includedTagIds")
+
+    for counter in all_counters(d):
+        cid = counter["id"]
+        if counter.get("isOn"):
+            problems.append(f"counter {cid}: isOn is true (must be device-local false)")
+        for day, val in (counter.get("countOnDay") or {}).items():
+            if not isinstance(val, (int, float)) or val < 0:
+                problems.append(f"counter {cid}: countOnDay[{day}] = {val!r} is invalid")
 
     for day, ids in (state.get("planner", {}).get("days") or {}).items():
         for tid in ids:

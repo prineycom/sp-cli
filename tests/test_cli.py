@@ -329,3 +329,220 @@ class TestPanelChanges:
     def test_no_flags_means_no_changes(self, sample):
         args = self._args(["board", "panel", "add", "b", "T"])
         assert cli._panel_changes(sample, args) == {}
+
+
+class TestCounterArgvRewrites:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["counter", "add", "T"], "counter-add"),
+            (["counter", "edit", "x"], "counter-edit"),
+            (["counter", "rm", "x"], "counter-rm"),
+            (["counter", "set", "x", "1"], "counter-set"),
+            (["counter", "inc", "x"], "counter-inc"),
+            (["counter", "log", "x", "30m"], "counter-log"),
+            (["counter", "order", "x"], "counter-order"),
+        ],
+    )
+    def test_rewrite(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_bare_counter_is_counters(self):
+        assert cli._rewrite_argv(["counter"]) == ["counters"]
+        assert cli._rewrite_argv(["counter", "--json"]) == ["counters", "--json"]
+
+
+class TestCounterCommands:
+    @staticmethod
+    def _counter(d, cid):
+        return d["state"]["simpleCounter"]["entities"][cid]
+
+    def test_add_click_counter(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_counter_add(
+            _args(["counter", "add", "Pushups", "--streak-min", "20"])
+        )
+        assert rc == 0
+        printed = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"], op["d"]) == ("SA", "SIMPLE_COUNTER", printed)
+        counter = op["p"]["actionPayload"]["simpleCounter"]
+        assert counter["type"] == "ClickCounter"
+        assert counter["isOn"] is False
+        assert counter["isEnabled"] is True
+        assert counter["streakMinValue"] == 20
+
+    def test_add_stopwatch_streak_min_is_a_duration(self, fake_ctx):
+        cli.cmd_counter_add(
+            _args(
+                [
+                    "counter", "add", "Desk",
+                    "--type", "stopwatch",
+                    "--streak-min", "30m",
+                    "--icon", "chair",
+                ]
+            )
+        )
+        counter = fake_ctx.ops[-1]["p"]["actionPayload"]["simpleCounter"]
+        assert counter["type"] == "StopWatch"
+        assert counter["streakMinValue"] == 1800000
+        assert counter["icon"] == "chair"
+
+    def test_add_countdown_with_duration_and_days(self, fake_ctx):
+        cli.cmd_counter_add(
+            _args(
+                [
+                    "counter", "add", "Stretch",
+                    "--type", "countdown",
+                    "--countdown", "30m",
+                    "--streak-days", "mon,sat",
+                    "--no-streak",
+                ]
+            )
+        )
+        counter = fake_ctx.ops[-1]["p"]["actionPayload"]["simpleCounter"]
+        assert counter["countdownDuration"] == 1800000
+        assert counter["isTrackStreaks"] is False
+        assert counter["streakWeekDays"] == {
+            "0": False,
+            "1": True,
+            "2": False,
+            "3": False,
+            "4": False,
+            "5": False,
+            "6": True,
+        }
+
+    def test_add_countdown_flag_on_click_counter_is_exit_2(self):
+        assert cli.main(["counter", "add", "X", "--countdown", "30m"]) == 2
+
+    def test_add_bad_weekday_is_exit_2(self, fake_ctx):
+        assert cli.main(["counter", "add", "X", "--streak-days", "monday"]) == 2
+
+    def test_edit_emits_su(self, fake_ctx, sample):
+        rc = cli.cmd_counter_edit(
+            _args(["counter", "edit", "COFFEE_COUNTER", "--title", "Tea", "--enable"])
+        )
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "SU"
+        assert op["p"]["actionPayload"]["simpleCounter"]["changes"] == {
+            "title": "Tea",
+            "isEnabled": True,
+        }
+
+    def test_edit_streak_days_rewrites_the_whole_map(self, fake_ctx):
+        cli.cmd_counter_edit(
+            _args(["counter", "edit", "COFFEE_COUNTER", "--streak-days", "sun"])
+        )
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["simpleCounter"]["changes"]
+        assert changes["streakWeekDays"]["0"] is True
+        assert changes["streakWeekDays"]["1"] is False
+
+    def test_edit_nothing_to_change_raises(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_counter_edit(_args(["counter", "edit", "COFFEE_COUNTER"]))
+
+    def test_edit_enable_and_disable_conflict(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_counter_edit(
+                _args(["counter", "edit", "COFFEE_COUNTER", "--enable", "--disable"])
+            )
+
+    def test_rm_abort_writes_nothing(self, fake_ctx, sample, monkeypatch, capsys):
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert cli.cmd_counter_rm(_args(["counter", "rm", "COFFEE_COUNTER"])) == 1
+        assert fake_ctx.ops == [] and fake_ctx.commits == 0
+        assert "aborted" in capsys.readouterr().err
+        assert "COFFEE_COUNTER" in sample["state"]["simpleCounter"]["ids"]
+
+    def test_rm_yes_deletes(self, fake_ctx, sample):
+        assert cli.cmd_counter_rm(_args(["counter", "rm", "COFFEE_COUNTER", "--yes"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "SD"
+        assert "COFFEE_COUNTER" not in sample["state"]["simpleCounter"]["ids"]
+
+    def test_set_today_emits_st(self, fake_ctx, sample):
+        from sp_cli.model import today_str
+
+        assert cli.cmd_counter_set(_args(["counter", "set", "COFFEE_COUNTER", "3"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "ST"
+        assert op["p"]["actionPayload"]["newVal"] == 3
+        assert self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today_str()] == 3
+
+    def test_set_past_date_emits_sfd(self, fake_ctx):
+        cli.cmd_counter_set(
+            _args(["counter", "set", "COFFEE_COUNTER", "2", "--date", "2020-01-02"])
+        )
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "SFD"
+        assert op["p"]["actionPayload"] == {
+            "id": "COFFEE_COUNTER",
+            "date": "2020-01-02",
+            "newVal": 2,
+        }
+
+    def test_set_stopwatch_value_is_a_duration(self, fake_ctx):
+        cli.cmd_counter_set(_args(["counter", "set", "STANDING_DESK_ID", "45m"]))
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["newVal"] == 2700000
+
+    def test_set_non_numeric_on_click_counter_is_exit_2(self, fake_ctx):
+        assert cli.main(["counter", "set", "COFFEE_COUNTER", "abc"]) == 2
+
+    def test_inc_defaults_to_one_and_is_absolute(self, fake_ctx, sample):
+        from sp_cli.model import today_str
+
+        self._counter(sample, "COFFEE_COUNTER")["countOnDay"][today_str()] = 2
+        assert cli.cmd_counter_inc(_args(["counter", "inc", "COFFEE_COUNTER"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "ST"
+        assert op["p"]["actionPayload"]["newVal"] == 3
+
+    def test_inc_by_amount(self, fake_ctx):
+        cli.cmd_counter_inc(_args(["counter", "inc", "COFFEE_COUNTER", "--by", "5"]))
+        assert fake_ctx.ops[-1]["p"]["actionPayload"]["newVal"] == 5
+
+    def test_log_emits_sc_and_accumulates(self, fake_ctx, sample):
+        from sp_cli.model import today_str
+
+        assert cli.cmd_counter_log(_args(["counter", "log", "STANDING_DESK_ID", "30m"])) == 0
+        cli.cmd_counter_log(_args(["counter", "log", "STANDING_DESK_ID", "15m"]))
+        assert [op["a"] for op in fake_ctx.ops] == ["SC", "SC"]
+        assert [op["p"]["actionPayload"]["duration"] for op in fake_ctx.ops] == [
+            1800000,
+            900000,
+        ]
+        assert (
+            self._counter(sample, "STANDING_DESK_ID")["countOnDay"][today_str()]
+            == 2700000
+        )
+
+    def test_log_on_click_counter_is_exit_2(self, fake_ctx):
+        assert cli.main(["counter", "log", "COFFEE_COUNTER", "30m"]) == 2
+
+    def test_log_negative_duration_is_exit_2(self, fake_ctx):
+        assert cli.main(["counter", "log", "STANDING_DESK_ID", "--", "-30m"]) == 2
+
+    def test_order_completes_the_list(self, fake_ctx, sample):
+        assert cli.cmd_counter_order(_args(["counter", "order", "COFFEE_COUNTER"])) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "SM"
+        assert op["p"]["actionPayload"]["ids"] == [
+            "COFFEE_COUNTER",
+            "STANDING_DESK_ID",
+            "STRETCHING_COUNTER",
+        ]
+        assert sample["state"]["simpleCounter"]["ids"][0] == "COFFEE_COUNTER"
+
+    def test_counters_list_renders(self, fake_ctx, sample, capsys):
+        from sp_cli.model import today_str
+
+        self._counter(sample, "STANDING_DESK_ID")["countOnDay"][today_str()] = 1800000
+        assert cli.cmd_counters(_args(["counters"])) == 0
+        out = capsys.readouterr().out
+        assert "STANDING_DESK_ID" in out
+        assert "stopwatch" in out
+        assert "30m" in out
+
+    def test_counters_json(self, fake_ctx, capsys):
+        assert cli.cmd_counters(_args(["counters", "--json"])) == 0
+        assert '"COFFEE_COUNTER"' in capsys.readouterr().out

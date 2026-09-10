@@ -326,6 +326,85 @@ def make_repeat_cfg(
     return cfg
 
 
+# ---------------------------------------------------------------- counters
+
+# SimpleCounterType values as stored in the sync file.
+SIMPLE_COUNTER_TYPES = {
+    "click": "ClickCounter",
+    "stopwatch": "StopWatch",
+    "countdown": "RepeatedCountdownReminder",
+}
+
+# Mon-Fri, as in EMPTY_SIMPLE_COUNTER (JSON keys are strings '0'..'6').
+DEFAULT_STREAK_WEEK_DAYS = {
+    "0": False,
+    "1": True,
+    "2": True,
+    "3": True,
+    "4": True,
+    "5": True,
+    "6": False,
+}
+
+# CLI weekday abbreviations -> streakWeekDays key (0 = Sunday, as in SP).
+STREAK_DAY_KEYS = {
+    "sun": "0",
+    "mon": "1",
+    "tue": "2",
+    "wed": "3",
+    "thu": "4",
+    "fri": "5",
+    "sat": "6",
+}
+
+
+def streak_week_days(days: list[str] | None = None) -> dict:
+    """{'0'..'6': bool}; `days` are streakWeekDays keys ('0'...'6')."""
+    if days is None:
+        return copy.deepcopy(DEFAULT_STREAK_WEEK_DAYS)
+    wanted = set(days)
+    return {k: (k in wanted) for k in DEFAULT_STREAK_WEEK_DAYS}
+
+
+def make_simple_counter(
+    counter_id: str,
+    title: str,
+    counter_type: str = "ClickCounter",
+    icon: str | None = None,
+    is_enabled: bool = True,
+    is_track_streaks: bool = True,
+    streak_min_value: int = 1,
+    week_days: list[str] | None = None,
+    countdown_duration: int | None = None,
+) -> dict:
+    """A SimpleCounter shaped like EMPTY_SIMPLE_COUNTER.
+
+    isOn is device-local and is always written as False (loadAllData forces it).
+    """
+    if counter_type not in SIMPLE_COUNTER_TYPES.values():
+        raise ValueError(f"invalid simple counter type: {counter_type}")
+    counter = {
+        "id": counter_id,
+        "title": title,
+        "isEnabled": bool(is_enabled),
+        "icon": icon,
+        "type": counter_type,
+        "countOnDay": {},
+        "isOn": False,
+        "isTrackStreaks": bool(is_track_streaks),
+        "streakMinValue": int(streak_min_value),
+        "streakMode": "specific-days",
+        "streakWeekDays": streak_week_days(week_days),
+    }
+    if counter_type == "RepeatedCountdownReminder":
+        counter["countdownDuration"] = int(
+            countdown_duration if countdown_duration is not None else 1800000
+        )
+    elif countdown_duration is not None:
+        raise ValueError("countdownDuration only applies to countdown counters")
+    return counter
+
+
 def task_with_subtasks(state: dict, task_id: str) -> dict:
     """Snapshot: the task entity plus 'subTasks': [sub entities]."""
     entities = state["task"]["entities"]
