@@ -2363,3 +2363,154 @@ class TestReorderConvertCommands:
         op = fake_ctx.ops[-1]
         assert (op["a"], op["e"]) == ("LB", "PLANNER")
         assert sample["state"]["planner"]["days"]["2030-01-02"] == [ids[0], ids[1]]
+
+
+class TestAttachArgvRewrite:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["attach", "edit", "T1", "A1"], "attach-edit"),
+            (["attach", "rm", "T1", "A1"], "attach-rm"),
+        ],
+    )
+    def test_subcommands_rewritten(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_attach_with_path_is_not_rewritten(self):
+        argv = ["attach", "T1", "https://a"]
+        assert cli._rewrite_argv(argv) == argv
+
+    def test_attach_without_path_lists(self):
+        assert cli._rewrite_argv(["attach", "T1"]) == ["attachments", "T1"]
+        assert cli._rewrite_argv(["attach", "T1", "--json"]) == [
+            "attachments",
+            "T1",
+            "--json",
+        ]
+
+
+class TestAttachCommands:
+    def _task(self, sample, add_task_entity):
+        return add_task_entity(title="task with links")
+
+    def _attach(self, sample, task, **kw):
+        from sp_cli.model import make_attachment
+
+        att = make_attachment(kw.pop("aid", "A" * 21), kw.pop("path", "https://a"), **kw)
+        task.setdefault("attachments", []).append(att)
+        return att
+
+    def test_attach_prints_id_and_emits_xa(
+        self, fake_ctx, sample, add_task_entity, capsys
+    ):
+        task = self._task(sample, add_task_entity)
+        argv = ["attach", task["id"], "https://example.com/spec.pdf"]
+        assert cli.cmd_attach(_args(argv)) == 0
+        printed = capsys.readouterr().out.strip()
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"], op["d"]) == ("XA", "UPD", "TASK", task["id"])
+        att = op["p"]["actionPayload"]["taskAttachment"]
+        assert att["id"] == printed
+        assert (att["type"], att["icon"], att["title"]) == (
+            "LINK",
+            "bookmark",
+            "spec.pdf",
+        )
+        assert task["attachments"][-1]["id"] == printed
+
+    def test_attach_flags_override(self, fake_ctx, sample, add_task_entity):
+        task = self._task(sample, add_task_entity)
+        argv = [
+            "attach",
+            task["id"],
+            "https://example.com/x.png",
+            "--title",
+            "Mockup",
+            "--type",
+            "file",
+        ]
+        assert cli.cmd_attach(_args(argv)) == 0
+        att = fake_ctx.ops[-1]["p"]["actionPayload"]["taskAttachment"]
+        assert (att["type"], att["icon"], att["title"]) == (
+            "FILE",
+            "insert_drive_file",
+            "Mockup",
+        )
+
+    def test_attach_to_missing_task_writes_nothing(self, fake_ctx, sample):
+        with pytest.raises(q.NotFoundError):
+            cli.cmd_attach(_args(["attach", "Z" * 21, "https://a"]))
+        assert fake_ctx.ops == []
+
+    def test_attachments_lists(self, fake_ctx, sample, add_task_entity, capsys):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21, path="https://a/one.txt")
+        assert cli.cmd_attachments(_args(["attach", task["id"]])) == 0
+        out = capsys.readouterr().out
+        assert "one.txt" in out and "LINK" in out
+
+    def test_attachments_json(self, fake_ctx, sample, add_task_entity, capsys):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21, path="https://a/one.txt")
+        assert cli.cmd_attachments(_args(["attach", task["id"], "--json"])) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert [a["id"] for a in data] == ["B" * 21]
+
+    def test_attachments_empty(self, fake_ctx, sample, add_task_entity, capsys):
+        task = self._task(sample, add_task_entity)
+        assert cli.cmd_attachments(_args(["attach", task["id"]])) == 0
+        assert "(none)" in capsys.readouterr().out
+
+    def test_edit_by_prefix_emits_xu(self, fake_ctx, sample, add_task_entity):
+        task = self._task(sample, add_task_entity)
+        att = self._attach(sample, task, aid="B" * 21, path="https://a/one.txt")
+        argv = ["attach", "edit", task["id"], "BBBB", "--title", "renamed"]
+        assert cli.cmd_attach_edit(_args(argv)) == 0
+        op = fake_ctx.ops[-1]
+        assert op["a"] == "XU" and op["o"] == "UPD" and op["e"] == "TASK"
+        assert op["p"]["actionPayload"]["taskAttachment"] == {
+            "id": att["id"],
+            "changes": {"title": "renamed"},
+        }
+        assert task["attachments"][0]["title"] == "renamed"
+
+    def test_edit_type_also_swaps_the_icon(self, fake_ctx, sample, add_task_entity):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21, path="https://a/one.txt")
+        argv = ["attach", "edit", task["id"], "BBBB", "--type", "img", "--path", "p.png"]
+        assert cli.cmd_attach_edit(_args(argv)) == 0
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["taskAttachment"]["changes"]
+        assert changes == {"path": "p.png", "type": "IMG", "icon": "image"}
+
+    def test_edit_without_flags_is_refused(self, fake_ctx, sample, add_task_entity):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21)
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_attach_edit(_args(["attach", "edit", task["id"], "BBBB"]))
+        assert fake_ctx.ops == []
+
+    def test_rm_emits_xd(self, fake_ctx, sample, add_task_entity, capsys):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21)
+        assert cli.cmd_attach_rm(_args(["attach", "rm", task["id"], "BBBB"])) == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["o"], op["e"]) == ("XD", "UPD", "TASK")
+        assert op["p"]["actionPayload"] == {"taskId": task["id"], "id": "B" * 21}
+        assert task["attachments"] == []
+        assert "deleted" in capsys.readouterr().out
+
+    def test_rm_unknown_attachment_writes_nothing(
+        self, fake_ctx, sample, add_task_entity
+    ):
+        task = self._task(sample, add_task_entity)
+        with pytest.raises(q.NotFoundError):
+            cli.cmd_attach_rm(_args(["attach", "rm", task["id"], "ZZZZ"]))
+        assert fake_ctx.ops == []
+
+    def test_show_renders_attachments(self, fake_ctx, sample, add_task_entity, capsys):
+        task = self._task(sample, add_task_entity)
+        self._attach(sample, task, aid="B" * 21, path="https://a/one.txt", title="One")
+        assert cli.cmd_show(_args(["show", task["id"]])) == 0
+        out = capsys.readouterr().out
+        assert "attachments:" in out
+        assert "[LINK] One — https://a/one.txt" in out

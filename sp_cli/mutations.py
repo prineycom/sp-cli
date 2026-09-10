@@ -1798,6 +1798,89 @@ def repeat_delete(d: dict, b: OpBuilder, cfg_id: str) -> None:
     _reg_remove(reg, cfg_id)
 
 
+# ---------------------------------------------------------------- attachments
+
+def _attachment_list(task: dict) -> list:
+    attachments = task.get("attachments")
+    if not isinstance(attachments, list):
+        attachments = []
+        task["attachments"] = attachments
+    return attachments
+
+
+def _attachment(task: dict, attachment_id: str) -> dict:
+    for attachment in _attachment_list(task):
+        if attachment.get("id") == attachment_id:
+            return attachment
+    raise MutationError(
+        f"attachment not found on task {task['id']}: {attachment_id}"
+    )
+
+
+def attachment_add(d: dict, b: OpBuilder, task_id: str, attachment: dict) -> str:
+    """XA — append an attachment to a task (already built via make_attachment).
+
+    All three attachment ops are e=TASK/o=UPD (even the delete) and the SP
+    reducers THROW when the task is missing, so existence is checked here.
+    None of them bumps task.modified.
+    """
+    state = _state(d)
+    task = _task(state, task_id)
+    attachments = _attachment_list(task)
+    if any(a.get("id") == attachment["id"] for a in attachments):
+        raise MutationError(f"attachment already exists: {attachment['id']}")
+
+    b.op(
+        "XA",
+        "UPD",
+        "TASK",
+        task_id,
+        {"taskId": task_id, "taskAttachment": copy.deepcopy(attachment)},
+    )
+
+    attachments.append(attachment)
+    return attachment["id"]
+
+
+def attachment_update(
+    d: dict, b: OpBuilder, task_id: str, attachment_id: str, changes: dict
+) -> None:
+    """XU — shallow-merge changes into one attachment by id."""
+    state = _state(d)
+    task = _task(state, task_id)
+    attachment = _attachment(task, attachment_id)
+    if not changes:
+        raise MutationError("attachment update: nothing to change")
+
+    b.op(
+        "XU",
+        "UPD",
+        "TASK",
+        task_id,
+        {
+            "taskId": task_id,
+            "taskAttachment": {"id": attachment_id, "changes": copy.deepcopy(changes)},
+        },
+    )
+
+    attachment.update(copy.deepcopy(changes))
+
+
+def attachment_delete(
+    d: dict, b: OpBuilder, task_id: str, attachment_id: str
+) -> None:
+    """XD — drop one attachment by id (o=UPD: the entity is the TASK)."""
+    state = _state(d)
+    task = _task(state, task_id)
+    _attachment(task, attachment_id)
+
+    b.op("XD", "UPD", "TASK", task_id, {"taskId": task_id, "id": attachment_id})
+
+    task["attachments"] = [
+        a for a in _attachment_list(task) if a.get("id") != attachment_id
+    ]
+
+
 # ---------------------------------------------------------------- notes
 
 def _note_reg(state: dict) -> dict:

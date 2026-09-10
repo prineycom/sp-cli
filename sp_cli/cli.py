@@ -14,6 +14,7 @@ from sp_cli import timer
 from sp_cli.config import ConfigError, init_config, load_config
 from sp_cli.ids import nanoid
 from sp_cli.model import (
+    ATTACHMENT_ICONS,
     BACKLOG_STATE,
     INBOX_PROJECT_ID,
     ISSUE_PROVIDER_DEFAULT_CFG,
@@ -27,6 +28,7 @@ from sp_cli.model import (
     TODAY_TAG_ID,
     WEEKDAY_KEYS,
     logical_today_str,
+    make_attachment,
     make_board,
     make_issue_provider,
     make_note,
@@ -54,6 +56,10 @@ class CliError(Exception):
 # ---------------------------------------------------------------- helpers
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# CLI exposes only the three attachment types a terminal can meaningfully
+# create; SP's union also has COMMAND and NOTE (dialog-only).
+_ATTACH_TYPES = {"link": "LINK", "img": "IMG", "file": "FILE"}
 
 
 def _ctx() -> tuple[SyncFileClient, SyncStore]:
@@ -1386,6 +1392,73 @@ def cmd_notes(args) -> int:
     return 0
 
 
+def cmd_attach(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    a_type = _ATTACH_TYPES[args.type] if args.type else None
+    attachment_id = nanoid()
+    try:
+        attachment = make_attachment(
+            attachment_id, args.path, attachment_type=a_type, title=args.title
+        )
+    except ValueError as e:
+        raise CliError(str(e)) from None
+
+    store.commit(
+        [lambda dd, b: mut.attachment_add(dd, b, tid, attachment)], initial=d
+    )
+    print(attachment_id)
+    return 0
+
+
+def cmd_attachments(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    attachments = q.task_attachments(d, tid)
+    if args.json:
+        render.print_json(attachments)
+    else:
+        render.print_attachments(attachments)
+    return 0
+
+
+def cmd_attach_edit(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    aid = q.resolve_attachment(d, tid, args.attachment)
+    changes: dict = {}
+    if args.title is not None:
+        changes["title"] = args.title
+    if args.path is not None:
+        changes["path"] = args.path
+    if args.type is not None:
+        changes["type"] = _ATTACH_TYPES[args.type]
+        changes["icon"] = ATTACHMENT_ICONS[changes["type"]]
+    if not changes:
+        raise CliError("attach edit: nothing to change")
+
+    store.commit(
+        [lambda dd, b: mut.attachment_update(dd, b, tid, aid, changes)], initial=d
+    )
+    print(f"updated {render.short_id(aid)}")
+    return 0
+
+
+def cmd_attach_rm(args) -> int:
+    client, store = _ctx()
+    d = client.get()
+    tid = q.resolve_task(d, args.id)
+    aid = q.resolve_attachment(d, tid, args.attachment)
+    store.commit(
+        [lambda dd, b: mut.attachment_delete(dd, b, tid, aid)], initial=d
+    )
+    print(f"deleted {render.short_id(aid)}")
+    return 0
+
+
 def cmd_note_add(args) -> int:
     client, store = _ctx()
     d = client.get()
@@ -2330,6 +2403,8 @@ _SUBCOMMAND_REWRITES = {
     ("backlog", "add"): "backlog-add",
     ("backlog", "rm"): "backlog-rm",
     ("backlog", "clear"): "backlog-clear",
+    ("attach", "edit"): "attach-edit",
+    ("attach", "rm"): "attach-rm",
     ("note", "add"): "note-add",
     ("note", "show"): "note-show",
     ("note", "edit"): "note-edit",
@@ -2369,6 +2444,11 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
         return [_SUBCOMMAND_REWRITES_3[tuple(argv[:3])]] + argv[3:]
     if len(argv) >= 2 and (argv[0], argv[1]) in _SUBCOMMAND_REWRITES:
         return [_SUBCOMMAND_REWRITES[(argv[0], argv[1])]] + argv[2:]
+    # `sp attach TASK` (no path) == `sp attachments TASK`
+    if argv[:1] == ["attach"] and len(argv) >= 2 and not argv[1].startswith("-") and (
+        len(argv) == 2 or all(a.startswith("-") for a in argv[2:])
+    ):
+        return ["attachments"] + argv[1:]
     # bare `sp note [--flags]` == `sp notes`
     if argv[:1] == ["note"] and (len(argv) == 1 or argv[1].startswith("-")):
         return ["notes"] + argv[1:]
@@ -2709,6 +2789,28 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("tag-rm", cmd_tag_rm, "delete a tag (removed from every task)")
     s.add_argument("id")
     s.add_argument("--yes", action="store_true")
+
+    s = add("attach", cmd_attach, "attach a link/file/image to a task")
+    s.add_argument("id")
+    s.add_argument("path", help="url or file path")
+    s.add_argument("--title")
+    s.add_argument(
+        "--type",
+        choices=sorted(_ATTACH_TYPES),
+        help="force the type (default: guessed from the path)",
+    )
+    s = add("attachments", cmd_attachments, "list a task's attachments")
+    s.add_argument("id")
+    s.add_argument("--json", action="store_true")
+    s = add("attach-edit", cmd_attach_edit, "edit a task attachment")
+    s.add_argument("id")
+    s.add_argument("attachment")
+    s.add_argument("--title")
+    s.add_argument("--path")
+    s.add_argument("--type", choices=sorted(_ATTACH_TYPES))
+    s = add("attach-rm", cmd_attach_rm, "remove a task attachment")
+    s.add_argument("id")
+    s.add_argument("attachment")
 
     s = add("notes", cmd_notes, "list notes")
     s.add_argument("--project")

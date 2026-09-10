@@ -84,6 +84,30 @@ def resolve_archived_task(d: dict, ref: str) -> str:
     return matches[0]
 
 
+def task_attachments(d: dict, task_id: str) -> list[dict]:
+    """Attachments of one live task (empty list when the field is absent)."""
+    task = d["state"]["task"]["entities"].get(task_id)
+    if task is None:
+        raise NotFoundError(f"no task with id '{task_id}'")
+    attachments = task.get("attachments")
+    return list(attachments) if isinstance(attachments, list) else []
+
+
+def resolve_attachment(d: dict, task_id: str, ref: str) -> str:
+    """Resolve an attachment id (or prefix) WITHIN one task."""
+    ids = [a.get("id") for a in task_attachments(d, task_id) if a.get("id")]
+    if ref in ids:
+        return ref
+    matches = _prefix_matches(ids, ref)
+    if not matches:
+        raise NotFoundError(
+            f"no attachment with id (prefix) '{ref}' on task {task_id}"
+        )
+    if len(matches) > 1:
+        raise AmbiguousIdError(ref, matches)
+    return matches[0]
+
+
 def resolve_note(d: dict, ref: str) -> str:
     ids = (d["state"].get("note") or {}).get("ids", [])
     if ref in ids:

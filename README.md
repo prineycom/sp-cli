@@ -241,6 +241,20 @@ Inbox удалить нельзя.
 ./sp note move <id> --project P
 ```
 
+### Вложения задач
+
+```sh
+./sp attach <task> <url-or-path> [--title T] [--type link|img|file]
+                                              # печатает id вложения
+                                              # тип по умолчанию: картинка → img,
+                                              # file:// или локальный путь → file, иначе link
+./sp attachments <task> [--json]              # `./sp attach <task>` без пути = то же
+./sp attach edit <task> <attach-id> [--title T] [--path P] [--type ...]
+./sp attach rm <task> <attach-id>
+```
+
+Вложения показываются и в `./sp show <task>`. `attach-id` резолвится по префиксу внутри задачи.
+
 ### Доски (boards)
 
 ```sh
@@ -437,6 +451,7 @@ python3 -m pytest tests/ -q    # 604 unit-теста, без сети
 - [x] Метрики: оценка дня (impact/energy/notes/рефлексии), фокус-сессии
 - [x] Интеграции: календари ICAL/CalDAV — подключение, правка, удаление, порядок
 - [x] Архив: список архивных задач, восстановление задачи с сабтасками
+- [x] Вложения задач: добавление, правка, удаление, список
 - [ ] YouTrack-мост (опционально)
 
 ## Известные ограничения

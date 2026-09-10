@@ -169,6 +169,22 @@ def note_rows(d: dict, notes: list[dict]) -> list[list[str]]:
     return rows
 
 
+def attachment_rows(attachments: list[dict]) -> list[list[str]]:
+    return [
+        [
+            short_id(a.get("id") or ""),
+            a.get("type") or "?",
+            truncate(a.get("title") or "", TITLE_WIDTH),
+            truncate(a.get("path") or "", 60),
+        ]
+        for a in attachments
+    ]
+
+
+def print_attachments(attachments: list[dict]) -> None:
+    print_table(["id", "type", "title", "path"], attachment_rows(attachments))
+
+
 def print_notes(d: dict, notes: list[dict]) -> None:
     print_table(["id", "pin", "content", "project"], note_rows(d, notes))
 
@@ -435,6 +451,15 @@ def task_card(d: dict, task: dict) -> str:
         lines.append("notes:")
         for ln in task["notes"].splitlines():
             lines.append(f"  {ln}")
+    attachments = task.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        lines.append("attachments:")
+        for a in attachments:
+            title = a.get("title") or a.get("path") or ""
+            lines.append(
+                f"  {short_id(a.get('id') or '')} "
+                f"[{a.get('type') or '?'}] {title} — {a.get('path') or ''}"
+            )
     subs = task.get("subTaskIds", [])
     if subs:
         lines.append("subtasks:")

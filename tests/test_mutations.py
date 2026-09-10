@@ -3672,3 +3672,181 @@ class TestPlannerMoveBefore:
         a, _target = self._seed(sample, add_task_entity)
         with pytest.raises(mut.MutationError, match="task not found"):
             mut.planner_move_before(sample, b, a["id"], "Z" * 21)
+
+
+class TestAttachments:
+    def _seed(self, sample, add_task_entity):
+        return add_task_entity(title="with attachments")
+
+    def test_add_emits_xa_upd_on_task_and_appends(
+        self, sample, b, add_task_entity
+    ):
+        task = self._seed(sample, add_task_entity)
+        att = model.make_attachment("A1", "https://example.com/spec.pdf")
+        mut.attachment_add(sample, b, task["id"], att)
+
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "XA",
+            "UPD",
+            "TASK",
+            task["id"],
+        )
+        payload = op["p"]["actionPayload"]
+        assert payload["taskId"] == task["id"]
+        assert payload["taskAttachment"]["id"] == "A1"
+        assert task["attachments"] == [att]
+        assert "modified" not in task
+        assert_doctor_clean(sample)
+
+    def test_add_auto_type_link_with_basename_title(
+        self, sample, b, add_task_entity
+    ):
+        task = self._seed(sample, add_task_entity)
+        att = model.make_attachment("A1", "https://example.com/docs/spec.pdf?v=2")
+        mut.attachment_add(sample, b, task["id"], att)
+        assert att["type"] == "LINK"
+        assert att["icon"] == "bookmark"
+        assert att["title"] == "spec.pdf"
+
+    def test_add_auto_type_img(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        att = model.make_attachment("A1", "https://example.com/a/Shot.PNG")
+        mut.attachment_add(sample, b, task["id"], att)
+        assert att["type"] == "IMG"
+        assert att["icon"] == "image"
+        assert att["title"] == "Shot.PNG"
+
+    def test_add_auto_type_file(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        att = model.make_attachment("A1", "file:///home/me/notes.txt")
+        mut.attachment_add(sample, b, task["id"], att)
+        assert att["type"] == "FILE"
+        assert att["icon"] == "insert_drive_file"
+        assert att["title"] == "notes.txt"
+
+    def test_explicit_title_and_type_win(self):
+        att = model.make_attachment(
+            "A1", "https://example.com/x.png", attachment_type="link", title="Shot"
+        )
+        assert (att["type"], att["title"], att["icon"]) == ("LINK", "Shot", "bookmark")
+
+    def test_unknown_type_is_refused(self):
+        with pytest.raises(ValueError, match="unknown attachment type"):
+            model.make_attachment("A1", "x", attachment_type="video")
+
+    def test_add_appends_after_existing(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        first = model.make_attachment("A1", "https://a")
+        second = model.make_attachment("A2", "https://b")
+        mut.attachment_add(sample, b, task["id"], first)
+        mut.attachment_add(sample, b, task["id"], second)
+        assert [a["id"] for a in task["attachments"]] == ["A1", "A2"]
+
+    def test_add_duplicate_id_is_refused(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A1", "x"))
+        with pytest.raises(mut.MutationError, match="already exists"):
+            mut.attachment_add(sample, b, task["id"], model.make_attachment("A1", "y"))
+
+    def test_add_on_missing_task_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="task not found"):
+            mut.attachment_add(
+                sample, b, "Z" * 21, model.make_attachment("A1", "https://a")
+            )
+        assert b.ops == []
+
+    def test_update_is_a_shallow_merge_by_id(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A1", "https://a"))
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A2", "https://b"))
+        mut.attachment_update(sample, b, task["id"], "A1", {"title": "renamed"})
+
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "XU",
+            "UPD",
+            "TASK",
+            task["id"],
+        )
+        payload = op["p"]["actionPayload"]
+        assert payload == {
+            "taskId": task["id"],
+            "taskAttachment": {"id": "A1", "changes": {"title": "renamed"}},
+        }
+        first, second = task["attachments"]
+        assert first["title"] == "renamed" and first["path"] == "https://a"
+        assert second["title"] == "b"
+        assert "modified" not in task
+
+    def test_update_missing_attachment_is_refused(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="attachment not found"):
+            mut.attachment_update(sample, b, task["id"], "A9", {"title": "x"})
+        assert b.ops == []
+
+    def test_update_missing_task_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="task not found"):
+            mut.attachment_update(sample, b, "Z" * 21, "A1", {"title": "x"})
+
+    def test_update_without_changes_is_refused(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A1", "x"))
+        with pytest.raises(mut.MutationError, match="nothing to change"):
+            mut.attachment_update(sample, b, task["id"], "A1", {})
+
+    def test_delete_filters_by_id_and_stays_upd(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A1", "https://a"))
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("A2", "https://b"))
+        mut.attachment_delete(sample, b, task["id"], "A1")
+
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "XD",
+            "UPD",
+            "TASK",
+            task["id"],
+        )
+        assert op["p"]["actionPayload"] == {"taskId": task["id"], "id": "A1"}
+        assert [a["id"] for a in task["attachments"]] == ["A2"]
+        assert "modified" not in task
+        assert_doctor_clean(sample)
+
+    def test_delete_missing_attachment_is_refused(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        with pytest.raises(mut.MutationError, match="attachment not found"):
+            mut.attachment_delete(sample, b, task["id"], "A9")
+        assert b.ops == []
+
+    def test_delete_missing_task_is_refused(self, sample, b):
+        with pytest.raises(mut.MutationError, match="task not found"):
+            mut.attachment_delete(sample, b, "Z" * 21, "A1")
+
+    def test_payload_is_decoupled_from_state(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        att = model.make_attachment("A1", "https://a")
+        mut.attachment_add(sample, b, task["id"], att)
+        att["title"] = "changed later"
+        assert _last_op(b)["p"]["actionPayload"]["taskAttachment"]["title"] == "a"
+
+    def test_resolve_attachment_by_prefix(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("abc123", "x"))
+        assert q.resolve_attachment(sample, task["id"], "abc") == "abc123"
+        with pytest.raises(q.NotFoundError):
+            q.resolve_attachment(sample, task["id"], "zz")
+
+    def test_resolve_attachment_ambiguous_prefix(self, sample, b, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("ab1", "x"))
+        mut.attachment_add(sample, b, task["id"], model.make_attachment("ab2", "y"))
+        with pytest.raises(q.AmbiguousIdError):
+            q.resolve_attachment(sample, task["id"], "ab")
+
+    def test_task_attachments_defaults_to_empty(self, sample, add_task_entity):
+        task = self._seed(sample, add_task_entity)
+        task.pop("attachments", None)
+        assert q.task_attachments(sample, task["id"]) == []
+        with pytest.raises(q.NotFoundError):
+            q.task_attachments(sample, "Z" * 21)

@@ -184,6 +184,73 @@ def make_task(
     return task
 
 
+ATTACHMENT_TYPES = ("FILE", "LINK", "IMG", "COMMAND", "NOTE")
+
+# SP's TaskAttachment icons (material icon names) — one per supported type.
+ATTACHMENT_ICONS = {
+    "FILE": "insert_drive_file",
+    "LINK": "bookmark",
+    "IMG": "image",
+}
+
+IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".bmp",
+    ".avif",
+    ".ico",
+    ".tif",
+    ".tiff",
+)
+
+
+def _attachment_basename(path: str) -> str:
+    """Last path segment, query/fragment stripped — SP's default title."""
+    cleaned = (path or "").split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    name = cleaned.rsplit("/", 1)[-1]
+    return name or (path or "")
+
+
+def guess_attachment_type(path: str) -> str:
+    """IMG for image extensions, FILE for local paths, LINK otherwise."""
+    cleaned = (path or "").split("#", 1)[0].split("?", 1)[0]
+    if cleaned.lower().endswith(IMAGE_EXTENSIONS):
+        return "IMG"
+    lowered = (path or "").lower()
+    if lowered.startswith("file://") or lowered.startswith("/") or lowered.startswith(
+        "~"
+    ):
+        return "FILE"
+    return "LINK"
+
+
+def make_attachment(
+    attachment_id: str,
+    path: str,
+    attachment_type: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """Build a TaskAttachment: type auto-detected, title defaults to basename,
+    icon derived from the type."""
+    a_type = (attachment_type or guess_attachment_type(path)).upper()
+    if a_type not in ATTACHMENT_TYPES:
+        raise ValueError(f"unknown attachment type: {attachment_type}")
+    attachment = {
+        "id": attachment_id,
+        "type": a_type,
+        "path": path,
+        "title": title if title else _attachment_basename(path),
+    }
+    icon = ATTACHMENT_ICONS.get(a_type)
+    if icon:
+        attachment["icon"] = icon
+    return attachment
+
+
 def make_note(
     note_id: str,
     content: str,
