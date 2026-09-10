@@ -9,8 +9,11 @@ import copy
 import datetime
 
 from sp_cli.model import (
+    METRIC_DEAD_FIELDS,
+    METRIC_FIELDS,
     TODAY_TAG_ID,
     day_of_ms,
+    make_metric,
     make_repeat_cfg,
     now_ms,
     sanitize_panel,
@@ -933,8 +936,8 @@ def _counter_reg(state: dict) -> dict:
     return reg
 
 
-def _counter_day(value: object, what: str) -> str:
-    """A countOnDay key must be a plain 'YYYY-MM-DD' string."""
+def _day_key(value: object, what: str) -> str:
+    """A day key (countOnDay key, metric id) must be plain 'YYYY-MM-DD'."""
     if not isinstance(value, str):
         raise MutationError(f"{what}: date must be a 'YYYY-MM-DD' string")
     try:
@@ -1064,7 +1067,7 @@ def counter_log_time(
             f"counter log: {counter_id} is not a StopWatch counter "
             "(use counter_set / counter_inc)"
         )
-    date = _counter_day(date, "counter log")
+    date = _day_key(date, "counter log")
     if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
         raise MutationError("counter log: duration must be a non-negative integer (ms)")
 
@@ -1105,6 +1108,120 @@ def counter_order(d: dict, b: OpBuilder, counter_ids: list[str]) -> None:
     )
 
     reg["ids"] = list(counter_ids)
+
+
+# ---------------------------------------------------------------- metrics
+
+def _metric_reg(state: dict) -> dict:
+    reg = state.setdefault("metric", {"ids": [], "entities": {}})
+    reg.setdefault("ids", [])
+    reg.setdefault("entities", {})
+    return reg
+
+
+def _metric_int(value: object, field: str, lo: int, hi: int | None) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise MutationError(f"metric {field}: must be an integer")
+    if value < lo or (hi is not None and value > hi):
+        bounds = f"{lo}-{hi}" if hi is not None else f">= {lo}"
+        raise MutationError(f"metric {field}: must be {bounds} (got {value})")
+    return value
+
+
+def _metric_changes(changes: dict) -> dict:
+    """Validate a metric patch: known fields only, no resurrected dead ones."""
+    clean = copy.deepcopy(dict(changes))
+    clean.pop("id", None)  # the id is the day and is never patched
+    for field in clean:
+        if field in METRIC_DEAD_FIELDS:
+            raise MutationError(
+                f"metric {field}: this field no longer exists in "
+                "SuperProductivity and must never be written"
+            )
+        if field == "focusSessions":
+            raise MutationError(
+                "use metric_log_focus to add a focus session "
+                "(a patch would overwrite the whole array)"
+            )
+        if field not in METRIC_FIELDS:
+            raise MutationError(f"metric: unknown field '{field}'")
+    if clean.get("impactOfWork") is not None:
+        _metric_int(clean["impactOfWork"], "impactOfWork", 1, 4)
+    if clean.get("energyCheckin") is not None:
+        _metric_int(clean["energyCheckin"], "energyCheckin", 1, 3)
+    for field in ("totalWorkMinutes", "completedTasks", "plannedTasks"):
+        if clean.get(field) is not None:
+            _metric_int(clean[field], field, 0, None)
+    if "notes" in clean and not isinstance(clean["notes"], (str, type(None))):
+        raise MutationError("metric notes: must be a string")
+    if "remindTomorrow" in clean and not isinstance(clean["remindTomorrow"], bool):
+        raise MutationError("metric remindTomorrow: must be a boolean")
+    if "reflections" in clean:
+        reflections = clean["reflections"]
+        if not isinstance(reflections, list):
+            raise MutationError("metric reflections: must be an array")
+        for item in reflections:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                raise MutationError(
+                    "metric reflections: each entry needs a 'text' string"
+                )
+    return clean
+
+
+def metric_update(d: dict, b: OpBuilder, day: str, changes: dict) -> str:
+    """EU: a self-creating patch — SP upserts {id, ...DEFAULT, ...changes}
+    when the day has no metric yet, so the CLI mirrors that locally."""
+    state = _state(d)
+    reg = _metric_reg(state)
+    day = _day_key(day, "metric set")
+    changes = _metric_changes(changes)
+    if not changes:
+        return day
+
+    b.op(
+        "EU",
+        "UPD",
+        "METRIC",
+        day,
+        {"metric": {"id": day, "changes": copy.deepcopy(changes)}},
+    )
+
+    metric = reg["entities"].get(day)
+    if metric is None:
+        _reg_add(reg, make_metric(day, **changes))
+    else:
+        metric.update(copy.deepcopy(changes))
+    return day
+
+
+def metric_log_focus(d: dict, b: OpBuilder, day: str, duration: int) -> int:
+    """EL: an ADDITIVE focus session (ms) appended to the day's
+    focusSessions. Also self-creating; duration must be positive (SP's
+    reducer treats <= 0 as a no-op)."""
+    state = _state(d)
+    reg = _metric_reg(state)
+    day = _day_key(day, "metric focus")
+    if not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0:
+        raise MutationError("metric focus: duration must be a positive number (ms)")
+
+    b.op("EL", "UPD", "METRIC", day, {"day": day, "duration": duration})
+
+    metric = reg["entities"].get(day)
+    if metric is None:
+        metric = make_metric(day)
+        _reg_add(reg, metric)
+    sessions = metric.setdefault("focusSessions", [])
+    sessions.append(duration)
+    return len(sessions)
+
+
+def metric_delete(d: dict, b: OpBuilder, day: str) -> None:
+    state = _state(d)
+    reg = _metric_reg(state)
+    if day not in reg["entities"]:
+        raise MutationError(f"metric not found: {day}")
+    b.op("ED", "DEL", "METRIC", day, {"id": day})
+    _reg_remove(reg, day)
 
 
 # ---------------------------------------------------------------- archive

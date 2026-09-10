@@ -1,8 +1,10 @@
+import json
+
 import pytest
 
 from sp_cli import cli
 from sp_cli import queries as q
-from sp_cli.model import make_tag
+from sp_cli.model import make_tag, today_str
 
 
 class TestAddParentFlagRejection:
@@ -728,3 +730,118 @@ class TestReorderRetry:
         assert changes["taskIds"][:2] == [second, first]
         assert "F" * 21 in changes["taskIds"]
         assert project["taskIds"] == changes["taskIds"]
+
+
+class TestMetricSubcommandRewrite:
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["metric", "set", "--impact", "3"], "metric-set"),
+            (["metric", "focus", "25m"], "metric-focus"),
+            (["metric", "rm", "2026-01-01"], "metric-rm"),
+            (["metric"], "metrics"),
+            (["metric", "--json"], "metrics"),
+        ],
+    )
+    def test_rewritten(self, argv, expected):
+        assert cli._rewrite_argv(argv)[0] == expected
+
+    def test_metrics_is_not_rewritten(self):
+        assert cli._rewrite_argv(["metrics", "--json"]) == ["metrics", "--json"]
+
+
+class TestMetricCommands:
+    def _entities(self, d):
+        return d["state"]["metric"]["entities"]
+
+    def test_set_emits_eu_and_creates_the_day(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_metric_set(
+            _args(["metric", "set", "--day", "2026-01-01", "--impact", "4"])
+        )
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"], op["d"]) == ("EU", "METRIC", "2026-01-01")
+        assert op["p"]["actionPayload"]["metric"]["changes"] == {"impactOfWork": 4}
+        assert self._entities(sample)["2026-01-01"]["focusSessions"] == []
+        assert "2026-01-01" in capsys.readouterr().out
+
+    def test_set_defaults_to_today(self, fake_ctx, sample):
+        cli.cmd_metric_set(_args(["metric", "set", "--energy", "2"]))
+        assert fake_ctx.ops[-1]["d"] == today_str()
+
+    def test_set_without_flags_raises(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="nothing to change"):
+            cli.cmd_metric_set(_args(["metric", "set"]))
+
+    def test_remind_flags_conflict(self, fake_ctx):
+        args = _args(
+            ["metric", "set", "--remind-tomorrow", "--no-remind-tomorrow"]
+        )
+        with pytest.raises(cli.CliError, match="mutually exclusive"):
+            cli.cmd_metric_set(args)
+
+    def test_out_of_range_impact_exits_2(self, fake_ctx):
+        assert cli.main(["metric", "set", "--impact", "9"]) == 2
+        assert fake_ctx.ops == []
+
+    def test_empty_notes_clears(self, fake_ctx):
+        cli.cmd_metric_set(_args(["metric", "set", "--notes", ""]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["metric"]["changes"]
+        assert changes == {"notes": None}
+
+    def test_reflect_appends_to_existing(self, fake_ctx, sample):
+        day = "2026-01-01"
+        cli.cmd_metric_set(_args(["metric", "set", "--day", day, "--reflect", "one"]))
+        cli.cmd_metric_set(_args(["metric", "set", "--day", day, "--reflect", "two"]))
+        changes = fake_ctx.ops[-1]["p"]["actionPayload"]["metric"]["changes"]
+        assert [r["text"] for r in changes["reflections"]] == ["one", "two"]
+        assert all("created" in r for r in changes["reflections"])
+        assert len(self._entities(sample)[day]["reflections"]) == 2
+
+    def test_focus_emits_el_with_day_payload(self, fake_ctx, sample, capsys):
+        rc = cli.cmd_metric_focus(
+            _args(["metric", "focus", "25m", "--day", "2026-01-01"])
+        )
+        assert rc == 0
+        op = fake_ctx.ops[-1]
+        assert (op["a"], op["e"], op["d"]) == ("EL", "METRIC", "2026-01-01")
+        assert op["p"]["actionPayload"] == {"day": "2026-01-01", "duration": 1500000}
+        assert self._entities(sample)["2026-01-01"]["focusSessions"] == [1500000]
+        assert "total" in capsys.readouterr().out
+
+    def test_focus_zero_duration_raises(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="positive"):
+            cli.cmd_metric_focus(_args(["metric", "focus", "0m"]))
+
+    def test_rm_missing_day_raises(self, fake_ctx):
+        with pytest.raises(cli.CliError, match="no metric for"):
+            cli.cmd_metric_rm(_args(["metric", "rm", "2026-01-01"]))
+
+    def test_rm_abort_writes_nothing(self, fake_ctx, sample, monkeypatch, capsys):
+        cli.cmd_metric_set(_args(["metric", "set", "--day", "2026-01-01", "--impact", "1"]))
+        fake_ctx.ops.clear()
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert cli.cmd_metric_rm(_args(["metric", "rm", "2026-01-01"])) == 1
+        assert fake_ctx.ops == []
+        assert "aborted" in capsys.readouterr().err
+        assert "2026-01-01" in self._entities(sample)
+
+    def test_rm_yes_deletes(self, fake_ctx, sample):
+        cli.cmd_metric_set(_args(["metric", "set", "--day", "2026-01-01", "--impact", "1"]))
+        assert cli.cmd_metric_rm(_args(["metric", "rm", "2026-01-01", "--yes"])) == 0
+        assert fake_ctx.ops[-1]["a"] == "ED"
+        assert self._entities(sample) == {}
+
+    def test_metrics_range_and_json(self, fake_ctx, sample, capsys):
+        for day in ("2026-01-01", "2026-01-05"):
+            cli.cmd_metric_set(_args(["metric", "set", "--day", day, "--impact", "2"]))
+        capsys.readouterr()  # drop the `metric set` cards
+        cli.cmd_metrics(_args(["metrics", "--from", "2026-01-02", "--json"]))
+        out = json.loads(capsys.readouterr().out)
+        assert [m["id"] for m in out] == ["2026-01-05"]
+
+    def test_metrics_table_lists_focus(self, fake_ctx, capsys):
+        cli.cmd_metric_focus(_args(["metric", "focus", "25m", "--day", "2026-01-01"]))
+        cli.cmd_metrics(_args(["metrics"]))
+        out = capsys.readouterr().out
+        assert "2026-01-01" in out and "1x 25m" in out

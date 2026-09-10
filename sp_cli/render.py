@@ -215,6 +215,72 @@ def print_counters(counters: list[dict], values: list[int]) -> None:
     )
 
 
+_IMPACT_LABEL = {1: "1 low", 2: "2 some", 3: "3 good", 4: "4 high"}
+_ENERGY_LABEL = {1: "1 low", 2: "2 ok", 3: "3 high"}
+
+
+def _or_dash(value) -> str:
+    return "-" if value is None else str(value)
+
+
+def metric_rows(metrics: list[dict]) -> list[list[str]]:
+    rows = []
+    for m in metrics:
+        sessions = [int(s) for s in (m.get("focusSessions") or [])]
+        focus = (
+            f"{len(sessions)}x {format_duration(sum(sessions))}" if sessions else "-"
+        )
+        done = m.get("completedTasks")
+        planned = m.get("plannedTasks")
+        tasks = (
+            "-"
+            if done is None and planned is None
+            else f"{_or_dash(done)}/{_or_dash(planned)}"
+        )
+        reflections = len(m.get("reflections") or [])
+        rows.append(
+            [
+                m["id"],
+                _IMPACT_LABEL.get(m.get("impactOfWork"), "-"),
+                _ENERGY_LABEL.get(m.get("energyCheckin"), "-"),
+                focus,
+                tasks,
+                str(reflections) if reflections else "-",
+                truncate(first_line(m.get("notes")), TITLE_WIDTH) or "-",
+            ]
+        )
+    return rows
+
+
+def print_metrics(metrics: list[dict]) -> None:
+    print_table(
+        ["day", "impact", "energy", "focus", "done/plan", "refl", "notes"],
+        metric_rows(metrics),
+    )
+
+
+def metric_card(metric: dict) -> str:
+    sessions = [int(s) for s in (metric.get("focusSessions") or [])]
+    lines = [
+        f"day:       {metric['id']}",
+        f"impact:    {_IMPACT_LABEL.get(metric.get('impactOfWork'), '-')}",
+        f"energy:    {_ENERGY_LABEL.get(metric.get('energyCheckin'), '-')}",
+        f"focus:     {len(sessions)} session(s), {format_duration(sum(sessions))}",
+        f"done/plan: {_or_dash(metric.get('completedTasks'))}/"
+        f"{_or_dash(metric.get('plannedTasks'))}",
+        f"remind:    {'yes' if metric.get('remindTomorrow') else 'no'}",
+    ]
+    if metric.get("notes"):
+        lines.append("notes:")
+        for ln in metric["notes"].splitlines():
+            lines.append(f"  {ln}")
+    for reflection in metric.get("reflections") or []:
+        lines.append(f"reflection ({format_ts(reflection.get('created'))}):")
+        for ln in (reflection.get("text") or "").splitlines():
+            lines.append(f"  {ln}")
+    return "\n".join(lines)
+
+
 _DONE_STATE = {1: "", 2: "done", 3: "undone"}
 _SCHEDULED_STATE = {1: "", 2: "scheduled", 3: "not-scheduled"}
 _BACKLOG_STATE = {1: "", 2: "no-backlog", 3: "only-backlog"}

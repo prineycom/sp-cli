@@ -1424,3 +1424,162 @@ class TestSimpleCounters:
         for forbidden in ("SI", "SX", "SG", "SO", "SF", "SN", "SUS", "SDM", "SUA"):
             assert forbidden not in actions
         assert all(op["e"] == "SIMPLE_COUNTER" for op in b.ops)
+
+
+class TestMetrics:
+    """Metric id IS the day; EU is self-creating, EL is additive."""
+
+    def _reg(self, d):
+        return d["state"]["metric"]
+
+    def test_set_on_missing_day_creates_entity_with_defaults(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"impactOfWork": 3})
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "EU",
+            "UPD",
+            "METRIC",
+            "2026-09-09",
+        )
+        assert op["p"]["actionPayload"] == {
+            "metric": {"id": "2026-09-09", "changes": {"impactOfWork": 3}}
+        }
+        metric = self._reg(sample)["entities"]["2026-09-09"]
+        assert metric == {
+            "id": "2026-09-09",
+            "focusSessions": [],
+            "remindTomorrow": False,
+            "reflections": [],
+            "impactOfWork": 3,
+        }
+        assert self._reg(sample)["ids"] == ["2026-09-09"]
+        assert_doctor_clean(sample)
+
+    def test_set_on_existing_day_patches(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"impactOfWork": 3})
+        mut.metric_update(sample, b, "2026-09-09", {"energyCheckin": 2})
+        metric = self._reg(sample)["entities"]["2026-09-09"]
+        assert metric["impactOfWork"] == 3 and metric["energyCheckin"] == 2
+        assert self._reg(sample)["ids"] == ["2026-09-09"]  # not re-added
+        assert_doctor_clean(sample)
+
+    def test_empty_changes_emit_nothing(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {})
+        assert b.ops == []
+        assert self._reg(sample)["entities"] == {}
+
+    def test_id_in_changes_is_ignored(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"id": "nope", "notes": "x"})
+        changes = _last_op(b)["p"]["actionPayload"]["metric"]["changes"]
+        assert changes == {"notes": "x"}
+
+    def test_reflections_append_keeps_previous(self, sample, b):
+        mut.metric_update(
+            sample, b, "2026-09-09", {"reflections": [{"text": "a", "created": 1}]}
+        )
+        current = self._reg(sample)["entities"]["2026-09-09"]["reflections"]
+        mut.metric_update(
+            sample,
+            b,
+            "2026-09-09",
+            {"reflections": list(current) + [{"text": "b", "created": 2}]},
+        )
+        texts = [
+            r["text"] for r in self._reg(sample)["entities"]["2026-09-09"]["reflections"]
+        ]
+        assert texts == ["a", "b"]
+        assert_doctor_clean(sample)
+
+    @pytest.mark.parametrize(
+        "field", ["mood", "productivity", "obstructions", "improvements"]
+    )
+    def test_dead_fields_rejected(self, sample, b, field):
+        with pytest.raises(mut.MutationError, match="no longer exists"):
+            mut.metric_update(sample, b, "2026-09-09", {field: 5})
+        assert b.ops == []
+
+    def test_unknown_field_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="unknown field"):
+            mut.metric_update(sample, b, "2026-09-09", {"whatever": 1})
+
+    def test_focus_sessions_cannot_be_patched(self, sample, b):
+        with pytest.raises(mut.MutationError, match="metric_log_focus"):
+            mut.metric_update(sample, b, "2026-09-09", {"focusSessions": [1000]})
+
+    @pytest.mark.parametrize(
+        "changes,match",
+        [
+            ({"impactOfWork": 0}, "1-4"),
+            ({"impactOfWork": 5}, "1-4"),
+            ({"energyCheckin": 4}, "1-3"),
+            ({"completedTasks": -1}, ">= 0"),
+            ({"notes": 5}, "notes"),
+            ({"remindTomorrow": "yes"}, "boolean"),
+            ({"reflections": "hi"}, "array"),
+            ({"reflections": [{"created": 1}]}, "text"),
+        ],
+    )
+    def test_invalid_values_rejected(self, sample, b, changes, match):
+        with pytest.raises(mut.MutationError, match=match):
+            mut.metric_update(sample, b, "2026-09-09", changes)
+        assert b.ops == []
+
+    def test_null_ratings_allowed(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"impactOfWork": None})
+        assert self._reg(sample)["entities"]["2026-09-09"]["impactOfWork"] is None
+
+    @pytest.mark.parametrize("day", ["2026-9-9", "09-09-2026", "today", ""])
+    def test_invalid_day_rejected(self, sample, b, day):
+        with pytest.raises(mut.MutationError, match="metric set"):
+            mut.metric_update(sample, b, day, {"impactOfWork": 1})
+
+    def test_focus_appends_and_self_creates(self, sample, b):
+        assert mut.metric_log_focus(sample, b, "2026-09-09", 1500000) == 1
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "EL",
+            "UPD",
+            "METRIC",
+            "2026-09-09",
+        )
+        assert op["p"]["actionPayload"] == {"day": "2026-09-09", "duration": 1500000}
+        assert mut.metric_log_focus(sample, b, "2026-09-09", 600000) == 2
+        metric = self._reg(sample)["entities"]["2026-09-09"]
+        assert metric["focusSessions"] == [1500000, 600000]
+        assert self._reg(sample)["ids"] == ["2026-09-09"]
+        assert_doctor_clean(sample)
+
+    @pytest.mark.parametrize("duration", [0, -1, 1.5, True])
+    def test_focus_non_positive_rejected(self, sample, b, duration):
+        with pytest.raises(mut.MutationError, match="positive"):
+            mut.metric_log_focus(sample, b, "2026-09-09", duration)
+        assert b.ops == []
+
+    def test_delete(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"impactOfWork": 2})
+        mut.metric_delete(sample, b, "2026-09-09")
+        op = _last_op(b)
+        assert (op["a"], op["o"], op["e"], op["d"]) == (
+            "ED",
+            "DEL",
+            "METRIC",
+            "2026-09-09",
+        )
+        assert op["p"]["actionPayload"] == {"id": "2026-09-09"}
+        assert self._reg(sample)["ids"] == []
+        assert self._reg(sample)["entities"] == {}
+        assert_doctor_clean(sample)
+
+    def test_delete_missing_day_rejected(self, sample, b):
+        with pytest.raises(mut.MutationError, match="not found"):
+            mut.metric_delete(sample, b, "2026-09-09")
+
+    def test_only_safe_actions_are_emitted(self, sample, b):
+        mut.metric_update(sample, b, "2026-09-09", {"impactOfWork": 4})
+        mut.metric_log_focus(sample, b, "2026-09-09", 1000)
+        mut.metric_delete(sample, b, "2026-09-09")
+        actions = [op["a"] for op in b.ops]
+        assert actions == ["EU", "EL", "ED"]
+        # EX is a FULL REPLACE (a partial payload wipes fields) — never emitted.
+        assert "EX" not in actions and "EA" not in actions
+        assert all(op["e"] == "METRIC" for op in b.ops)

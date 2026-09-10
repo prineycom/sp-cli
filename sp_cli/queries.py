@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 
 from sp_cli.model import (
+    METRIC_DEAD_FIELDS,
     PANEL_SORT_BY,
     SIMPLE_COUNTER_TYPES,
     TODAY_TAG_ID,
@@ -299,6 +300,32 @@ def counter_value(counter: dict, date: str | None = None) -> int:
     return int((counter.get("countOnDay") or {}).get(date, 0))
 
 
+# ---------------------------------------------------------------- metrics
+
+def all_metrics(d: dict) -> list[dict]:
+    """Every day's metric, oldest day first (the id IS the day)."""
+    reg = d["state"].get("metric") or {}
+    entities = reg.get("entities") or {}
+    return [entities[mid] for mid in sorted(entities)]
+
+
+def list_metrics(
+    d: dict, day_from: str | None = None, day_to: str | None = None
+) -> list[dict]:
+    metrics = all_metrics(d)
+    if day_from:
+        metrics = [m for m in metrics if m["id"] >= day_from]
+    if day_to:
+        metrics = [m for m in metrics if m["id"] <= day_to]
+    return metrics
+
+
+def focus_sessions(metric: dict) -> tuple[int, int]:
+    """(count, total ms) of the day's focus sessions."""
+    sessions = [int(s) for s in (metric.get("focusSessions") or [])]
+    return len(sessions), sum(sessions)
+
+
 def agenda(d: dict) -> dict:
     today_s = today_str()
     now = int(datetime.datetime.now().timestamp() * 1000)
@@ -389,7 +416,15 @@ def doctor(d: dict) -> list[str]:
     problems: list[str] = []
     state = d["state"]
 
-    for name in ("task", "project", "tag", "taskRepeatCfg", "note", "simpleCounter"):
+    for name in (
+        "task",
+        "project",
+        "tag",
+        "taskRepeatCfg",
+        "note",
+        "simpleCounter",
+        "metric",
+    ):
         reg = state.get(name)
         if not reg:
             continue
@@ -488,6 +523,22 @@ def doctor(d: dict) -> list[str]:
                 problems.append(f"project {pid}: noteIds references missing note {nid}")
             elif notes[nid].get("projectId") != pid:
                 problems.append(f"project {pid}: note {nid} projectId mismatch")
+
+    for day, metric in ((m["id"], m) for m in all_metrics(d)):
+        try:
+            valid_day = datetime.date.fromisoformat(day).isoformat() == day
+        except ValueError:
+            valid_day = False
+        if not valid_day:
+            problems.append(f"metric {day}: id must be a 'YYYY-MM-DD' day")
+        sessions = metric.get("focusSessions")
+        if sessions is not None and not isinstance(sessions, list):
+            problems.append(f"metric {day}: focusSessions must be an array")
+        for dead in METRIC_DEAD_FIELDS:
+            if dead in metric:
+                problems.append(
+                    f"metric {day}: leftover field '{dead}' (removed from SP)"
+                )
 
     board_ids: set[str] = set()
     panel_ids: set[str] = set()

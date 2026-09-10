@@ -24,6 +24,7 @@ from sp_cli.model import (
     make_board,
     make_note,
     make_panel,
+    make_reflection,
     make_project,
     make_simple_counter,
     make_tag,
@@ -1294,6 +1295,100 @@ def cmd_counter_order(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- metrics
+
+def cmd_metrics(args) -> int:
+    client, _ = _ctx()
+    d = client.get()
+    day_from = _parse_day(getattr(args, "from")) if getattr(args, "from") else None
+    day_to = _parse_day(args.to) if args.to else None
+    metrics = q.list_metrics(d, day_from, day_to)
+    if args.json:
+        render.print_json(metrics)
+        return 0
+    render.print_metrics(metrics)
+    return 0
+
+
+def cmd_metric_set(args) -> int:
+    if args.remind_tomorrow and args.no_remind_tomorrow:
+        raise CliError(
+            "metric set: --remind-tomorrow and --no-remind-tomorrow are "
+            "mutually exclusive"
+        )
+    base: dict = {}
+    if args.impact is not None:
+        base["impactOfWork"] = args.impact
+    if args.energy is not None:
+        base["energyCheckin"] = args.energy
+    if args.notes is not None:
+        base["notes"] = args.notes or None
+    if args.completed is not None:
+        base["completedTasks"] = args.completed
+    if args.planned is not None:
+        base["plannedTasks"] = args.planned
+    if args.remind_tomorrow:
+        base["remindTomorrow"] = True
+    if args.no_remind_tomorrow:
+        base["remindTomorrow"] = False
+    if not base and not args.reflect:
+        raise CliError("metric set: nothing to change")
+
+    day = _parse_day(args.day) if args.day else today_str()
+    client, store = _ctx()
+    d = client.get()
+
+    def _set(dd, b):
+        changes = dict(base)
+        if args.reflect:
+            # Reflections are a whole-array field: read the CURRENT array from
+            # the fresh state so a 412 retry still appends instead of dropping.
+            reg = (dd["state"].get("metric") or {}).get("entities") or {}
+            current = (reg.get(day) or {}).get("reflections") or []
+            changes["reflections"] = list(current) + [make_reflection(args.reflect)]
+        mut.metric_update(dd, b, day, changes)
+
+    result = store.commit([_set], initial=d)
+    metric = result["state"]["metric"]["entities"][day]
+    print(render.metric_card(metric))
+    return 0
+
+
+def cmd_metric_focus(args) -> int:
+    ms = render.parse_duration(args.duration)
+    if ms <= 0:
+        raise CliError("metric focus: duration must be positive")
+    day = _parse_day(args.day) if args.day else today_str()
+    client, store = _ctx()
+    d = client.get()
+    count: list[int] = []
+
+    def _log(dd, b):
+        count.append(mut.metric_log_focus(dd, b, day, ms))
+
+    result = store.commit([_log], initial=d)
+    _, total = q.focus_sessions(result["state"]["metric"]["entities"][day])
+    print(
+        f"{day}: focus session {render.format_duration(ms)} "
+        f"(#{count[0]}, total {render.format_duration(total)})"
+    )
+    return 0
+
+
+def cmd_metric_rm(args) -> int:
+    day = _parse_day(args.day)
+    client, store = _ctx()
+    d = client.get()
+    if day not in ((d["state"].get("metric") or {}).get("entities") or {}):
+        raise CliError(f"no metric for {day}")
+    if not _confirm(f"delete the metric for {day}?", args.yes):
+        print("aborted", file=sys.stderr)
+        return 1
+    store.commit([lambda dd, b: mut.metric_delete(dd, b, day)], initial=d)
+    print(f"deleted {day}")
+    return 0
+
+
 def cmd_archive(args) -> int:
     client, store = _ctx()
     d = client.get()
@@ -1387,6 +1482,9 @@ _SUBCOMMAND_REWRITES = {
     ("counter", "inc"): "counter-inc",
     ("counter", "log"): "counter-log",
     ("counter", "order"): "counter-order",
+    ("metric", "set"): "metric-set",
+    ("metric", "focus"): "metric-focus",
+    ("metric", "rm"): "metric-rm",
 }
 
 _SUBCOMMAND_REWRITES_3 = {
@@ -1408,6 +1506,9 @@ def _rewrite_argv(argv: list[str]) -> list[str]:
     # bare `sp counter [--flags]` == `sp counters`
     if argv[:1] == ["counter"] and (len(argv) == 1 or argv[1].startswith("-")):
         return ["counters"] + argv[1:]
+    # bare `sp metric [--flags]` == `sp metrics`
+    if argv[:1] == ["metric"] and (len(argv) == 1 or argv[1].startswith("-")):
+        return ["metrics"] + argv[1:]
     return argv
 
 
@@ -1703,6 +1804,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="YYYY-MM-DD (default today)")
     s = add("counter-order", cmd_counter_order, "reorder counters (listed first)")
     s.add_argument("ids", nargs="+")
+
+    s = add("metrics", cmd_metrics, "daily metrics / day rating")
+    s.add_argument("--from", dest="from", help="YYYY-MM-DD | today | +N")
+    s.add_argument("--to", help="YYYY-MM-DD | today | +N")
+    s.add_argument("--json", action="store_true")
+    s = add("metric-set", cmd_metric_set, "rate a day")
+    s.add_argument("--day", help="YYYY-MM-DD | today | +N (default today)")
+    s.add_argument("--impact", type=int, help="impact of work, 1-4")
+    s.add_argument("--energy", type=int, help="energy check-in, 1-3")
+    s.add_argument("--notes", help="day notes (empty string clears)")
+    s.add_argument("--reflect", help="append a reflection")
+    s.add_argument("--remind-tomorrow", action="store_true")
+    s.add_argument("--no-remind-tomorrow", action="store_true")
+    s.add_argument("--completed", type=int, help="completed task count")
+    s.add_argument("--planned", type=int, help="planned task count")
+    s = add("metric-focus", cmd_metric_focus, "log a focus session")
+    s.add_argument("duration", help="e.g. 25m, 1.5h")
+    s.add_argument("--day", help="YYYY-MM-DD (default today)")
+    s = add("metric-rm", cmd_metric_rm, "delete a day's metric")
+    s.add_argument("day")
+    s.add_argument("--yes", action="store_true")
 
     s = add("archive", cmd_archive, "archive done tasks")
     s.add_argument("--yes", action="store_true")

@@ -513,3 +513,59 @@ class TestCounters:
     def test_doctor_detects_registry_desync(self, sample):
         sample["state"]["simpleCounter"]["ids"].remove("COFFEE_COUNTER")
         assert any("COFFEE_COUNTER" in p for p in q.doctor(sample))
+
+
+def _add_metric(d, day, **fields):
+    metric = {
+        "id": day,
+        "focusSessions": [],
+        "remindTomorrow": False,
+        "reflections": [],
+        **fields,
+    }
+    reg = d["state"].setdefault("metric", {"ids": [], "entities": {}})
+    reg["ids"].append(day)
+    reg["entities"][day] = metric
+    return metric
+
+
+class TestMetricsQueries:
+    def test_all_metrics_sorted_by_day(self, sample):
+        _add_metric(sample, "2026-09-09")
+        _add_metric(sample, "2026-01-02")
+        assert [m["id"] for m in q.all_metrics(sample)] == [
+            "2026-01-02",
+            "2026-09-09",
+        ]
+
+    def test_missing_slice_is_empty(self, sample):
+        sample["state"].pop("metric", None)
+        assert q.all_metrics(sample) == []
+
+    def test_range_filter_is_inclusive(self, sample):
+        for day in ("2026-01-01", "2026-01-02", "2026-01-03"):
+            _add_metric(sample, day)
+        days = [m["id"] for m in q.list_metrics(sample, "2026-01-02", "2026-01-03")]
+        assert days == ["2026-01-02", "2026-01-03"]
+
+    def test_focus_sessions_count_and_total(self, sample):
+        metric = _add_metric(sample, "2026-01-01", focusSessions=[1000, 2000])
+        assert q.focus_sessions(metric) == (2, 3000)
+        assert q.focus_sessions(_add_metric(sample, "2026-01-02")) == (0, 0)
+
+    def test_doctor_flags_bad_day_id(self, sample):
+        _add_metric(sample, "not-a-day")
+        assert any("must be a 'YYYY-MM-DD' day" in p for p in q.doctor(sample))
+
+    def test_doctor_flags_ids_entities_desync(self, sample):
+        _add_metric(sample, "2026-01-01")
+        sample["state"]["metric"]["ids"] = []
+        assert any("not listed in ids" in p for p in q.doctor(sample))
+
+    def test_doctor_flags_removed_fields(self, sample):
+        _add_metric(sample, "2026-01-01", mood=5)
+        assert any("leftover field 'mood'" in p for p in q.doctor(sample))
+
+    def test_doctor_clean_on_good_metric(self, sample):
+        _add_metric(sample, "2026-01-01", impactOfWork=3, focusSessions=[1000])
+        assert q.doctor(sample) == []

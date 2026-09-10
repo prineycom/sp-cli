@@ -349,6 +349,53 @@ def make_repeat_cfg(
     return cfg
 
 
+# ---------------------------------------------------------------- metrics
+
+# DEFAULT_METRIC_FOR_DAY as SP builds it. The metric's id IS the day
+# ('YYYY-MM-DD'). mood / productivity / obstruction / improvement no longer
+# exist in SuperProductivity and must never be written.
+DEFAULT_METRIC = {
+    "focusSessions": [],
+    "remindTomorrow": False,
+    "reflections": [],
+}
+
+# Fields the CLI is allowed to write via a metric patch.
+METRIC_FIELDS = (
+    "impactOfWork",
+    "energyCheckin",
+    "notes",
+    "remindTomorrow",
+    "reflections",
+    "totalWorkMinutes",
+    "completedTasks",
+    "plannedTasks",
+)
+
+# Removed from SP; writing them resurrects dead fields in everyone's file.
+METRIC_DEAD_FIELDS = (
+    "mood",
+    "productivity",
+    "obstructions",
+    "improvements",
+    "improvementsTomorrow",
+    "obstruction",
+    "improvement",
+)
+
+
+def make_metric(day: str, **changes) -> dict:
+    """A Metric for `day` shaped like DEFAULT_METRIC_FOR_DAY + changes."""
+    metric = {"id": day}
+    metric.update(copy.deepcopy(DEFAULT_METRIC))
+    metric.update(copy.deepcopy(changes))
+    return metric
+
+
+def make_reflection(text: str, created: int | None = None) -> dict:
+    return {"text": text, "created": created if created is not None else now_ms()}
+
+
 # ---------------------------------------------------------------- counters
 
 # SimpleCounterType values as stored in the sync file.
