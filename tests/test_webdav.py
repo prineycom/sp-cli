@@ -282,3 +282,10 @@ class TestExplicitBackups:
         for _ in range(12):
             client.save_backup()
         assert len(list((tmp_path / "backups").glob("sync-data-*.json"))) == 10
+
+    def test_constructor_backup_keep_honored(self, tmp_path):
+        client, _ = self._client_with_state(tmp_path)
+        client.backup_keep = 2
+        for _ in range(5):
+            client.save_backup()
+        assert len(list((tmp_path / "backups").glob("sync-data-*.json"))) == 2

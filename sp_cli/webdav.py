@@ -53,11 +53,13 @@ class SyncFileClient:
         password: str,
         backup_dir: str,
         session: requests.Session | None = None,
+        backup_keep: int = BACKUP_KEEP,
     ):
         self.session = session or requests.Session()
         self.session.auth = (user, password)
         self.file_url = f"{url.rstrip('/')}/{folder.strip('/')}/sync-data.json"
         self.backup_dir = Path(backup_dir)
+        self.backup_keep = backup_keep
         self.etag: str | None = None
         self.original_bytes: bytes | None = None
 
@@ -113,7 +115,8 @@ class SyncFileClient:
         """Write a backup of the last downloaded bytes; returns the path.
 
         directory defaults to the configured backup_dir; keep is the rotation
-        count for that directory (default BACKUP_KEEP, 0 = keep everything).
+        count for that directory (default: the client's backup_keep,
+        0 = keep everything).
         """
         return self._write_backup(directory, keep)
 
@@ -123,7 +126,7 @@ class SyncFileClient:
         if self.original_bytes is None:
             return None
         target = Path(directory) if directory is not None else self.backup_dir
-        keep = BACKUP_KEEP if keep is None else keep
+        keep = self.backup_keep if keep is None else keep
         target.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         path = target / f"sync-data-{stamp}.json"

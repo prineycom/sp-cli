@@ -67,7 +67,8 @@ _ATTACH_TYPES = {"link": "LINK", "img": "IMG", "file": "FILE"}
 def _ctx() -> tuple[SyncFileClient, SyncStore]:
     cfg = load_config()
     client = SyncFileClient(
-        cfg.url, cfg.folder, cfg.user, cfg.password, cfg.backup_dir
+        cfg.url, cfg.folder, cfg.user, cfg.password, cfg.backup_dir,
+        backup_keep=cfg.backup_keep,
     )
     return client, SyncStore(client, cfg.client_id)
 
@@ -2702,13 +2703,25 @@ def cmd_doctor(args) -> int:
     return 1
 
 
+def _resolve_backup_target(
+    cfg, cli_dir: str | None, cli_keep: int | None
+) -> tuple[str | None, int | None]:
+    """Flags beat config: --dir > manual_backup_dir, --keep > manual_backup_keep.
+
+    (None, None) means the client's own backup_dir/backup_keep."""
+    directory = os.path.expanduser(cli_dir) if cli_dir else cfg.manual_backup_dir
+    keep = cli_keep if cli_keep is not None else cfg.manual_backup_keep
+    return directory, keep
+
+
 def cmd_backup(args) -> int:
     if args.keep is not None and args.keep < 0:
         raise CliError("--keep must be >= 0 (0 keeps everything)")
+    cfg = load_config()
     client, _ = _ctx()
     client.get()
-    directory = os.path.expanduser(args.dir) if args.dir else None
-    path = client.save_backup(directory, args.keep)
+    directory, keep = _resolve_backup_target(cfg, args.dir, args.keep)
+    path = client.save_backup(directory, keep)
     print(f"backup written to {path}")
     return 0
 

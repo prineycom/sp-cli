@@ -71,7 +71,16 @@ The config is written to `~/.config/sp-cli/config.toml` (override with the `SP_C
 | `password` / `password_file` | one of the two | password, or path to a file containing it |
 | `client_id` | yes | generated once by `init`; a repeated `init` keeps it |
 | `folder` | no | folder on the server (default `superproductivity`) |
-| `backup_dir` | no | where backups go (default `~/.local/share/sp-cli/backups`) |
+| `backup_dir` | no | where automatic pre-write backups go (default `~/.local/share/sp-cli/backups`) |
+| `backup_keep` | no | rotation for automatic backups (default `10`; `0` keeps everything) |
+| `manual_backup_dir` | no | default `--dir` for `sp backup` (scheduled/manual backups) |
+| `manual_backup_keep` | no | default `--keep` for `sp backup` |
+| `mcp_read_only` | no | `true` = sp-mcp exposes only read-only tools (a `--read-only` flag can't override it back) |
+| `mcp_include` | no | list of command globs sp-mcp exposes (e.g. `["list", "today*"]`) |
+| `mcp_exclude` | no | list of command globs sp-mcp hides (e.g. `["provider*", "init"]`) |
+
+CLI flags beat config values (`sp backup --dir/--keep`, `sp-mcp --include/--exclude`);
+a repeated `sp init` rewrites the connection keys but preserves everything else.
 
 `init` flags: `--url`, `--user`, `--password`, `--password-file`, `--folder`, `--backup-dir`.
 
@@ -427,9 +436,9 @@ Subtask time is rolled up to the parent: `track`/`untrack` recompute the parent 
 Two independent layers:
 
 - **Automatic** — before every write, the just-downloaded file is saved to the
-  config `backup_dir` (default `~/.local/share/sp-cli/backups`, the newest 10
-  are kept). This protects against a bad write, not against data loss over
-  time — ten writes later the old state is gone.
+  config `backup_dir` (default `~/.local/share/sp-cli/backups`; rotation
+  `backup_keep`, default 10). This protects against a bad write, not against
+  data loss over time — `backup_keep` writes later the old state is gone.
 - **Explicit** — `sp backup` downloads the current file and stores it:
 
   ```sh
@@ -438,9 +447,18 @@ Two independent layers:
   ./sp backup --dir ~/sp-backups --keep 0    # keep everything
   ```
 
-  For scheduled backups always pass `--dir` pointing **outside** the config
-  `backup_dir`: write operations rotate that directory down to 10 files, so
-  scheduled backups stored there would be evicted within a few writes.
+  For scheduled backups always use a directory **outside** the config
+  `backup_dir`: write operations rotate that directory down to `backup_keep`
+  files, so scheduled backups stored there would be evicted within a few
+  writes. Instead of flags you can set the defaults once in the config —
+
+  ```toml
+  manual_backup_dir = "~/sp-backups"
+  manual_backup_keep = 31
+  ```
+
+  — after which a plain `sp backup` (and the cron line below) needs no
+  arguments.
 
 ### Scheduled backups with cron
 

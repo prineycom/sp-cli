@@ -314,3 +314,47 @@ class TestReadOnlyMode:
         server = SpMcpServer(read_only=True, exclude=["worklog"])
         names = {t["name"] for t in server.tools}
         assert "sp_worklog" not in names and "sp_list" in names
+
+
+class TestResolveFilters:
+    class Cfg:
+        mcp_include = ["today*"]
+        mcp_exclude = ["provider*"]
+        mcp_read_only = True
+
+    def test_config_used_when_no_flags(self):
+        inc, exc, ro = mcp.resolve_filters(self.Cfg(), None, None, False)
+        assert (inc, exc, ro) == (["today*"], ["provider*"], True)
+
+    def test_flags_beat_config(self):
+        inc, exc, ro = mcp.resolve_filters(self.Cfg(), ["list"], ["board*"], False)
+        assert inc == ["list"] and exc == ["board*"]
+        assert ro is True  # config read_only cannot be un-set by a flag
+
+    def test_no_config(self):
+        assert mcp.resolve_filters(None, None, None, False) == (None, None, False)
+
+
+class TestResolveBackupTarget:
+    class Cfg:
+        manual_backup_dir = "/cfg/dir"
+        manual_backup_keep = 31
+
+    class EmptyCfg:
+        manual_backup_dir = None
+        manual_backup_keep = None
+
+    def test_flags_beat_config(self):
+        d, k = cli._resolve_backup_target(self.Cfg(), "/cli/dir", 5)
+        assert (d, k) == ("/cli/dir", 5)
+
+    def test_config_when_no_flags(self):
+        d, k = cli._resolve_backup_target(self.Cfg(), None, None)
+        assert (d, k) == ("/cfg/dir", 31)
+
+    def test_zero_keep_flag_wins_over_config(self):
+        _, k = cli._resolve_backup_target(self.Cfg(), None, 0)
+        assert k == 0
+
+    def test_all_defaults(self):
+        assert cli._resolve_backup_target(self.EmptyCfg(), None, None) == (None, None)

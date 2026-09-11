@@ -22,6 +22,7 @@ import json
 import sys
 
 from sp_cli import __version__, cli
+from sp_cli.config import ConfigError, load_config
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -372,6 +373,17 @@ class SpMcpServer:
         return 0
 
 
+def resolve_filters(
+    cfg, include: list[str] | None, exclude: list[str] | None, read_only: bool
+) -> tuple[list[str] | None, list[str] | None, bool]:
+    """CLI flags beat the config; mcp_read_only=true cannot be disabled by a flag."""
+    if cfg is not None:
+        include = include or cfg.mcp_include
+        exclude = exclude or cfg.mcp_exclude
+        read_only = read_only or cfg.mcp_read_only
+    return include, exclude, read_only
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="sp-mcp", description="MCP stdio server for sp-cli"
@@ -400,9 +412,14 @@ def main(argv: list[str] | None = None) -> int:
         help="print the generated tool names and exit",
     )
     args = p.parse_args(argv)
-    server = SpMcpServer(
-        include=args.include, exclude=args.exclude, read_only=args.read_only
+    try:
+        cfg = load_config()
+    except ConfigError:
+        cfg = None  # no/partial config: tools still list; calls will explain
+    include, exclude, read_only = resolve_filters(
+        cfg, args.include, args.exclude, args.read_only
     )
+    server = SpMcpServer(include=include, exclude=exclude, read_only=read_only)
     if args.list_tools:
         for tool in server.tools:
             print(f"{tool['name']}\t{tool['description']}")

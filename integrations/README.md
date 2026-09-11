@@ -131,6 +131,15 @@ sp-mcp --include 'list' --include 'show' --include 'add' --include 'today*'
 sp-mcp --list-tools        # inspect the resulting set without starting the server
 ```
 
+The same filters can live in `~/.config/sp-cli/config.toml`, which is handy
+when the agent's config format makes passing arguments awkward:
+
+```toml
+mcp_read_only = true                    # cannot be overridden by flags
+mcp_include = ["list", "show", "today*"]
+mcp_exclude = ["provider*", "init"]     # flags override include/exclude
+```
+
 **Choose the tool set for the trust level of the agent.** Destructive tools
 require `yes=true`, but a model can and will pass it on its own — a
 confirmation parameter is a speed bump, not a permission system. Field note:

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Config keys for backup rotation and MCP tool filtering: `backup_keep`
+  (automatic pre-write rotation), `manual_backup_dir`/`manual_backup_keep`
+  (defaults for `sp backup`), `mcp_read_only`/`mcp_include`/`mcp_exclude`
+  (sp-mcp tool set without command-line flags). CLI flags take precedence;
+  a repeated `sp init` now preserves keys it does not manage.
 - `sp-mcp --read-only`: expose only read-only tools — recommended for
   autonomous or untrusted agents (a `yes=true` confirmation parameter is not a
   permission system; a model will happily pass it).
