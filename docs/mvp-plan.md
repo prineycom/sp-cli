@@ -1,76 +1,78 @@
-# MVP Plan — sp-cli (v2, согласовано с Пашей)
+*Historical planning document (translated from Russian).*
 
-**Цель:** CLI с **полным покрытием работы с задачами и планами на день** — read + write + sync-слой в первом этапе. Никакого «сначала read-only, потом write».
+# MVP Plan — sp-cli (v2, agreed with the maintainer)
 
-## Принципы
+**Goal:** a CLI with **full coverage of tasks and day planning** — read + write + sync layer in the first stage. No "read-only first, write later".
+
+## Principles
 
 - Python 3, stdlib + `requests` (WebDAV = GET/PUT).
-- Конфиг: `~/.config/sp-cli/config.toml` (WebDAV URL, юзер, путь к паролю, clientId CLI).
-- Бэкап перед каждым PUT: `~/.local/share/sp-cli/backups/sync-data-<ts>.json` (ротация: последние 10).
-- Отдельный clientId CLI (не как у телефона) — обязателен с первой write-операции.
-- Тесты: unit на мутациях (in-memory), integration на копии файла, финальная проверка на живом WebDAV + телефон.
+- Config: `~/.config/sp-cli/config.toml` (WebDAV URL, user, path to the password, CLI clientId).
+- Backup before every PUT: `~/.local/share/sp-cli/backups/sync-data-<ts>.json` (rotation: last 10).
+- A dedicated CLI clientId (distinct from the phone's) — mandatory from the very first write operation.
+- Tests: unit tests on mutations (in-memory), integration tests on a copy of the file, final check against the live WebDAV + phone.
 
-## Этап 1 — Задачи + планы на день (полное покрытие)
+## Stage 1 — Tasks + day plans (full coverage)
 
-### 1a. Ядро данных + sync-слой (~2-3 чч)
-- `SyncClient`: GET/PUT sync-data.json, strip/re-add `pf_2__`, бэкапы, schemaVersion-чек
-- `recentOps` append, `vectorClock` инкремент своего clientId, `lastModified`
-- Retry при конфликте (перечитать → повторить мутацию, max 3)
+### 1a. Data core + sync layer (~2-3 h)
+- `SyncClient`: GET/PUT sync-data.json, strip/re-add `pf_2__`, backups, schemaVersion check
+- `recentOps` append, `vectorClock` increment of our clientId, `lastModified`
+- Retry on conflict (re-read → replay the mutation, max 3)
 
-### 1b. Задачи — read (~1 чч)
-- `sp list` — фильтры: `--project`, `--tag`, `--overdue`, `--today`, `--unscheduled`, `--search`, `--done`, `--parents-only`, `--json`
-- `sp show <id>` — полная карточка задачи (включая подзадачи, время, заметки)
+### 1b. Tasks — read (~1 h)
+- `sp list` — filters: `--project`, `--tag`, `--overdue`, `--today`, `--unscheduled`, `--search`, `--done`, `--parents-only`, `--json`
+- `sp show <id>` — full task card (including subtasks, time, notes)
 
-### 1c. Задачи — write (~3-4 чч)
-- `sp add "тайтл" [--project X --tag Y --due 2026-08-10 --est 30m --notes "..."]` (парсер длительности: 30m/1h/1.5h)
+### 1c. Tasks — write (~3-4 h)
+- `sp add "title" [--project X --tag Y --due 2026-08-10 --est 30m --notes "..."]` (duration parser: 30m/1h/1.5h)
 - `sp edit <id> [--title --notes --due --est --project --tags]`
 - `sp complete <id>` / `sp reopen <id>` (doneOn + timestamp)
-- `sp delete <id>` — каскад на подзадачи
-- `sp subtask <parent-id> "тайтл"` — подзадача
-- `sp move <id> --project X` — перенос между проектами
-- `sp tag <id> --add X --remove Y` — точечное управление тегами
-- `sp reorder --project X <id1> <id2> ...` — порядок в проекте
+- `sp delete <id>` — cascades to subtasks
+- `sp subtask <parent-id> "title"` — subtask
+- `sp move <id> --project X` — move between projects
+- `sp tag <id> --add X --remove Y` — fine-grained tag management
+- `sp reorder --project X <id1> <id2> ...` — ordering within a project
 
-### 1d. Планы на день (~1-2 чч)
-- `sp today` — что в Today-виде сейчас (тег `TODAY` в `tagIds`)
+### 1d. Day plans (~1-2 h)
+- `sp today` — what is in the Today view right now (the `TODAY` tag in `tagIds`)
 - `sp today add <id...>` / `sp today remove <id...>`
-- `sp agenda` — Today + дедлайны на сегодня + просроченные (утренний обзор одним вызовом)
+- `sp agenda` — Today + deadlines due today + overdue (a morning review in a single call)
 
-**DoD этапа 1:** полный жизненный цикл задачи из CLI — create → plan → edit → complete; всё отражается на телефоне после синка без конфликтов. Проверка на живом WebDAV + телефон вручную.
+**Stage 1 DoD:** the full task lifecycle from the CLI — create → plan → edit → complete; everything shows up on the phone after sync without conflicts. Verified manually against the live WebDAV + phone.
 
-## Этап 2 — Проекты и теги (CRUD, ~1 чч)
+## Stage 2 — Projects and tags (CRUD, ~1 h)
 
-- `sp projects` / `sp project add "Имя" [--color]` / `sp project edit <id>` / `sp project archive <id>`
+- `sp projects` / `sp project add "Name" [--color]` / `sp project edit <id>` / `sp project archive <id>`
 - `sp tags` / `sp tag add` / `sp tag edit`
 
-## Этап 3 — Worklog и отчёты (~1 чч)
+## Stage 3 — Worklog and reports (~1 h)
 
-- `sp worklog --from --to` — время по дням/проектам/тегам, точность оценок
-- `sp show <id>` уже показывает timeSpent/timeEstimate
+- `sp worklog --from --to` — time by day/project/tag, estimate accuracy
+- `sp show <id>` already shows timeSpent/timeEstimate
 
-## Этап 4 — Интеграция с Hermes (~1-2 чч)
+## Stage 4 — Hermes integration (~1-2 h)
 
-- Скилл `sp-cli`: команды, gotchas, fallback
-- Опционально cron: утренний `sp agenda`-дайджест (замена убитого Vikunja-дайджеста)
+- `sp-cli` skill: commands, gotchas, fallback
+- Optional cron: a morning `sp agenda` digest (replacing the retired Vikunja digest)
 
-## Вне MVP (осознанно)
+## Out of MVP scope (deliberately)
 
-- Таймер start/stop — нужна delta-модель (внешний таймер не тикает), сделаем отдельно
-- Repeat-конфиги (нужен образец структуры из UI)
-- Планировщик дней (нужен образец из UI)
-- YouTrack-мост — после MVP
-- bulk-операции — синтаксис `sp complete <id1> <id2> ...` уже покрывает основное
+- Timer start/stop — needs a delta model (an external timer does not tick), will be done separately
+- Repeat configs (needs a sample structure produced by the UI)
+- Day planner (needs a sample from the UI)
+- YouTrack bridge — after the MVP
+- Bulk operations — the `sp complete <id1> <id2> ...` syntax already covers the essentials
 
-## Риски
+## Risks
 
-| Риск | Митигация |
+| Risk | Mitigation |
 |---|---|
-| Телефон перезатрёт изменения CLI | корректный vectorClock + recentOps; живой тест синка до «релиза» |
-| SP обновит schemaVersion | чек при чтении, предупреждение |
-| Одновременная запись | retry + бэкапы; юзкейс редкий |
+| The phone overwrites CLI changes | correct vectorClock + recentOps; live sync test before "release" |
+| SP bumps schemaVersion | check on read, warn |
+| Concurrent writes | retry + backups; a rare use case |
 
-## Оценка суммарно
+## Total estimate
 
-Этап 1: **~7-10 чч** (ядро+sync 2-3, read 1, write 3-4, today 1-2)
-Этапы 2-4: ~3-4 чч
-**Всего MVP: ~10-14 чч**
+Stage 1: **~7-10 h** (core+sync 2-3, read 1, write 3-4, today 1-2)
+Stages 2-4: ~3-4 h
+**Total MVP: ~10-14 h**
