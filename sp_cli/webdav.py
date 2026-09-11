@@ -107,20 +107,29 @@ class SyncFileClient:
             raise WebDavError(f"PUT {self.file_url}: HTTP {r.status_code}")
         self.etag = r.headers.get("ETag")
 
-    def save_backup(self) -> Path | None:
-        """Write a backup of the last downloaded bytes; returns the path."""
-        if self.original_bytes is None:
-            return None
-        return self._write_backup()
+    def save_backup(
+        self, directory: str | Path | None = None, keep: int | None = None
+    ) -> Path | None:
+        """Write a backup of the last downloaded bytes; returns the path.
 
-    def _write_backup(self) -> Path | None:
+        directory defaults to the configured backup_dir; keep is the rotation
+        count for that directory (default BACKUP_KEEP, 0 = keep everything).
+        """
+        return self._write_backup(directory, keep)
+
+    def _write_backup(
+        self, directory: str | Path | None = None, keep: int | None = None
+    ) -> Path | None:
         if self.original_bytes is None:
             return None
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        target = Path(directory) if directory is not None else self.backup_dir
+        keep = BACKUP_KEEP if keep is None else keep
+        target.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        path = self.backup_dir / f"sync-data-{stamp}.json"
+        path = target / f"sync-data-{stamp}.json"
         path.write_bytes(self.original_bytes)
-        backups = sorted(self.backup_dir.glob("sync-data-*.json"))
-        for old in backups[:-BACKUP_KEEP]:
-            old.unlink(missing_ok=True)
+        if keep > 0:
+            backups = sorted(target.glob("sync-data-*.json"))
+            for old in backups[:-keep]:
+                old.unlink(missing_ok=True)
         return path

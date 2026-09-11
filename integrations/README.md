@@ -20,6 +20,29 @@ lives in `~/.config/sp-cli/config.toml` and can be overridden with the
 CLI: the op-log, vectorClock, backups, and conflict retry are inherited
 automatically.
 
+## Authentication
+
+The MCP client config carries **no WebDAV credentials, and none are needed**:
+the server executes the same code as the CLI, which reads
+`~/.config/sp-cli/config.toml` and authenticates to the WebDAV server with
+HTTP Basic auth on every request. Nothing writes to the file "around"
+authorization, and duplicating the password into an agent's config would only
+create one more copy of the secret.
+
+To point one agent at a different Super Productivity setup (or a test copy),
+give it its own config via the environment instead:
+
+```json
+{
+  "mcpServers": {
+    "superproductivity": {
+      "command": "/path/to/sp-cli/sp-mcp",
+      "env": { "SP_CLI_CONFIG": "/path/to/alternate-config.toml" }
+    }
+  }
+}
+```
+
 ## Registering the MCP server
 
 The launch command is the same everywhere: `/absolute/path/to/sp-cli/sp-mcp`

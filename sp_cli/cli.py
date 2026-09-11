@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import re
 import sys
 
@@ -2702,9 +2703,12 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_backup(args) -> int:
+    if args.keep is not None and args.keep < 0:
+        raise CliError("--keep must be >= 0 (0 keeps everything)")
     client, _ = _ctx()
     client.get()
-    path = client.save_backup()
+    directory = os.path.expanduser(args.dir) if args.dir else None
+    path = client.save_backup(directory, args.keep)
     print(f"backup written to {path}")
     return 0
 
@@ -3392,7 +3396,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--raw", action="store_true")
 
     add("doctor", cmd_doctor, "validate state invariants")
-    add("backup", cmd_backup, "download and store a backup")
+
+    s = add("backup", cmd_backup, "download and store a backup")
+    s.add_argument(
+        "--dir",
+        help="directory for the backup (default: the config backup_dir, "
+        "which write operations also rotate — use a separate directory "
+        "for scheduled backups)",
+    )
+    s.add_argument(
+        "--keep",
+        type=int,
+        help="rotation: keep the newest N backups in that directory "
+        "(default 10; 0 keeps everything)",
+    )
 
     return p
 

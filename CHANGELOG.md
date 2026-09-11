@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `sp backup` gained `--dir` (store backups in a separate directory, safe from
+  the pre-write rotation) and `--keep N` (per-directory rotation, `0` keeps
+  everything). README documents a cron recipe for scheduled backups and the
+  restore procedure.
+
 ## 0.1.0 — 2026-09-11
 
 First public release.

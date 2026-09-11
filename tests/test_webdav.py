@@ -240,3 +240,45 @@ class TestStoreRetry:
         with pytest.raises(ConflictError):
             store.commit([add])
         assert len(session.put_calls) == 3
+
+
+class TestExplicitBackups:
+    """save_backup with a custom directory and rotation (sp backup --dir/--keep)."""
+
+    def _client_with_state(self, tmp_path):
+        session = FakeSession()
+        data = _minimal_file()
+        body = add_prefix(serialize(data)).encode()
+        session.get_responses.append(FakeResponse(200, body, {"ETag": '"e1"'}))
+        client = _client(tmp_path, session)
+        client.get()
+        return client, body
+
+    def test_custom_directory(self, tmp_path):
+        client, body = self._client_with_state(tmp_path)
+        target = tmp_path / "cron-backups"
+        path = client.save_backup(target)
+        assert path.parent == target
+        assert path.read_bytes() == body
+        # default backup_dir untouched
+        assert not (tmp_path / "backups").exists()
+
+    def test_custom_keep_rotates(self, tmp_path):
+        client, _ = self._client_with_state(tmp_path)
+        target = tmp_path / "cron-backups"
+        for _ in range(5):
+            client.save_backup(target, keep=3)
+        assert len(list(target.glob("sync-data-*.json"))) == 3
+
+    def test_keep_zero_keeps_everything(self, tmp_path):
+        client, _ = self._client_with_state(tmp_path)
+        target = tmp_path / "cron-backups"
+        for _ in range(12):
+            client.save_backup(target, keep=0)
+        assert len(list(target.glob("sync-data-*.json"))) == 12
+
+    def test_default_rotation_unchanged(self, tmp_path):
+        client, _ = self._client_with_state(tmp_path)
+        for _ in range(12):
+            client.save_backup()
+        assert len(list((tmp_path / "backups").glob("sync-data-*.json"))) == 10

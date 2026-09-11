@@ -3219,3 +3219,9 @@ class TestBulkNeverEmitsMultiEntityOps:
             _args(["bulk", "--project", "inbox", "--tag-add", "home", "--complete"])
         ) == 0
         assert_doctor_clean(sample)
+
+
+class TestBackupCommand:
+    def test_negative_keep_rejected_before_any_network(self):
+        # validation runs before _ctx(), so no config is needed
+        assert cli.main(["backup", "--keep", "-1"]) == 2
