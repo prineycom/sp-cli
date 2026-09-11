@@ -125,10 +125,22 @@ the mcporter CLI.
 needs part of the functionality, the set can be cut down with glob filters:
 
 ```bash
+sp-mcp --read-only         # only listing/reporting tools; no writes possible
 sp-mcp --exclude 'provider*' --exclude 'board*' --exclude 'counter*'
 sp-mcp --include 'list' --include 'show' --include 'add' --include 'today*'
 sp-mcp --list-tools        # inspect the resulting set without starting the server
 ```
+
+**Choose the tool set for the trust level of the agent.** Destructive tools
+require `yes=true`, but a model can and will pass it on its own — a
+confirmation parameter is a speed bump, not a permission system. Field note:
+the very first autonomous agent connected to the full tool set responded to
+"do you have sp-cli tools now?" by systematically test-firing all 97 tools,
+`sp_delete`/`sp_*_rm` included, with `yes=true` — and cleaned out live data.
+For an autonomous bot (Telegram assistant, cron agent, small local model) use
+`--read-only`, or at least `--exclude '*rm*' --exclude 'delete' --exclude
+'bulk' --exclude 'archive' --exclude init`; give the full set only to
+interactive sessions where a human reviews tool calls.
 
 A sensible minimum for a "task assistant" agent: `--exclude 'provider*'
 --exclude init` (an agent usually has no business reconfiguring the config or

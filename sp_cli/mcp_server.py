@@ -194,10 +194,17 @@ class ToolError(Exception):
 
 
 class SpMcpServer:
-    def __init__(self, include: list[str] | None = None, exclude: list[str] | None = None):
+    def __init__(
+        self,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        read_only: bool = False,
+    ):
         parser = cli.build_parser()
         self.commands: dict[str, tuple[argparse.ArgumentParser, str]] = {}
         for name, sp, help_ in iter_subcommands(parser):
+            if read_only and name not in READ_ONLY:
+                continue
             if include and not any(fnmatch.fnmatch(name, pat) for pat in include):
                 continue
             if exclude and any(fnmatch.fnmatch(name, pat) for pat in exclude):
@@ -382,12 +389,20 @@ def main(argv: list[str] | None = None) -> int:
         help="hide commands matching this glob (repeatable)",
     )
     p.add_argument(
+        "--read-only",
+        action="store_true",
+        help="expose only read-only tools (no writes possible); recommended "
+        "for autonomous or untrusted agents",
+    )
+    p.add_argument(
         "--list-tools",
         action="store_true",
         help="print the generated tool names and exit",
     )
     args = p.parse_args(argv)
-    server = SpMcpServer(include=args.include, exclude=args.exclude)
+    server = SpMcpServer(
+        include=args.include, exclude=args.exclude, read_only=args.read_only
+    )
     if args.list_tools:
         for tool in server.tools:
             print(f"{tool['name']}\t{tool['description']}")

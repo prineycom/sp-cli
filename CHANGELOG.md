@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `sp-mcp --read-only`: expose only read-only tools — recommended for
+  autonomous or untrusted agents (a `yes=true` confirmation parameter is not a
+  permission system; a model will happily pass it).
 - `sp backup` gained `--dir` (store backups in a separate directory, safe from
   the pre-write rotation) and `--keep N` (per-directory rotation, `0` keeps
   everything). README documents a cron recipe for scheduled backups and the

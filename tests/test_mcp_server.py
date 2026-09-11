@@ -301,3 +301,16 @@ class TestCallToolGuards:
         monkeypatch.setattr(cli, "main", fake_main)
         text, is_error = server.call_tool("sp_list", {})
         assert is_error and "error: boom" in text and "partial" in text
+
+
+class TestReadOnlyMode:
+    def test_read_only_exposes_only_read_tools(self):
+        server = SpMcpServer(read_only=True)
+        names = {t["name"] for t in server.tools}
+        assert names == {tool_name(c) for c in mcp.READ_ONLY}
+        assert all(t["annotations"]["readOnlyHint"] for t in server.tools)
+
+    def test_read_only_composes_with_exclude(self):
+        server = SpMcpServer(read_only=True, exclude=["worklog"])
+        names = {t["name"] for t in server.tools}
+        assert "sp_worklog" not in names and "sp_list" in names
