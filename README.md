@@ -424,6 +424,61 @@ Subtask time is rolled up to the parent: `track`/`untrack` recompute the parent 
 ./sp init ...        # see "Configuration"
 ```
 
+## Timezones
+
+All wall-clock times — `--at "YYYY-MM-DD HH:MM"`, `--remind` offsets, deadline
+times, and times parsed from the short syntax (`@friday 15:00`) — are converted
+to unix ms with a naive `strptime().timestamp()`, which resolves them in the
+**process's local timezone** (the `TZ` env var), not UTC and not the timezone
+of your SP clients. If the host's timezone differs from the one you actually
+live in, every scheduled task and reminder lands at the wrong local time on
+your devices.
+
+This bites hardest on headless hosts, which are very often configured as UTC:
+
+```sh
+timedatectl                     # or: cat /etc/timezone
+# "Time zone: Etc/UTC (UTC, +0000)"  →  "20:00" you type becomes 22:00 in
+#                                       a Europe/Belgrade SP client
+```
+
+**Fix per invocation** (CLI):
+
+```sh
+TZ=Europe/Belgrade ./sp schedule <id> --at "2026-09-17 20:00" --remind 0m
+```
+
+**Fix for the MCP server:** MCP clients typically pass a *filtered* environment
+to stdio subprocesses (e.g. Hermes passes only `PATH`, `HOME`, `LANG` and a few
+other safe variables — `TZ` is **not** among them, even if your shell has it
+exported). Set it in the client's server config instead, e.g. for Hermes in
+`~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  superproductivity:
+    command: /path/to/sp-cli/sp-mcp
+    env:
+      TZ: Europe/Belgrade
+```
+
+MCP servers spawn at agent startup, so the env change requires an agent
+restart to take effect.
+
+Related gotchas in the same area:
+
+- `sp schedule` without `--remind` clears the task's `remindAt` — an at-start
+  reminder must be re-armed explicitly with `--remind 0m`. This bites during
+  timezone-fix reschedules: fixing the time silently drops the reminder.
+- Display commands (`sp list`, `sp show`, …) format timestamps back through the
+  same process timezone — a host in UTC will *render* scheduled times as UTC,
+  which makes a correct file look wrong. The sync file is always the source of
+  truth; check `dueWithTime` there, or run the command with the same `TZ=` you
+  scheduled with.
+- Repeat configs (`startTime`) are interpreted by the SP app itself in the
+  client's timezone — the CLI does not convert them, so they are unaffected by
+  the host's `TZ`.
+
 ## Write safety
 
 - Before every PUT, a backup is made automatically in `~/.local/share/sp-cli/backups` (rotation: the last 10 are kept).
